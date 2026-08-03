@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="dittobot-api-base" content="">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <title>Dittobot Operator Console</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f8f7fb;
+      --panel: #f2f0f6;
+      --panel-strong: #ebe8f1;
+      --border: #ded9e6;
+      --text: #292333;
+      --muted: #706979;
+      --accent: #7752d6;
+      --accent-soft: #eee8fb;
+      --ok: #27835c;
+      --ok-soft: #e7f5ee;
+      --warn: #a26916;
+      --warn-soft: #fff3dc;
+      --danger: #bd3d3d;
+      --danger-soft: #fdeaea;
+      font-family: Inter, Pretendard, "Noto Sans KR", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: var(--bg); color: var(--text); }
+    button { font: inherit; }
+    button:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 32%, transparent); outline-offset: 2px; }
+    .shell { display: grid; grid-template-columns: 270px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { position: sticky; top: 0; height: 100vh; padding: 30px 22px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--panel); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
+    .brand-mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 60% 40% 56% 44%; color: white; font-weight: 800; background: linear-gradient(145deg, #9a7ae8, #6540c2); box-shadow: 0 6px 18px #7250c940; }
+    .brand strong { display: block; font-size: 19px; }
+    .brand small { display: block; margin-top: 3px; color: var(--muted); font: 12px ui-monospace, monospace; }
+    .nav { display: grid; gap: 4px; }
+    .nav button { border: 0; border-radius: 11px; padding: 12px 14px; text-align: left; color: var(--muted); background: transparent; cursor: pointer; }
+    .nav button[aria-current="page"] { color: #5736aa; background: var(--accent-soft); font-weight: 650; }
+    .connection { margin-top: auto; display: grid; gap: 10px; }
+    .mode { width: fit-content; padding: 7px 10px; border-radius: 9px; color: var(--warn); background: var(--warn-soft); font: 700 11px ui-monospace, monospace; letter-spacing: .04em; }
+    .mini-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: 0 0 auto; }
+    .dot.ok { background: var(--ok); }
+    .dot.danger { background: var(--danger); }
+    main { width: min(1120px, 100%); padding: 46px 54px 72px; }
+    .page[hidden] { display: none; }
+    .eyebrow { margin: 0 0 9px; color: var(--accent); font: 700 12px ui-monospace, monospace; letter-spacing: .11em; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 36px); letter-spacing: -.025em; }
+    .subtitle { max-width: 680px; margin: 9px 0 0; color: var(--muted); line-height: 1.6; }
+    .toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; flex-wrap: wrap; margin-bottom: 28px; }
+    .filters { display: flex; gap: 7px; }
+    .chip { padding: 8px 16px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: var(--panel); cursor: pointer; }
+    .chip[aria-pressed="true"] { color: #5736aa; border-color: var(--accent); background: var(--accent-soft); }
+    .banner { margin-bottom: 20px; padding: 11px 14px; border-radius: 10px; color: var(--warn); background: var(--warn-soft); font: 12px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+    .banner.ok { color: var(--ok); background: var(--ok-soft); }
+    .banner.danger { color: var(--danger); background: var(--danger-soft); }
+    .list { display: grid; gap: 10px; }
+    .skill-card { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 15px; background: var(--panel); cursor: pointer; }
+    .skill-card:hover { border-color: #c8bfd8; background: var(--panel-strong); }
+    .skill-card h2 { margin: 0 0 6px; font: 650 17px ui-monospace, monospace; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .tag { display: inline-block; margin-left: 8px; padding: 3px 8px; border-radius: 6px; font: 700 11px ui-monospace, monospace; }
+    .tag.candidate { color: var(--warn); background: var(--warn-soft); }
+    .tag.tested { color: var(--ok); background: var(--ok-soft); }
+    .tag.active { color: #5736aa; background: var(--accent-soft); }
+    .button { border: 1px solid var(--border); border-radius: 10px; padding: 9px 15px; color: var(--text); background: var(--panel); cursor: pointer; }
+    .button.primary { color: white; border-color: var(--accent); background: var(--accent); font-weight: 700; }
+    .button.danger { color: var(--danger); border-color: var(--danger); background: transparent; }
+    .button:disabled { opacity: .45; cursor: not-allowed; }
+    .empty { padding: 42px 18px; border: 1px dashed var(--border); border-radius: 15px; color: var(--muted); text-align: center; }
+    .detail-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+    .nodes { display: grid; gap: 8px; margin-bottom: 24px; }
+    .node { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; padding: 15px 18px; border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 0 13px 13px 0; background: var(--panel); }
+    .node.running { border-left-color: var(--accent); }
+    .node.ok { border-left-color: var(--ok); }
+    .node.error { border-left-color: var(--danger); }
+    .node strong { font: 650 14px ui-monospace, monospace; }
+    .node p { margin: 5px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .node-state { align-self: center; color: var(--muted); font: 700 11px ui-monospace, monospace; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .safety { display: flex; gap: 9px; flex-wrap: wrap; margin: 24px 0; }
+    .safety span { padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--muted); font: 11px ui-monospace, monospace; }
+    .monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .8fr); gap: 18px; }
+    .panel { padding: 22px; border: 1px solid var(--border); border-radius: 17px; background: var(--panel); }
+    .scene { min-height: 300px; display: grid; place-items: center; border-radius: 13px; color: #cfc4e6; background: linear-gradient(#7957c715 1px, transparent 1px), linear-gradient(90deg, #7957c715 1px, transparent 1px), #25222b; background-size: 12.5% 12.5%; font: 12px ui-monospace, monospace; }
+    .run-title { margin: 4px 0 14px; font: 650 16px ui-monospace, monospace; }
+    .run-status { display: inline-block; padding: 5px 10px; border-radius: 999px; color: var(--muted); background: var(--panel-strong); font-size: 12px; }
+    .run-steps { min-height: 96px; margin: 18px 0; padding: 0; list-style: none; color: var(--muted); font: 12px/1.8 ui-monospace, monospace; }
+    .run-steps .done { color: var(--ok); }
+    .run-steps .current { color: var(--accent); font-weight: 700; }
+    .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    @media (max-width: 800px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { position: static; width: 100%; height: auto; padding: 18px; }
+      .brand { margin-bottom: 16px; }
+      .nav { grid-template-columns: repeat(3, 1fr); }
+      .nav button { text-align: center; padding-inline: 7px; }
+      .connection { margin-top: 18px; }
+      main { padding: 32px 18px 56px; }
+      .monitor-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">D</div>
+        <div><strong>dittobot</strong><small>M0609 · RG2 · D435i</small></div>
+      </div>
+      <nav class="nav" aria-label="주요 화면">
+        <button type="button" data-page="skills" aria-current="page">스킬 관리</button>
+        <button type="button" data-page="detail">스킬 상세</button>
+        <button type="button" data-page="monitor">실시간 모니터링</button>
+      </nav>
+      <div class="connection">
+        <span class="mode">MOCK API</span>
+        <div class="mini-status"><span id="connection-dot" class="dot"></span><span id="connection-label">FastAPI 연결 확인 중</span></div>
+      </div>
+    </aside>
+
+    <main>
+      <section id="page-skills" class="page">
+        <div class="toolbar">
+          <header><p class="eyebrow">01 · REGISTRY</p><h1>스킬 관리</h1><p class="subtitle">SQLite 레지스트리의 스킬 버전을 검증하고 활성화하거나 Mock으로 실행합니다.</p></header>
+          <div class="filters" aria-label="스킬 필터">
+            <button type="button" class="chip" data-filter="all" aria-pressed="true">전체</button>
+            <button type="button" class="chip" data-filter="candidate" aria-pressed="false">후보</button>
+            <button type="button" class="chip" data-filter="active" aria-pressed="false">활성</button>
+          </div>
+        </div>
+        <div id="api-banner" class="banner" role="status" aria-live="polite">FastAPI 연결 확인 중…</div>
+        <div id="skill-list" class="list"></div>
+        <div id="skill-empty" class="empty" hidden>등록된 스킬이 없습니다.</div>
+      </section>
+
+      <section id="page-detail" class="page" hidden>
+        <div class="detail-head">
+          <header><p class="eyebrow">02 · SKILLGRAPH</p><h1 id="detail-title">스킬을 선택하세요</h1><p id="detail-subtitle" class="subtitle">스킬 관리 화면에서 버전을 선택해 주세요.</p></header>
+          <button id="validate-skill" type="button" class="button primary">전체 Mock 검증</button>
+        </div>
+        <div id="detail-nodes" class="nodes"></div>
+        <div class="actions">
+          <button id="activate-skill" type="button" class="button primary">검증 후 활성화</button>
+          <button type="button" class="button" data-page="skills">목록으로</button>
+        </div>
+      </section>
+
+      <section id="page-monitor" class="page" hidden>
+        <header><p class="eyebrow">03 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">Scene 캡처, binding, preflight, Mock 실행 상태를 표시합니다. ROS 2와 실제 로봇 제어는 아직 연결되지 않았습니다.</p></header>
+        <div class="safety"><span id="estop-chip">● E-STOP READY</span><span id="force-chip">○ FORCE SUPERVISOR IDLE</span><span id="workspace-chip">○ WORKSPACE MONITOR IDLE</span><span>● MOCK MODE</span></div>
+        <div class="monitor-grid">
+          <div class="panel"><p class="eyebrow">SCENE VIEW</p><div class="scene">RealSense 영상 연결 예정 · Mock Scene API 사용 중</div></div>
+          <div class="panel">
+            <span id="run-status" class="run-status">대기</span>
+            <p id="run-title" class="run-title">실행 중인 스킬 없음</p>
+            <ul id="run-steps" class="run-steps"><li>활성 스킬의 실행 버튼을 눌러주세요.</li></ul>
+            <div class="control-grid">
+              <button type="button" class="button" disabled title="백엔드 API 미구현">일시정지</button>
+              <button type="button" class="button" disabled title="백엔드 API 미구현">재개</button>
+              <button id="estop-run" type="button" class="button danger">안전정지</button>
+              <button id="abort-run" type="button" class="button danger">중단</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="./api-client.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

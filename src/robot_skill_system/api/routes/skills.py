@@ -20,6 +20,11 @@ from robot_skill_system.api.dependencies import ServiceDependency
 router = APIRouter(prefix="/skills", tags=["skills"])
 
 
+@router.get("")
+def list_skills(service: ServiceDependency) -> dict[str, Any]:
+    return service.list_skills()
+
+
 @router.post("/induce")
 def induce_skill(
     request: SkillInduceRequest, service: ServiceDependency
@@ -35,8 +40,12 @@ def search_skills(
 
 
 @router.get("/{skill_id}")
-def get_skill(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
-    return service.get_skill(skill_id)
+def get_skill(
+    skill_id: str,
+    service: ServiceDependency,
+    version: str | None = None,
+) -> dict[str, Any]:
+    return service.get_skill(skill_id, version)
 
 
 @router.get("/{skill_id}/versions")

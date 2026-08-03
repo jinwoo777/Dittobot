@@ -124,6 +124,12 @@ uvicorn robot_skill_system.api.app:create_app --factory --host 127.0.0.1 --port 
 `dry_run`이지만 현재 구현에서는 이것도 MockRobot 명령을 실행·기록하는 오프라인 경로입니다.
 Hardware 요청은 아래 다섯 환경 gate를 만족해도 구성된 Doosan adapter가 없어 거부됩니다.
 
+운영 UI는 같은 서버의 `http://127.0.0.1:8000/ui`에서 열 수 있습니다. UI는 `/skills`를 통해
+SQLite 레지스트리를 읽고, 스킬 전체 Mock 검증·활성화와 Scene 캡처 → binding → preflight →
+Mock 실행/중단 API를 호출합니다. 일시정지·재개와 ROS 2/실기 실행은 아직 연결하지 않았으며 UI도
+이를 활성 기능처럼 모사하지 않습니다. `file://`로 HTML을 직접 여는 대신 FastAPI가 제공하는
+경로를 사용해야 동일 출처 API 연결이 보장됩니다.
+
 ## 검사
 
 ```bash

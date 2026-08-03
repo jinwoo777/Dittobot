@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
@@ -10,7 +11,8 @@ def create_app(service: Any | None = None) -> Any:
 
     try:
         from fastapi import FastAPI, HTTPException, Request
-        from fastapi.responses import JSONResponse
+        from fastapi.responses import JSONResponse, RedirectResponse
+        from fastapi.staticfiles import StaticFiles
     except ImportError as exc:  # pragma: no cover - environment-dependent guard
         raise RuntimeError("Install the 'api' optional dependencies to run FastAPI") from exc
 
@@ -35,6 +37,17 @@ def create_app(service: Any | None = None) -> Any:
     app.include_router(scenes.router)
     app.include_router(skills.router)
     app.include_router(runtime.router)
+
+    settings = getattr(service, "settings", None)
+    repository_root = getattr(settings, "repo_root", None)
+    ui_root = Path(repository_root) / "dittobot-design" if repository_root else None
+    if ui_root is not None and ui_root.is_dir():
+
+        @app.get("/ui", include_in_schema=False)
+        def ui_redirect() -> RedirectResponse:
+            return RedirectResponse(url="/ui/")
+
+        app.mount("/ui", StaticFiles(directory=ui_root, html=True), name="ui")
 
     @app.exception_handler(KeyError)
     async def not_found(_request: Request, exc: KeyError) -> JSONResponse:

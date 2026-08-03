@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 
 from robot_skill_system.api.app import create_app
@@ -56,6 +57,7 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/teaching/sessions/{session_id}/finalize",
         "/scenes/capture",
         "/perception/scene/capture",
+        "/skills",
         "/skills/induce",
         "/skills/search",
         "/skills/{skill_id}/validate",
@@ -69,6 +71,39 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/runtime/abort",
     }
     assert required <= paths
+
+
+def test_ui_registry_api_and_static_console_are_connected(
+    service: MVPApplication,
+) -> None:
+    app = create_app(service)
+    client = TestClient(app)
+
+    assert client.get("/skills").json() == {"skills": []}
+    induced = service.induce_skill(
+        {"demo_path": "tests/fixtures/demonstrations/novice_wipe.json"}
+    )
+
+    registry = client.get("/skills")
+    assert registry.status_code == 200
+    [row] = registry.json()["skills"]
+    assert row["skill_id"] == "wipe_surface"
+    assert row["version"] == induced["version"]
+    assert row["status"] == "active"
+    assert row["validation_status"] == "passed"
+    assert row["node_count"] == len(row["skill_graph"]["nodes"])
+
+    detail = client.get(
+        "/skills/wipe_surface", params={"version": induced["version"]}
+    )
+    assert detail.status_code == 200
+    assert detail.json()["skill_graph"]["skill_id"] == "wipe_surface"
+
+    ui_redirect = client.get("/ui", follow_redirects=False)
+    assert ui_redirect.status_code in {302, 307}
+    assert ui_redirect.headers["location"] == "/ui/"
+    assert "Dittobot Operator Console" in client.get("/ui/").text
+    assert "DittobotApiClient" in client.get("/ui/api-client.js").text
 
 
 def test_persisted_teaching_runtime_update_promotion_and_rollback(

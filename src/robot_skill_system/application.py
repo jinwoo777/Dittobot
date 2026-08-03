@@ -423,8 +423,33 @@ class MVPApplication:
                 "results": [self._version_summary(row) for row in rows],
             }
 
-    def get_skill(self, skill_id: str) -> dict[str, Any]:
-        row = self._find_version(skill_id)
+    def list_skills(self) -> dict[str, Any]:
+        """Return registry rows required by the operator UI without provider calls."""
+
+        with self.database.session() as session:
+            rows = list(
+                session.execute(
+                    select(SkillVersionRecord, SkillRecord)
+                    .join(SkillRecord, SkillVersionRecord.skill_id == SkillRecord.id)
+                    .order_by(SkillVersionRecord.created_at.desc())
+                ).tuples()
+            )
+        return {
+            "skills": [
+                {
+                    **self._version_summary(version, include_graph=True),
+                    "name": skill.name,
+                    "intent": skill.intent,
+                    "variant": skill.variant,
+                    "description": skill.description,
+                    "node_count": len(version.graph_json.get("nodes", [])),
+                }
+                for version, skill in rows
+            ]
+        }
+
+    def get_skill(self, skill_id: str, version: str | None = None) -> dict[str, Any]:
+        row = self._find_version(skill_id, version)
         return self._version_summary(row, include_graph=True)
 
     def get_skill_versions(self, skill_id: str) -> dict[str, Any]:

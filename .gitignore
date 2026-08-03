@@ -1,6 +1,7 @@
 .codex/
 .vscode/
-dittobot-design/
+dittobot-design/dittobot_Console_dc.html
+dittobot-design/support.js
 .env
 .env.*
 !.env.example
