@@ -1,5 +1,6 @@
 .codex/
 .vscode/
+dittobot-design/
 .env
 .env.*
 !.env.example
