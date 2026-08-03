@@ -1,0 +1,6 @@
+{
+  "fixture_kind": "novice_wipe",
+  "generator": "generate_novice_wipe_trajectory",
+  "seed": 101,
+  "description": "Slow, noisy, moderately confident repeated surface wipe"
+}

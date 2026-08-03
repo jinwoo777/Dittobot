@@ -1,0 +1,7 @@
+{
+  "workspace_id": "mock_table_workspace_v1",
+  "reference_frame": "camera_color_optical_frame",
+  "unknown_space_policy": "forbidden",
+  "minimum_clearance_m": 0.05,
+  "dynamic_obstacle_policy": "stop_refresh_revalidate"
+}

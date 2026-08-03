@@ -1,0 +1,6 @@
+{
+  "fixture_kind": "periodic_wipe",
+  "generator": "generate_periodic_trajectory",
+  "cycles": 3.0,
+  "description": "Deterministic periodic primitive classification fixture"
+}

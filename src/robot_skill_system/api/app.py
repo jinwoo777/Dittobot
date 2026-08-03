@@ -1,0 +1,49 @@
+"""FastAPI application factory; importing the core does not require FastAPI."""
+
+from __future__ import annotations
+
+from typing import Any
+
+
+def create_app(service: Any | None = None) -> Any:
+    """Create the HTTP application around an injected or default MVP service."""
+
+    try:
+        from fastapi import FastAPI, HTTPException, Request
+        from fastapi.responses import JSONResponse
+    except ImportError as exc:  # pragma: no cover - environment-dependent guard
+        raise RuntimeError("Install the 'api' optional dependencies to run FastAPI") from exc
+
+    from robot_skill_system.api.routes import runtime, scenes, skills, teaching
+
+    if service is None:
+        from robot_skill_system.application import create_application
+
+        service = create_application()
+    app = FastAPI(
+        title="Robot Skill System",
+        version="0.1.0",
+        description="Safety-bounded teaching, skill registry, and runtime API",
+    )
+    app.state.service = service
+
+    @app.get("/health", tags=["system"])
+    def health() -> dict[str, str]:
+        return {"status": "ok", "default_execution_mode": "mock"}
+
+    app.include_router(teaching.router)
+    app.include_router(scenes.router)
+    app.include_router(skills.router)
+    app.include_router(runtime.router)
+
+    @app.exception_handler(KeyError)
+    async def not_found(_request: Request, exc: KeyError) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
+    @app.exception_handler(ValueError)
+    async def invalid_request(_request: Request, exc: ValueError) -> JSONResponse:
+        return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    # Retain FastAPI's type in the generated OpenAPI graph without importing it in core modules.
+    _ = HTTPException
+    return app

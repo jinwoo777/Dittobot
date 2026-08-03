@@ -1,0 +1,69 @@
+{
+  "schema_version": "1.0",
+  "force_profiles": [
+    {
+      "profile_id": "wipe_light",
+      "allowed_tool_classes": ["wiper", "cloth_tool"],
+      "allowed_surface_roles": ["contact_target"],
+      "target_force_vector_n": {"x": 0.0, "y": 0.0, "z": -5.0},
+      "force_control_axes": [false, false, true],
+      "maximum_force_n": 12.0,
+      "minimum_contact_force_n": 1.0,
+      "tangential_force_limit_n": 4.0,
+      "stiffness_n_m": {"x": 1200.0, "y": 1200.0, "z": 350.0},
+      "force_ramp_time_s": 0.5,
+      "force_release_time_s": 0.5,
+      "contact_search_speed_m_s": 0.008,
+      "maximum_search_distance_m": 0.04,
+      "unexpected_contact_policy": "stop_release_retract"
+    },
+    {
+      "profile_id": "wipe_standard",
+      "allowed_tool_classes": ["wiper", "cloth_tool"],
+      "allowed_surface_roles": ["contact_target"],
+      "target_force_vector_n": {"x": 0.0, "y": 0.0, "z": -8.0},
+      "force_control_axes": [false, false, true],
+      "maximum_force_n": 18.0,
+      "minimum_contact_force_n": 2.0,
+      "tangential_force_limit_n": 6.0,
+      "stiffness_n_m": {"x": 1300.0, "y": 1300.0, "z": 400.0},
+      "force_ramp_time_s": 0.6,
+      "force_release_time_s": 0.6,
+      "contact_search_speed_m_s": 0.008,
+      "maximum_search_distance_m": 0.04,
+      "unexpected_contact_policy": "stop_release_retract"
+    },
+    {
+      "profile_id": "polish_soft",
+      "allowed_tool_classes": ["polisher", "soft_pad"],
+      "allowed_surface_roles": ["contact_target"],
+      "target_force_vector_n": {"x": 0.0, "y": 0.0, "z": -4.0},
+      "force_control_axes": [false, false, true],
+      "maximum_force_n": 10.0,
+      "minimum_contact_force_n": 1.0,
+      "tangential_force_limit_n": 3.0,
+      "stiffness_n_m": {"x": 1000.0, "y": 1000.0, "z": 300.0},
+      "force_ramp_time_s": 0.7,
+      "force_release_time_s": 0.7,
+      "contact_search_speed_m_s": 0.006,
+      "maximum_search_distance_m": 0.03,
+      "unexpected_contact_policy": "stop_release_retract"
+    },
+    {
+      "profile_id": "contact_search_soft",
+      "allowed_tool_classes": ["wiper", "cloth_tool", "polisher", "soft_pad"],
+      "allowed_surface_roles": ["contact_target"],
+      "target_force_vector_n": {"x": 0.0, "y": 0.0, "z": -2.0},
+      "force_control_axes": [false, false, true],
+      "maximum_force_n": 6.0,
+      "minimum_contact_force_n": 0.5,
+      "tangential_force_limit_n": 2.0,
+      "stiffness_n_m": {"x": 900.0, "y": 900.0, "z": 250.0},
+      "force_ramp_time_s": 0.4,
+      "force_release_time_s": 0.4,
+      "contact_search_speed_m_s": 0.005,
+      "maximum_search_distance_m": 0.05,
+      "unexpected_contact_policy": "stop_release_retract"
+    }
+  ]
+}

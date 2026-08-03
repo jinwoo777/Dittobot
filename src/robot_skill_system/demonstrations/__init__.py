@@ -1,0 +1,90 @@
+"""Offline learning-from-demonstration building blocks."""
+
+from .models import (
+    DemonstrationTrajectory,
+    FitResiduals,
+    PoseSample,
+    PreprocessingReport,
+    PrimitiveFit,
+    PrimitiveRecommendation,
+    ProcessedTrajectory,
+    SegmentationResult,
+    SegmentationState,
+    SegmentState,
+    TimeInterval,
+    TrajectorySample,
+    TrajectorySegment,
+)
+from .preprocessing import (
+    PreprocessingConfig,
+    TrajectoryPreprocessingError,
+    preprocess_pose_samples,
+    preprocess_trajectory,
+)
+from .primitive_fitter import (
+    PrimitiveFitterConfig,
+    PrimitiveFittingError,
+    fit_arc,
+    fit_line,
+    fit_periodic,
+    recommend_primitive,
+)
+from .quality import (
+    QualityAssessment,
+    QualityConfig,
+    RepeatConsistencyResult,
+    assess_trajectory_quality,
+    validate_repeat_consistency,
+)
+from .recorder import DemonstrationRecorder, load_demonstration, load_pose_samples
+from .segmentation import SegmentationConfig, segment_trajectory
+from .synthetic import (
+    generate_arc_trajectory,
+    generate_expert_wipe_trajectory,
+    generate_line_trajectory,
+    generate_novice_wipe_trajectory,
+    generate_periodic_trajectory,
+    generate_wipe_trajectory,
+)
+
+__all__ = [
+    "DemonstrationRecorder",
+    "DemonstrationTrajectory",
+    "FitResiduals",
+    "PoseSample",
+    "PreprocessingConfig",
+    "PreprocessingReport",
+    "PrimitiveFit",
+    "PrimitiveFitterConfig",
+    "PrimitiveFittingError",
+    "PrimitiveRecommendation",
+    "ProcessedTrajectory",
+    "QualityAssessment",
+    "QualityConfig",
+    "RepeatConsistencyResult",
+    "SegmentationConfig",
+    "SegmentationResult",
+    "SegmentationState",
+    "SegmentState",
+    "TimeInterval",
+    "TrajectorySegment",
+    "TrajectoryPreprocessingError",
+    "TrajectorySample",
+    "assess_trajectory_quality",
+    "fit_arc",
+    "fit_line",
+    "fit_periodic",
+    "generate_arc_trajectory",
+    "generate_expert_wipe_trajectory",
+    "generate_line_trajectory",
+    "generate_novice_wipe_trajectory",
+    "generate_periodic_trajectory",
+    "generate_wipe_trajectory",
+    "load_demonstration",
+    "load_pose_samples",
+    "preprocess_pose_samples",
+    "preprocess_trajectory",
+    "recommend_primitive",
+    "segment_trajectory",
+    "validate_repeat_consistency",
+]

@@ -1,0 +1,6 @@
+{
+  "object_definition_id": "wiper_pad_v1",
+  "class_name": "wiper",
+  "pose_methods": ["marker", "depth_centroid"],
+  "attributes": {"color": ["blue"], "contact_capable": true}
+}
