@@ -16,7 +16,9 @@ def create_app(service: Any | None = None) -> Any:
     except ImportError as exc:  # pragma: no cover - environment-dependent guard
         raise RuntimeError("Install the 'api' optional dependencies to run FastAPI") from exc
 
-    from robot_skill_system.api.routes import runtime, scenes, skills, teaching
+    from robot_skill_system.api.routes import calibration, camera, runtime, scenes, skills, teaching
+    from robot_skill_system.capture.rgbd_recording import CameraStateError
+    from robot_skill_system.exceptions import HardwareExecutionDenied, NotConfiguredError
 
     if service is None:
         from robot_skill_system.application import create_application
@@ -37,6 +39,8 @@ def create_app(service: Any | None = None) -> Any:
     app.include_router(scenes.router)
     app.include_router(skills.router)
     app.include_router(runtime.router)
+    app.include_router(camera.router)
+    app.include_router(calibration.router)
 
     settings = getattr(service, "settings", None)
     repository_root = getattr(settings, "repo_root", None)
@@ -56,6 +60,22 @@ def create_app(service: Any | None = None) -> Any:
     @app.exception_handler(ValueError)
     async def invalid_request(_request: Request, exc: ValueError) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
+
+    @app.exception_handler(CameraStateError)
+    async def camera_conflict(_request: Request, exc: CameraStateError) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(NotConfiguredError)
+    async def optional_adapter_missing(
+        _request: Request, exc: NotConfiguredError
+    ) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    @app.exception_handler(HardwareExecutionDenied)
+    async def hardware_denied(
+        _request: Request, exc: HardwareExecutionDenied
+    ) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": str(exc)})
 
     # Retain FastAPI's type in the generated OpenAPI graph without importing it in core modules.
     _ = HTTPException

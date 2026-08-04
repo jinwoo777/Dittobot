@@ -1,12 +1,72 @@
 # Robot Skill System MVP
 
+## 실제 장치 실행: 터미널 2개
+
+아래 명령은 이 워크스테이션의 Doosan M0609(`192.168.1.100`), ROS namespace `dsr01`,
+로봇망 인터페이스 `enp3s0`, ROS domain `78` 기준입니다. 먼저 **터미널 1**에서 bringup을
+실행하고 그대로 둡니다.
+
+### 터미널 1 — Doosan bringup
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/rokey/cobot_ws/install/setup.bash
+
+export ROS_DOMAIN_ID=78
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
+
+ros2 launch dsr_bringup2 dsr_bringup2_rviz.launch.py \
+  name:=dsr01 mode:=real host:=192.168.1.100 port:=12345 model:=m0609
+```
+
+bringup이 완료되면 새 **터미널 2**에서 API/UI를 실행합니다. 아래 calibration gate는 실제
+로봇 이동을 허용하므로 작업공간, Chessboard 고정, E-stop 및 21개 pose 계획을 확인한 경우에만
+사용해야 합니다. `NPY TF 복사·검증`은 이동 명령을 보내지 않지만 같은 명시적 gate를 요구합니다.
+
+### 터미널 2 — Dittobot API/UI (8001)
+
+```bash
+cd /home/rokey/Dittobot
+source /opt/ros/humble/setup.bash
+source /home/rokey/cobot_ws/install/setup.bash
+
+export ROS_DOMAIN_ID=78
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+
+export ROBOT_EXECUTION_MODE=hardware
+export ENABLE_HARDWARE_EXECUTION=true
+export ROBOT_BACKEND=doosan
+export ENABLE_REAL_ROBOT=true
+export DRY_RUN=false
+export ENABLE_HANDEYE_CALIBRATION=true
+export CALIBRATION_POSE_PLAN_APPROVED=true
+export CALIBRATION_CELL_SAFETY_VERIFIED=true
+export DOOSAN_ROBOT_ID=dsr01
+export DOOSAN_ROBOT_MODEL=m0609
+export HANDEYE_LEGACY_NPY_PATH="$PWD/T_gripper2camera.npy"
+export HANDEYE_LEGACY_EXPECTED_TCP=2FG_TCP
+
+python3 -m uvicorn robot_skill_system.api.app:create_app \
+  --factory --env-file .env --host 127.0.0.1 --port 8001
+```
+
+실행 후 UI는 `http://127.0.0.1:8001/ui/`, API 문서는
+`http://127.0.0.1:8001/docs`에서 확인합니다. `.env`, 장치별 설정과 calibration artifact는
+Git에 포함하지 않습니다.
+
 작업자의 RGB-D 시연을 로컬 궤적 분석과 제한된 의미 분석으로 분해하고, 검증된
 `SkillGraph`를 결정론적으로 컴파일하는 Python 3.10 프로젝트입니다. 현재 실행 가능한
 End-to-End 경로는 완전한 오프라인 `MockRobotAdapter`이며 로봇·카메라·OpenAI API가 없어도
 Teaching → Registry → Runtime → Update 흐름을 실행할 수 있습니다. `simulation` 모드는 아직
 별도 물리 시뮬레이터가 아니라 같은 Mock adapter의 별칭입니다.
 
-> RealSense D435i, Doosan M0609, OnRobot RG2, ROS 2, MoveIt 연동은 실제 장치에서 검증하지
+> RealSense D435i의 직접 `pyrealsense2` RGB-D preview/recording은 이 개발 장치에서 검증했지만,
+> ROS 2 카메라 토픽과 Doosan M0609, OnRobot RG2, MoveIt 연동은 실제 장치에서 검증하지
 > 않았습니다. Doosan/RG2 adapter는 인터페이스 자리만 제공하며 gate가 닫혀 있으면 authorization
 > 오류, gate가 열려도 `NotConfiguredError`로 거부합니다. 환경 플래그만으로 실제 로봇을 움직일
 > 수 없습니다.
@@ -24,6 +84,12 @@ python -m pip install -e '.[dev,api]'
 cp .env.example .env
 ```
 
+RealSense UI를 사용할 환경에는 카메라 extra도 설치합니다.
+
+```bash
+python -m pip install -e '.[dev,api,realsense]'
+```
+
 Ubuntu 22.04에서 `ensurepip is not available` 또는 `python3.10-venv` 누락 오류가 나면 운영자가
 시스템 정책을 확인한 뒤 다음을 직접 실행해야 합니다. 프로젝트와 설치 스크립트는 `sudo`를
 자동 실행하지 않습니다.
@@ -35,12 +101,12 @@ sudo apt-get install python3.10-venv
 
 Mock 실행에는 API 키가 필요 없습니다. Live 의미 분석 또는 STT를 명시적으로 시험할 때만
 `.env`의 `OPENAI_API_KEY`를 채우고 `OPENAI_MODE=live`로 바꿉니다. `.env`는 Git에서 제외됩니다.
-이 프로젝트는 `.env`를 암묵적으로 읽지 않으므로 셸에서 다음처럼 로드합니다.
+이 프로젝트는 `.env`를 암묵적으로 읽지 않습니다. CLI live 명령에서는 필요한 값을 셸 환경에
+직접 export하고, FastAPI에서는 아래 실행 예시처럼 Uvicorn의 `--env-file .env`를 사용합니다.
 
 ```bash
-set -a
-source .env
-set +a
+export OPENAI_MODE=live
+export OPENAI_API_KEY='<your-key>'
 ```
 
 현재 검증에서는 실제 API key를 사용한 OpenAI live 호출을 수행하지 않았습니다. `.env.example`의
@@ -108,16 +174,16 @@ PYTHONPATH=src python3 examples/expert_update_demo.py
 - `data/skills/<skill_id>/<version>/`: graph, compiled module, validation report, manifest
 - SQLite `execution_runs`/`execution_events`: 실행 상태와 구조화 이벤트
 
-현재 CLI/API teaching 흐름은 원본 RGB, depth, audio, point cloud를 자동 녹화하지 않습니다.
-그 데이터용 URI/checksum 스키마와 capture/recorder 인터페이스는 있지만 실제 recorder를 연결해야
-합니다. SQLite에는 생성된 Python이나 bulk camera payload가 아니라 메타데이터와 URI/checksum이
-저장됩니다.
+현재 CLI/API teaching-session capture는 원본 RGB, depth, audio, point cloud를 자동 녹화하지
+않습니다. 별도의 UI Camera API는 사용자가 명시적으로 시작한 동안 RGB JPEG와 color 좌표계에
+정렬된 depth NPZ를 `data/demonstrations/rgbd_<id>/`에 기록하고 checksum manifest를 만듭니다.
+SQLite에는 생성된 Python이나 bulk camera payload가 아니라 메타데이터와 URI/checksum이 저장됩니다.
 
 ## FastAPI
 
 ```bash
-source .venv/bin/activate
-uvicorn robot_skill_system.api.app:create_app --factory --host 127.0.0.1 --port 8000
+PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m uvicorn robot_skill_system.api.app:create_app \
+  --factory --env-file .env --host 127.0.0.1 --port 8000
 ```
 
 `/docs`에서 Teaching, Scene, Skills, Runtime API를 확인할 수 있습니다. Runtime 요청 기본 mode는
@@ -129,6 +195,56 @@ SQLite 레지스트리를 읽고, 스킬 전체 Mock 검증·활성화와 Scene 
 Mock 실행/중단 API를 호출합니다. 일시정지·재개와 ROS 2/실기 실행은 아직 연결하지 않았으며 UI도
 이를 활성 기능처럼 모사하지 않습니다. `file://`로 HTML을 직접 여는 대신 FastAPI가 제공하는
 경로를 사용해야 동일 출처 API 연결이 보장됩니다.
+
+모니터링 화면의 `RGB-D 켜기`를 누르면 RealSense RGB/Depth preview가 시작되고, `모션 녹화 시작`을
+누른 동안만 로컬 RGB-D artifact를 기록합니다. preview/capture는 기본 30 FPS를 유지하고 저장은
+기본 10 FPS로 샘플링하며 `REALSENSE_RECORDING_FRAMES_PER_SECOND`로 조정할 수 있습니다. 기본 최대 시간은 60초이며
+`REALSENSE_MAXIMUM_RECORDING_DURATION_S`로 더 낮게 제한할 수 있습니다. API 서버는 인증이 없으므로
+카메라 화면을 외부 네트워크에 노출하지 말고 `127.0.0.1`에 바인딩해야 합니다.
+
+같은 모니터링 패널의 `Calibrate` 버튼은 손목/브라켓 장착 RealSense와 고정 10×7, 25mm
+Chessboard를 위한 eye-in-hand 보정 세션을 시작합니다. 로봇은 먼저
+J1/J2가 0°에 있어야 합니다. `Calibrate`를 누르면 측정된 J1/J2 값을 고정한 채 J3–J6를
+`[90,0,90,0]`으로 먼저 이동합니다. 이후 21개 고정 pose는 J1/J2를 바꾸지 않고 J3–J6도
+기준 대비 최대 ±5°, 인접 pose 사이 joint별 최대 5°만 움직입니다. 매 pose의 RGB,
+joint, flange pose로 `T_flange_camera`를 계산하고 오차 기준을 통과한 결과만
+`data/calibrations/handeye_<id>/`에 저장합니다. 이 버튼은 기본 비활성화되어 있으며, 모든 로봇
+hardware gate와 별도의 pose-plan/cell-safety/calibration gate가 열린 경우에만 실제 이동을
+요청합니다. 결과는 ROS TF로 자동 publish되지 않으며 runtime 실기 권한도 만들지 않습니다.
+
+옆의 `NPY TF 복사·검증` 버튼은 `T_gripper2camera.npy` 원본을 덮어쓰지 않고 고유 artifact
+폴더에 먼저 복사한 뒤, 현재 flange/TCP pose를 읽어 `T_flange_camera` 후보로 변환하고 기존
+Chessboard 관측으로 교차 검증합니다. 이 동작은 로봇을 움직이지 않습니다. 검증 통과 후보만 이후
+Candidate SkillGraph에 provenance로 연결되며, 실패 결과도 원인 확인용으로 보존되지만 좌표 근거로
+사용되지 않습니다. NPY 검증 실패나 NPY 부재는 surface-relative Mock Candidate 등록을 차단하지
+않지만, 실제 로봇 TF 권한이나 하드웨어 실행 근거로 승격되지도 않습니다.
+
+UI의 `스킬 만들기` 화면은 서버 재시작 뒤에도 `rgbd_manifest.json`을 검색해 완료된 녹화를 다시
+불러옵니다. RGB/Depth 프레임 슬라이더와 저장 FPS 기준 재생으로 내용을 확인한 뒤 스킬 ID, 작업
+설명, 대표 프레임 수를 지정할 수 있습니다. 서버는 균등 간격의 RGB와 checksum 검증된 정렬 Depth
+NPZ의 TURBO 컬러맵을 한 쌍으로 구성해 `OPENAI_MAX_KEYFRAMES` 한도 내에서 최대 300쌍까지 OpenAI
+Responses API에 보냅니다. 각 쌍은 RGB 다음 Depth 순서이며, 현재 모델이 video input을 지원하지
+않아 원본 영상 파일은 보내지 않습니다. 프롬프트는 두 개의 의도적으로 편 fingertip을 gripper jaw로
+보고 모든 대표 프레임마다 jaw 끝점/중점의 정규화 이미지 좌표 또는 명시적인 미검출 이유를 반드시
+반환하게 합니다. 사람 손 모양, 툴 모양, 작업대 평면 후보 ROI도 구조화해 반환하지만, 이 값들은
+semantic 이미지 힌트일 뿐 camera/robot 좌표나 metric pose가 아닙니다.
+직접 이미지 입력이 거부되면 선택된 RGB-D JPEG의 ZIP을 로컬 artifact로 보존하고, 비전 모델이
+해석할 수 있는 PDF contact sheet를 `input_file`로 자동 재전송합니다. ZIP 자체는 비전 입력으로
+보내지 않습니다. raw depth NPZ, 로컬 절대 경로 및 API key도 보내지 않습니다. 결과는 녹화 아래
+`skill_drafts/<draft_id>.json`에 저장되는 실행 불가 semantic draft입니다. 실제 실행 가능한 스킬에는
+별도의 robot/tool pose trajectory, TF와 로컬 안전 검증이 필요합니다.
+
+스킬 관리 화면은 이 artifact를 SQLite SkillGraph와 섞지 않고 `분석 초안`으로 별도 표시합니다.
+초안 상세의 승격 체크리스트는 RGB-D 증거, 두 손가락 TCP 프록시, 보정 TF, 신뢰 가능한 pose
+trajectory, Mock 검증 상태를 보여 줍니다. `Depth 평면 자동 추출`은 GPT의 작업대 ROI를 힌트로만
+사용하고 원본 aligned Depth와 저장된 카메라 intrinsics에 deterministic RANSAC/SVD를 적용해
+`T_camera_surface`를 계산합니다. 3점 수동 보정도 그대로 사용할 수 있습니다. `GPT TCP 경로 적용`은
+GPT의 정규화 fingertip 위치를 원본 Depth로 다시 deproject하며, 4개 이상 유효한 3D 샘플이 없으면
+누락 원인과 함께 실패합니다. `경로 티칭 시작`의 수동 방식도 유지됩니다. 증거 검증 뒤에만
+`Candidate로 등록`이 활성화되고 컴파일·Mock 검증이 실행됩니다. 이 Candidate는 비활성·실기
+호환 불가 상태이며, 실제 로봇 재생에는 별도로 검증한 `robot_base → camera/surface` TF와 FK,
+로봇 안전 검증이 필요합니다. Chessboard/관절각 hand-eye 보정 구성은
+[Hardware setup](docs/HARDWARE_SETUP.md#tf-hierarchy-and-chessboard-calibration)을 참고하십시오.
 
 ## 검사
 
@@ -145,15 +261,16 @@ robot-skill demo-e2e
 
 ## RealSense 경계
 
-Core/Mock 모드는 `pyrealsense2` 없이 import됩니다. `RealSenseCapture`에는 lazy import, color-depth
-alignment, burst median, timestamp-domain 보존 인터페이스가 구현되어 있고 fake module로만
-테스트했습니다. D435i 실장치와 vendor SDK에서는 검증하지 않았으며 CLI/API의
-`capture-scene --backend`는 현재 `mock`만 허용합니다. `RealSenseCapture.stream()`이라는 저수준
-iterator는 있지만 continuous recording/Scene 갱신 파이프라인에는 연결되어 있지 않습니다.
+Core/Mock 모드는 `pyrealsense2` 없이 import됩니다. UI Camera API만 lazy direct adapter를 열며,
+RGB와 color 좌표계 정렬 depth를 MJPEG로 표시하고 원본 장치 timestamps/clock domains, intrinsics,
+depth scale, 파일 checksum을 녹화 manifest에 보존합니다. 시작 직후 동기화되지 않은 프레임은
+제한 횟수 안에서만 건너뛰고, 20ms 이내의 RGB/depth pair를 얻지 못하면 실패합니다.
 
-실제 카메라를 연결하려면 대상 장비에 맞는 Intel SDK/`pyrealsense2`를 운영자가 설치하고
-serial, intrinsics/extrinsics, depth scale, alignment와 clock domain을 직접 검증해야 합니다.
-ROS의 `realsense2_camera` topic 또는 rosbag adapter는 이 저장소에 구현되어 있지 않습니다.
+이 개발 환경에서는 D435i, librealsense 2.58.3, firmware 5.17.0.10, 640×480@30fps로 단일 프레임과
+1초 RGB-D 녹화를 검증했습니다. 장치 serial은 소스나 문서에 고정하지 않으며 배포 시
+`REALSENSE_DEVICE_SERIAL`로 지정합니다. 녹화는 영상 기반 모션 원본일 뿐 손/도구 pose나
+robot-base trajectory를 아직 생성하지 않습니다. CLI `capture-scene`은 계속 Mock 전용이고,
+ROS의 `realsense2_camera` topic/rosbag adapter와 지속 Scene obstacle 갱신도 아직 구현되지 않았습니다.
 
 ROS 2 순서:
 

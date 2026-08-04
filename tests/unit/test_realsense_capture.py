@@ -171,3 +171,33 @@ def test_fake_realsense_capture_maps_to_epoch_and_retains_raw_clock_metadata() -
     assert first.raw_depth_timestamp_clock_domain == "hardware_clock"
     assert second.timestamp_ns - first.timestamp_ns == 33_000_000
     assert np.allclose(first.depth_image_m, 1.0)
+
+
+def test_realsense_capture_skips_unsynchronized_startup_pairs() -> None:
+    color = np.full((2, 2, 3), 7, dtype=np.uint8)
+    depth = np.full((2, 2), 1000, dtype=np.uint16)
+    unsynchronized = _FakeFrameSet(
+        _FakeFrame(color, timestamp_ms=1_000.0, frame_number=1),
+        _FakeFrame(depth, timestamp_ms=1_250.0, frame_number=1),
+    )
+    synchronized = _fake_frame_set(1_300.0, 2)
+    capture = RealSenseCapture(
+        RealSenseCaptureConfig(
+            width_px=2,
+            height_px=2,
+            enable_spatial_filter=False,
+            enable_temporal_filter=False,
+            synchronization_retry_count=2,
+        ),
+        epoch_clock_ns=lambda: 1_700_000_000_000_000_000,
+    )
+    capture._pipeline = _FakePipeline(  # noqa: SLF001 - injected hardware boundary
+        [unsynchronized, synchronized]
+    )
+    capture._align = _FakeAlign()  # noqa: SLF001 - injected hardware boundary
+    capture._depth_scale_m = 0.001  # noqa: SLF001 - injected hardware boundary
+
+    frame = capture.capture(CaptureRequest(mode=CaptureMode.SINGLE)).representative_frame
+
+    assert frame.frame_number == 2
+    assert abs(frame.color_timestamp_ns - frame.depth_timestamp_ns) == 400_000

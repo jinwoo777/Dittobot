@@ -9,12 +9,19 @@ network call. Structured semantic outputs call
 a JSON string. The supported dependency range is declared in `pyproject.toml`; model IDs remain
 environment settings and must be verified against the operator's account before live use.
 
-`DemonstrationAnalyzer`, `SkillGraphComposer`, and `RuntimeIntentResolver` accept only structured,
-bounded inputs and outputs. After schema parsing, every returned entity, primitive, profile, and
-binding identifier is checked for membership in the caller-supplied local catalogs; an unknown ID
-raises `SemanticCatalogViolationError` before the result reaches graph or runtime code.
-Representative RGB/depth-colormap keyframes may be data-URL image inputs; raw videos and raw depth
-arrays are not sent. `TranscriptionService` calls Audio Transcriptions with a Korean hint, domain
+`DemonstrationAnalyzer`, `RecordingSkillDraftAnalyzer`, `SkillGraphComposer`, and
+`RuntimeIntentResolver` accept only structured, bounded inputs and outputs. After schema parsing,
+every returned entity, primitive, profile, and binding identifier is checked for membership in the
+caller-supplied local catalogs; an unknown ID raises `SemanticCatalogViolationError` before the
+result reaches graph or runtime code. `RecordingSkillDraftAnalyzer` receives only server-selected,
+checksum-verified chronological RGB frames paired with locally rendered aligned-depth colormaps as
+base64 data URLs. Each pair is RGB then depth. The active GPT-5.6 Luna configuration accepts images
+but not video input, so raw video containers are not sent. Raw depth NPZ remains local. The strict
+prompt treats two intentionally extended fingertips as gripper jaw tips and their midpoint as a
+qualitative TCP proxy; the output schema forbids robot pose availability and contains no
+coordinates. It never receives client-selected paths, API keys, force values, or execution
+permission. `TranscriptionService`
+calls Audio Transcriptions with a Korean hint, domain
 prompt, verbose JSON, and segment timestamps. In mock mode, `robot-skill transcribe AUDIO_PATH`
 uses a sibling `.txt` sidecar when present and never constructs a live client.
 `SkillEmbeddingService` calls the Embeddings API in live mode and a deterministic local hash in
@@ -28,6 +35,37 @@ measured, surface-relative path samples. `SkillGraphComposer` is implemented and
 schema/catalog-tested as a service boundary, but it is not yet wired into the application induction
 flow. Therefore the current application does not claim that an OpenAI graph proposal drove the
 generated geometry or executable graph.
+
+The UI recording workflow is deliberately a semantic-draft boundary. It evenly selects at most
+`OPENAI_MAX_KEYFRAMES` aligned pairs (hard-limited to 300) from a finalized RGB-D manifest and persists the
+validated `RecordingSkillDraft` beside that recording. Direct image inputs remain the primary
+transport. If OpenAI rejects that image payload with an image/media/payload status error, the
+server creates a local ZIP archive of the exact chronological RGB/depth-preview set and renders the
+pairs as a labeled PDF contact sheet. The PDF is retried as an `input_file`, because normal file inputs do
+not expose images embedded in ZIP archives to vision models. The ZIP is provenance/recovery data,
+not a claimed vision input. The schema requires one TCP audit record for every supplied keyframe,
+normalized two-fingertip image landmarks or an explicit failure reason, and semantic hand/tool/work-
+surface regions. The schema fixes `executable=false` and `requires_pose_trajectory=true`;
+the OpenAI response itself does not register, compile, validate, activate, or execute a SkillGraph.
+Separate, explicitly invoked local endpoints use the normalized regions only as hints. Local raw
+aligned depth and recorded camera intrinsics own plane fitting and fingertip deprojection. They may
+add operator-confirmed surface calibration and two-fingertip RGB-D path evidence, register a
+surface-relative Candidate, and run compile/Mock validation. They do not grant hardware authority.
+
+Persisted recording drafts are available from `GET /skills/drafts` and
+`GET /skills/drafts/{draft_id}`. Their promotion-readiness view is fail-closed. The UI/API can add
+local evidence through:
+
+- `POST /skills/drafts/{draft_id}/surface-calibration`
+- `POST /skills/drafts/{draft_id}/surface-calibration/auto`
+- `POST /skills/drafts/{draft_id}/tcp-trajectory`
+- `POST /skills/drafts/{draft_id}/candidate`
+
+Candidate registration remains disabled until the first two artifacts pass local validation. The
+result stays a non-active, hardware-incompatible Candidate even after Mock validation. Real replay
+still requires an independently calibrated robot-base TF chain, robot FK/trajectory evidence, and
+the existing hardware safety path. A failed or absent legacy hand-eye NPY is advisory for this Mock
+candidate path and is never attached as transform provenance.
 
 ## Observability and privacy
 

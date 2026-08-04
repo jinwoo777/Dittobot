@@ -41,9 +41,9 @@
       this.timeoutMs = timeoutMs;
     }
 
-    async request(path, { method = "GET", body = undefined } = {}) {
+    async request(path, { method = "GET", body = undefined, timeoutMs = this.timeoutMs } = {}) {
       const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), this.timeoutMs);
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
       try {
         const response = await window.fetch(`${this.baseUrl}${path}`, {
           method,
@@ -69,7 +69,7 @@
         return payload;
       } catch (error) {
         if (error?.name === "AbortError") {
-          throw new DittobotApiError(`API 응답 제한 시간 ${this.timeoutMs}ms를 초과했습니다.`);
+          throw new DittobotApiError(`API 응답 제한 시간 ${timeoutMs}ms를 초과했습니다.`);
         }
         if (error instanceof DittobotApiError) throw error;
         throw new DittobotApiError("FastAPI 서버에 연결할 수 없습니다.", { detail: error });
@@ -84,6 +84,46 @@
 
     listSkills() {
       return this.request("/skills");
+    }
+
+    listSkillDrafts() {
+      return this.request("/skills/drafts");
+    }
+
+    getSkillDraft(draftId) {
+      return this.request(`/skills/drafts/${encodeURIComponent(draftId)}`);
+    }
+
+    calibrateDraftSurface(draftId, payload) {
+      return this.request(`/skills/drafts/${encodeURIComponent(draftId)}/surface-calibration`, {
+        method: "POST",
+        body: payload,
+        timeoutMs: 60000,
+      });
+    }
+
+    autoCalibrateDraftSurface(draftId, payload) {
+      return this.request(`/skills/drafts/${encodeURIComponent(draftId)}/surface-calibration/auto`, {
+        method: "POST",
+        body: payload,
+        timeoutMs: 60000,
+      });
+    }
+
+    createDraftTcpTrajectory(draftId, payload) {
+      return this.request(`/skills/drafts/${encodeURIComponent(draftId)}/tcp-trajectory`, {
+        method: "POST",
+        body: payload,
+        timeoutMs: 360000,
+      });
+    }
+
+    registerDraftCandidate(draftId) {
+      return this.request(`/skills/drafts/${encodeURIComponent(draftId)}/candidate`, {
+        method: "POST",
+        body: { acknowledge_mock_only: true },
+        timeoutMs: 120000,
+      });
     }
 
     getSkill(skillId, version = null) {
@@ -109,6 +149,110 @@
       return this.request("/scenes/capture", {
         method: "POST",
         body: { mode: "mock" },
+      });
+    }
+
+    cameraStatus() {
+      return this.request("/camera/status");
+    }
+
+    handeyeCalibrationStatus() {
+      return this.request("/calibration/hand-eye/status");
+    }
+
+    startHandeyeCalibration(operatorId = "ui_operator") {
+      return this.request("/calibration/hand-eye/start", {
+        method: "POST",
+        body: {
+          operator_id: operatorId,
+          operator_confirmed: true,
+          board_secured: true,
+          workspace_cleared: true,
+          estop_ready: true,
+        },
+      });
+    }
+
+    abortHandeyeCalibration(reason = "operator_request") {
+      return this.request("/calibration/hand-eye/abort", {
+        method: "POST",
+        body: { reason },
+      });
+    }
+
+    importLegacyHandeyeNpy(operatorId = "ui_operator") {
+      return this.request("/calibration/hand-eye/import-legacy-npy", {
+        method: "POST",
+        body: {
+          operator_id: operatorId,
+          operator_confirmed: true,
+          acknowledge_candidate_only: true,
+        },
+      });
+    }
+
+    startCameraPreview() {
+      return this.request("/camera/preview/start", { method: "POST", body: {} });
+    }
+
+    stopCameraPreview() {
+      return this.request("/camera/preview/stop", { method: "POST", body: {} });
+    }
+
+    cameraStreamUrl(kind) {
+      if (!new Set(["rgb", "depth"]).has(kind)) {
+        throw new DittobotApiError("카메라 스트림은 rgb 또는 depth여야 합니다.");
+      }
+      return `${this.baseUrl}/camera/streams/${kind}.mjpg?ts=${Date.now()}`;
+    }
+
+    startCameraRecording(maximumDurationS) {
+      return this.request("/camera/recordings", {
+        method: "POST",
+        body: { maximum_duration_s: maximumDurationS },
+      });
+    }
+
+    stopCameraRecording(recordingId) {
+      return this.request(`/camera/recordings/${encodeURIComponent(recordingId)}/stop`, {
+        method: "POST",
+        body: {},
+      });
+    }
+
+    getCameraRecording(recordingId) {
+      return this.request(`/camera/recordings/${encodeURIComponent(recordingId)}`);
+    }
+
+    listCameraRecordings() {
+      return this.request("/camera/recordings");
+    }
+
+    recordingFrameUrl(recordingId, frameIndex, kind) {
+      if (!new Set(["rgb", "depth"]).has(kind)) {
+        throw new DittobotApiError("녹화 프레임은 rgb 또는 depth여야 합니다.");
+      }
+      const safeIndex = Number(frameIndex);
+      if (!Number.isInteger(safeIndex) || safeIndex < 0) {
+        throw new DittobotApiError("녹화 프레임 번호가 올바르지 않습니다.");
+      }
+      return `${this.baseUrl}/camera/recordings/${encodeURIComponent(recordingId)}/frames/${safeIndex}/${kind}.jpg`;
+    }
+
+    recordingSkillDraftCapabilities() {
+      return this.request("/skills/draft-from-recording/capabilities");
+    }
+
+    createRecordingSkillDraft({ recordingId, nameHint, operatorInstruction, keyframeCount }) {
+      return this.request("/skills/draft-from-recording", {
+        method: "POST",
+        body: {
+          recording_id: recordingId,
+          name_hint: nameHint,
+          operator_instruction: operatorInstruction,
+          keyframe_count: keyframeCount,
+        },
+        timeoutMs: 360000,
       });
     }
 

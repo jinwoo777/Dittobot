@@ -19,10 +19,54 @@ samples, phase intervals, local fit residuals, quality issues, operator metadata
 scenes. A low-confidence or unsynchronized interval remains explicit and can force
 `reteach_required`; it is not silently converted into motion.
 
-That is the target artifact model. The current CLI/API session writes metadata plus captured Scene
-JSON and final status/transcript JSON; it does not yet record raw RGB/depth/audio/TF files. The
-standalone demonstration recorder writes `metadata.json` and `poses.jsonl` under a caller-supplied
-session directory.
+That is the target artifact model. The current CLI/API teaching session writes metadata plus
+captured Scene JSON and final status/transcript JSON. Separately, the UI Camera API records
+`rgb/<index>.jpg`, color-aligned `depth/<index>.npz`, and `rgbd_manifest.json` beneath a generated
+`demonstrations/rgbd_<id>/` URI. Every frame entry retains source/mapped timestamps, clock domains,
+intrinsics, depth scale, artifact URIs, and SHA-256 checksums. The manifest distinguishes the raw
+capture rate from the configured recording rate; recording defaults to 10 FPS without reducing the
+live preview rate. Audio, TF, inferred pose, and success
+labels are not added by that raw recorder. The standalone pose recorder still writes
+`metadata.json` and `poses.jsonl` under a caller-supplied session directory.
+
+Recording-based OpenAI review writes immutable `skill_drafts/<draft_id>.json` below the selected
+RGB-D recording. It contains the source recording ID, selected frame indices, OpenAI mode/model and
+trace metadata, RGB-then-depth transport metadata, and a strict semantic draft. The draft includes
+two-finger TCP-proxy states for every supplied keyframe, normalized image landmarks or an explicit
+failure reason, plus semantic hand/tool/work-surface regions. It contains no camera-metric or robot
+coordinates. It contains neither image bytes nor
+API credentials. The draft is explicitly non-executable and requires a separately validated pose
+trajectory. Draft-list API responses add a derived fail-closed promotion checklist without
+modifying the immutable artifact.
+
+Explicit promotion actions write immutable evidence below
+`skill_drafts/<draft_id>_evidence/`. A surface-calibration artifact records the selected RGB frame,
+three source pixels or a semantic ROI, locally derived `T_camera_surface`, quality diagnostics, and
+operator confirmation. Automatic calibration stores deterministic raw-depth RANSAC/SVD inlier,
+residual, normal, and extent diagnostics. A TCP-trajectory artifact records the calibration ID,
+per-frame fingertip evidence, locally depth-derived midpoint poses, surface-relative path, quality
+summary, and its manual, GPT-normalized-plus-local-depth, or local-MediaPipe method. Candidate
+registration adds a result artifact linking those evidence
+checksums to the generated graph and Mock validation run. These artifacts contain no API key and
+do not claim `T_base_camera` or hardware calibration.
+
+## Eye-in-hand calibration
+
+An explicitly confirmed calibration session writes
+`calibrations/handeye_<id>/session_started.json`, accepted RGB images, and one JSON observation per
+pose. Each observation contains a waypoint ID, capture timestamp, six joint angles in radians,
+`T_base_flange`, `T_camera_board`, and reprojection RMS. A completed solve writes `result.json` plus
+checksum-addressed `T_flange_camera.npy`. The result records the 10×7/0.025m fixed-board definition,
+locked J1/J2 policy, validation metrics, accepted observation IDs, and pass/fail state. Failed
+results remain evidence but are not publishable calibration authority.
+
+A confirmed legacy import never overwrites its configured source NPY. It creates a unique
+`calibrations/legacy_import_<id>/` directory containing the byte-identical
+`source_T_gripper2camera.npy`, a metre-valued `T_flange_camera_candidate.npy`, and `result.json`.
+The result records both checksums, source session, active/expected TCP names, measured
+`T_flange_tcp`, fixed-board residual metrics, and explicit `candidate_only`,
+`hardware_validated=false`, and `runtime_authorized=false` flags. A failed candidate remains audit
+evidence but is not included as geometry provenance in a generated SkillGraph.
 
 ## SkillGraph and manifest
 
@@ -64,5 +108,6 @@ Demonstration input is a separate allowlisted boundary: application paths may be
 absolute only when they resolve under `tests/fixtures` or
 `<ARTIFACT_ROOT>/demonstrations`. The default database is `data/robot_skills.db`; current execution
 runs/events are database rows. The schema includes URI/checksum fields and an embedding table; the
-application persists validated skill-version embeddings there. Raw camera/audio payloads are
-not automatically recorded by the current application flow.
+application persists validated skill-version embeddings there. Bulk camera payloads stay outside
+SQLite and are recorded only after an explicit Camera API start; audio is not automatically
+recorded by the current application flow.

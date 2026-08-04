@@ -132,6 +132,8 @@ class RealSenseCaptureConfig:
     default_mode: CaptureMode = CaptureMode.BURST
     default_burst_frame_count: int = 5
     wait_timeout_ms: int = 5000
+    maximum_timestamp_skew_ms: float = 20.0
+    synchronization_retry_count: int = 15
     enable_spatial_filter: bool = True
     enable_temporal_filter: bool = True
     enable_hole_filling: bool = False
@@ -141,6 +143,8 @@ class RealSenseCaptureConfig:
             raise ValueError("RealSense stream dimensions and rate must be positive")
         if self.default_burst_frame_count < 1 or self.wait_timeout_ms <= 0:
             raise ValueError("RealSense counts and timeouts must be positive")
+        if self.maximum_timestamp_skew_ms <= 0.0 or self.synchronization_retry_count < 1:
+            raise ValueError("RealSense synchronization limits must be positive")
 
 
 class RealSenseCapture:
@@ -227,59 +231,77 @@ class RealSenseCapture:
         if self._pipeline is None or self._align is None:
             raise NotConfiguredError("RealSense capture has not been started")
         try:
-            frames = self._pipeline.wait_for_frames(self.config.wait_timeout_ms)
-            observed_host_unix_epoch_ns = self._epoch_clock_ns()
-            aligned = self._align.process(frames)
-            color_frame = aligned.get_color_frame()
-            depth_frame = aligned.get_depth_frame()
-            if not color_frame or not depth_frame:
-                raise CaptureError("RealSense returned an incomplete RGB-D pair")
-            for filter_object in self._filters:
-                depth_frame = filter_object.process(depth_frame)
-            color = np.asanyarray(color_frame.get_data()).astype(np.uint8, copy=False)
-            raw_depth = np.asanyarray(depth_frame.get_data())
-            depth_m = np.asarray(raw_depth, dtype=np.float32) * self._depth_scale_m
-            video_profile = color_frame.profile.as_video_stream_profile()
-            intrinsic = video_profile.intrinsics
-            intrinsics = CameraIntrinsics(
-                width_px=int(intrinsic.width),
-                height_px=int(intrinsic.height),
-                fx_px=float(intrinsic.fx),
-                fy_px=float(intrinsic.fy),
-                cx_px=float(intrinsic.ppx),
-                cy_px=float(intrinsic.ppy),
-                distortion_model=str(intrinsic.model),
-                distortion_coefficients=tuple(float(value) for value in intrinsic.coeffs),
-            )
-            raw_color_timestamp_ns = int(
-                round(float(color_frame.get_timestamp()) * 1.0e6)
-            )
-            raw_depth_timestamp_ns = int(
-                round(float(depth_frame.get_timestamp()) * 1.0e6)
-            )
-            raw_color_clock_domain = _normalise_timestamp_clock_domain(color_frame)
-            raw_depth_clock_domain = _normalise_timestamp_clock_domain(depth_frame)
-            color_timestamp_ns, depth_timestamp_ns = self._timestamp_mapper.map_pair(
-                raw_color_timestamp_ns=raw_color_timestamp_ns,
-                raw_depth_timestamp_ns=raw_depth_timestamp_ns,
-                color_clock_domain=raw_color_clock_domain,
-                depth_clock_domain=raw_depth_clock_domain,
-                observed_host_unix_epoch_ns=observed_host_unix_epoch_ns,
-            )
-            return SynchronizedRGBDFrame(
-                color_image_rgb=color,
-                depth_image_m=depth_m,
-                color_timestamp_ns=color_timestamp_ns,
-                depth_timestamp_ns=depth_timestamp_ns,
-                color_intrinsics=intrinsics,
-                frame_number=int(color_frame.get_frame_number()),
-                depth_scale_m=self._depth_scale_m,
-                timestamp_clock_domain=HOST_UNIX_EPOCH_CLOCK_DOMAIN,
-                raw_color_timestamp_ns=raw_color_timestamp_ns,
-                raw_depth_timestamp_ns=raw_depth_timestamp_ns,
-                raw_color_timestamp_clock_domain=raw_color_clock_domain,
-                raw_depth_timestamp_clock_domain=raw_depth_clock_domain,
-            )
+            maximum_skew_ns = int(round(self.config.maximum_timestamp_skew_ms * 1.0e6))
+            for attempt in range(self.config.synchronization_retry_count):
+                frames = self._pipeline.wait_for_frames(self.config.wait_timeout_ms)
+                observed_host_unix_epoch_ns = self._epoch_clock_ns()
+                aligned = self._align.process(frames)
+                color_frame = aligned.get_color_frame()
+                depth_frame = aligned.get_depth_frame()
+                if not color_frame or not depth_frame:
+                    if attempt + 1 == self.config.synchronization_retry_count:
+                        raise CaptureError("RealSense returned incomplete RGB-D pairs")
+                    continue
+                raw_color_timestamp_ns = int(
+                    round(float(color_frame.get_timestamp()) * 1.0e6)
+                )
+                raw_depth_timestamp_ns = int(
+                    round(float(depth_frame.get_timestamp()) * 1.0e6)
+                )
+                raw_color_clock_domain = _normalise_timestamp_clock_domain(color_frame)
+                raw_depth_clock_domain = _normalise_timestamp_clock_domain(depth_frame)
+                if (
+                    raw_color_clock_domain == raw_depth_clock_domain
+                    and abs(raw_color_timestamp_ns - raw_depth_timestamp_ns)
+                    > maximum_skew_ns
+                ):
+                    if attempt + 1 == self.config.synchronization_retry_count:
+                        raise CaptureError(
+                            "RealSense RGB/depth frames did not synchronize within the limit"
+                        )
+                    continue
+                for filter_object in self._filters:
+                    depth_frame = filter_object.process(depth_frame)
+                color = np.asanyarray(color_frame.get_data()).astype(np.uint8, copy=True)
+                raw_depth = np.asanyarray(depth_frame.get_data())
+                depth_m = np.asarray(raw_depth, dtype=np.float32) * self._depth_scale_m
+                video_profile = color_frame.profile.as_video_stream_profile()
+                intrinsic = video_profile.intrinsics
+                intrinsics = CameraIntrinsics(
+                    width_px=int(intrinsic.width),
+                    height_px=int(intrinsic.height),
+                    fx_px=float(intrinsic.fx),
+                    fy_px=float(intrinsic.fy),
+                    cx_px=float(intrinsic.ppx),
+                    cy_px=float(intrinsic.ppy),
+                    distortion_model=str(intrinsic.model),
+                    distortion_coefficients=tuple(
+                        float(value) for value in intrinsic.coeffs
+                    ),
+                )
+                color_timestamp_ns, depth_timestamp_ns = self._timestamp_mapper.map_pair(
+                    raw_color_timestamp_ns=raw_color_timestamp_ns,
+                    raw_depth_timestamp_ns=raw_depth_timestamp_ns,
+                    color_clock_domain=raw_color_clock_domain,
+                    depth_clock_domain=raw_depth_clock_domain,
+                    observed_host_unix_epoch_ns=observed_host_unix_epoch_ns,
+                )
+                return SynchronizedRGBDFrame(
+                    color_image_rgb=color,
+                    depth_image_m=depth_m,
+                    color_timestamp_ns=color_timestamp_ns,
+                    depth_timestamp_ns=depth_timestamp_ns,
+                    color_intrinsics=intrinsics,
+                    frame_number=int(color_frame.get_frame_number()),
+                    depth_scale_m=self._depth_scale_m,
+                    maximum_timestamp_skew_ns=maximum_skew_ns,
+                    timestamp_clock_domain=HOST_UNIX_EPOCH_CLOCK_DOMAIN,
+                    raw_color_timestamp_ns=raw_color_timestamp_ns,
+                    raw_depth_timestamp_ns=raw_depth_timestamp_ns,
+                    raw_color_timestamp_clock_domain=raw_color_clock_domain,
+                    raw_depth_timestamp_clock_domain=raw_depth_clock_domain,
+                )
+            raise CaptureError("RealSense capture exhausted synchronization retries")
         except (CaptureError, ValueError):
             raise
         except Exception as exc:

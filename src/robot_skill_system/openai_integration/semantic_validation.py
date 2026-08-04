@@ -11,7 +11,12 @@ from collections.abc import Iterable, Mapping
 
 from robot_skill_system.exceptions import SemanticCatalogViolationError
 
-from .schemas import DemonstrationAnalysis, RuntimeIntent, SkillGraphProposal
+from .schemas import (
+    DemonstrationAnalysis,
+    RecordingSkillDraft,
+    RuntimeIntent,
+    SkillGraphProposal,
+)
 
 
 def _unknown(values: Iterable[str], catalog: Iterable[str]) -> set[str]:
@@ -124,3 +129,53 @@ def validate_skill_graph_proposal(
             "force_profile_ids": _unknown(force_profiles, approved_force_profiles),
         },
     )
+
+
+def validate_recording_skill_draft(
+    draft: RecordingSkillDraft,
+    *,
+    primitive_catalog: Iterable[str],
+    entity_role_catalog: Iterable[str],
+    keyframe_indices: Iterable[int],
+) -> None:
+    """Reject model-invented primitive, role, and frame identifiers."""
+
+    _raise_if_violations(
+        "RecordingSkillDraft",
+        {
+            "operations": _unknown(
+                (item.operation for item in draft.primitive_sequence),
+                primitive_catalog,
+            ),
+            "entity_roles": _unknown(
+                draft.required_entity_roles,
+                entity_role_catalog,
+            ),
+        },
+    )
+    expected_indices = set(keyframe_indices)
+    observed_list = [
+        state.frame_index for state in draft.tcp_proxy_observation.observed_states
+    ]
+    observed_indices = set(observed_list)
+    if len(observed_list) != len(observed_indices):
+        raise SemanticCatalogViolationError(
+            "RecordingSkillDraft returned duplicate TCP evidence frame indices"
+        )
+    if observed_indices != expected_indices:
+        raise SemanticCatalogViolationError(
+            "RecordingSkillDraft must audit every supplied TCP keyframe exactly once: "
+            f"missing={sorted(expected_indices - observed_indices)!r}; "
+            f"unknown={sorted(observed_indices - expected_indices)!r}"
+        )
+    scene_indices = {
+        draft.scene_observation.person_hand.representative_frame_index,
+        draft.scene_observation.tool.representative_frame_index,
+        draft.scene_observation.work_surface.representative_frame_index,
+    }
+    unknown_scene_indices = scene_indices - expected_indices
+    if unknown_scene_indices:
+        raise SemanticCatalogViolationError(
+            "RecordingSkillDraft referenced scene evidence frames outside the supplied "
+            f"keyframes: {sorted(unknown_scene_indices)!r}"
+        )

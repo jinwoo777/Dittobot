@@ -25,6 +25,13 @@ from .realsense_capture import (
     RealSenseCaptureConfig,
     RealSenseTimestampMapper,
 )
+from .rgbd_recording import (
+    CameraStateError,
+    RGBDCameraController,
+    RGBDRecordingWriter,
+    encode_depth_jpeg,
+    encode_rgb_jpeg,
+)
 from .sequence import (
     InferenceSamplingConfig,
     RGBDSequence,
@@ -38,6 +45,7 @@ __all__ = [
     "ArrayImageSequenceAdapter",
     "CameraExtrinsics",
     "CameraIntrinsics",
+    "CameraStateError",
     "CaptureError",
     "CaptureMode",
     "CaptureRequest",
@@ -53,6 +61,8 @@ __all__ = [
     "RGBDCapture",
     "RGBDFrame",
     "RGBDImageSequenceLoader",
+    "RGBDCameraController",
+    "RGBDRecordingWriter",
     "RGBDSequence",
     "RealSenseCapture",
     "RealSenseCaptureConfig",
@@ -62,4 +72,6 @@ __all__ = [
     "select_inference_frames",
     "select_keyframes",
     "sequence_from_frames",
+    "encode_depth_jpeg",
+    "encode_rgb_jpeg",
 ]

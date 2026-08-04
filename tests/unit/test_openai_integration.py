@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import APITimeoutError
+from openai import APITimeoutError, BadRequestError
 from pydantic import ValidationError
 
 from robot_skill_system.exceptions import SemanticCatalogViolationError
@@ -23,10 +23,16 @@ from robot_skill_system.openai_integration.embeddings import (
 )
 from robot_skill_system.openai_integration.intent_resolver import RuntimeIntentResolver
 from robot_skill_system.openai_integration.mock_client import MockOpenAIClient
+from robot_skill_system.openai_integration.recording_skill_analyzer import (
+    ImageInputRejectedError,
+    RecordingSkillDraftAnalyzer,
+)
 from robot_skill_system.openai_integration.schemas import (
     APICallMetadata,
     DemonstrationAnalysis,
     DemonstrationAnalysisInput,
+    RecordingSkillDraft,
+    RecordingSkillDraftInput,
     RuntimeIntent,
     SkillGraphProposal,
 )
@@ -139,6 +145,157 @@ def test_responses_parse_rejects_wrong_schema() -> None:
             payload={},
             output_type=RuntimeIntent,
             trace_id="trace-test",
+        )
+
+
+def test_live_recording_draft_sends_bounded_rgb_depth_pairs_with_store_disabled(
+    tmp_path: Path,
+) -> None:
+    rgb_image = tmp_path / "rgb_keyframe.jpg"
+    depth_image = tmp_path / "depth_keyframe.jpg"
+    rgb_image.write_bytes(b"\xff\xd8mock-rgb-jpeg\xff\xd9")
+    depth_image.write_bytes(b"\xff\xd8mock-depth-jpeg\xff\xd9")
+    request = RecordingSkillDraftInput(
+        recording_id="rgbd_0123456789abcdef0123456789abcdef",
+        name_hint="recorded_wipe",
+        operator_instruction="걸레로 표면을 닦는다",
+        recording_summary={"frame_count": 10, "recording_fps": 10},
+        primitive_catalog=["motion.move_l"],
+        entity_role_catalog=["tool", "target_surface"],
+        keyframe_indices=[5],
+        limitations=["No trusted robot-base pose trajectory."],
+    )
+    expected = MockOpenAIClient().analyze_recording_skill_draft(request, "trace")[0]
+    captured: dict[str, object] = {}
+
+    def parse(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(output_parsed=expected, id="resp_recording", usage=None)
+
+    fake_client = SimpleNamespace(responses=SimpleNamespace(parse=parse))
+    analyzer = RecordingSkillDraftAnalyzer(
+        settings(
+            tmp_path,
+            OPENAI_MODE="live",
+            OPENAI_API_KEY="test-secret",
+            OPENAI_MAX_KEYFRAMES="1",
+        ),
+        client=fake_client,
+        retry=RetryExecutor(0, sleep=lambda _seconds: None),
+    )
+
+    result, metadata = analyzer.analyze(
+        request,
+        rgb_paths=[rgb_image],
+        depth_paths=[depth_image],
+    )
+
+    assert result == expected
+    assert metadata.response_id == "resp_recording"
+    assert captured["store"] is False
+    [message] = captured["input"]  # type: ignore[misc]
+    assert [item["type"] for item in message["content"]] == [
+        "input_text",
+        "input_image",
+        "input_image",
+    ]
+    assert message["content"][1]["image_url"].startswith("data:image/jpeg;base64,")
+    assert message["content"][2]["image_url"].startswith("data:image/jpeg;base64,")
+    assert "midpoint_between_fingertips" in message["content"][0]["text"]
+    assert "EVERY supplied keyframe" in captured["instructions"]
+    assert "scene_observation" in captured["instructions"]
+    assert "test-secret" not in repr(captured)
+
+
+def test_responses_parse_sends_pdf_as_base64_input_file(tmp_path: Path) -> None:
+    pdf = tmp_path / "rgb_contact_sheet.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nmock\n%%EOF")
+    request = RecordingSkillDraftInput(
+        recording_id="rgbd_0123456789abcdef0123456789abcdef",
+        name_hint="recorded_wipe",
+        operator_instruction="걸레로 표면을 닦는다",
+        recording_summary={"frame_count": 10, "recording_fps": 10},
+        primitive_catalog=["motion.move_l"],
+        entity_role_catalog=["tool", "target_surface"],
+        keyframe_indices=[5],
+        limitations=["No trusted robot-base pose trajectory."],
+    )
+    expected = MockOpenAIClient().analyze_recording_skill_draft(request, "trace")[0]
+    captured: dict[str, object] = {}
+
+    def parse(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(output_parsed=expected, id="resp_pdf", usage=None)
+
+    result, _metadata = parse_structured_response(
+        client=SimpleNamespace(responses=SimpleNamespace(parse=parse)),
+        retry=RetryExecutor(0, sleep=lambda _seconds: None),
+        model="test-model",
+        instructions="strict",
+        payload=request,
+        output_type=RecordingSkillDraft,
+        trace_id="trace-pdf",
+        file_paths=[pdf],
+        image_detail="low",
+    )
+
+    assert result == expected
+    [message] = captured["input"]  # type: ignore[misc]
+    assert [item["type"] for item in message["content"]] == [
+        "input_text",
+        "input_file",
+    ]
+    file_part = message["content"][1]
+    assert file_part["filename"] == "rgb_contact_sheet.pdf"
+    assert file_part["detail"] == "low"
+    assert file_part["file_data"].startswith("data:application/pdf;base64,")
+
+
+def test_recording_analyzer_marks_rejected_images_for_file_fallback(
+    tmp_path: Path,
+) -> None:
+    rgb_image = tmp_path / "rgb_keyframe.jpg"
+    depth_image = tmp_path / "depth_keyframe.jpg"
+    rgb_image.write_bytes(b"\xff\xd8mock-rgb-jpeg\xff\xd9")
+    depth_image.write_bytes(b"\xff\xd8mock-depth-jpeg\xff\xd9")
+    request = RecordingSkillDraftInput(
+        recording_id="rgbd_0123456789abcdef0123456789abcdef",
+        name_hint="recorded_wipe",
+        operator_instruction="걸레로 표면을 닦는다",
+        recording_summary={"frame_count": 10, "recording_fps": 10},
+        primitive_catalog=["motion.move_l"],
+        entity_role_catalog=["tool", "target_surface"],
+        keyframe_indices=[5],
+        limitations=["No trusted robot-base pose trajectory."],
+    )
+
+    def reject_images(**_kwargs: object) -> object:
+        response = httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://example.invalid/v1/responses"),
+        )
+        raise BadRequestError(
+            "input_image payload is not supported",
+            response=response,
+            body={"error": "input_image payload is not supported"},
+        )
+
+    analyzer = RecordingSkillDraftAnalyzer(
+        settings(
+            tmp_path,
+            OPENAI_MODE="live",
+            OPENAI_API_KEY="test-secret",
+            OPENAI_MAX_KEYFRAMES="1",
+        ),
+        client=SimpleNamespace(responses=SimpleNamespace(parse=reject_images)),
+        retry=RetryExecutor(0, sleep=lambda _seconds: None),
+    )
+
+    with pytest.raises(ImageInputRejectedError, match="RGB-D image payload"):
+        analyzer.analyze(
+            request,
+            rgb_paths=[rgb_image],
+            depth_paths=[depth_image],
         )
 
 
