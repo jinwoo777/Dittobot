@@ -1,6 +1,7 @@
 .codex/
 .vscode/
-dittobot-design/
+dittobot-design/dittobot_Console_dc.html
+dittobot-design/support.js
 .env
 .env.*
 !.env.example
@@ -12,6 +13,7 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 data/*.db
+data/calibrations/*/
 data/**/*.npy
 data/demonstrations/*/
 data/demonstrations/*/rgb/
@@ -21,3 +23,6 @@ data/maps/*
 data/scenes/*.json
 data/skills/*/*/
 !data/**/.gitkeep
+/Calibration_Tutorial.zip
+/dsr_bringup2.zip
+/T_gripper2camera.npy

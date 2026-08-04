@@ -7,6 +7,11 @@ from typing import Any
 from fastapi import APIRouter
 
 from robot_skill_system.api.contracts import (
+    DraftAutoSurfaceCalibrationRequest,
+    DraftCandidateRegistrationRequest,
+    DraftSurfaceCalibrationRequest,
+    DraftTCPPathRequest,
+    RecordingSkillDraftRequest,
     SkillActivateRequest,
     SkillCompileRequest,
     SkillInduceRequest,
@@ -20,11 +25,82 @@ from robot_skill_system.api.dependencies import ServiceDependency
 router = APIRouter(prefix="/skills", tags=["skills"])
 
 
+@router.get("")
+def list_skills(service: ServiceDependency) -> dict[str, Any]:
+    return service.list_skills()
+
+
 @router.post("/induce")
 def induce_skill(
     request: SkillInduceRequest, service: ServiceDependency
 ) -> dict[str, Any]:
     return service.induce_skill(request.model_dump())
+
+
+@router.get("/draft-from-recording/capabilities")
+def recording_draft_capabilities(service: ServiceDependency) -> dict[str, Any]:
+    return service.get_recording_skill_draft_capabilities()
+
+
+@router.post("/draft-from-recording")
+def create_recording_draft(
+    request: RecordingSkillDraftRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.create_recording_skill_draft(request.model_dump())
+
+
+@router.get("/drafts")
+def list_recording_drafts(service: ServiceDependency) -> dict[str, Any]:
+    return service.list_recording_skill_drafts()
+
+
+@router.get("/drafts/{draft_id}")
+def get_recording_draft(
+    draft_id: str,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.get_recording_skill_draft(draft_id)
+
+
+@router.post("/drafts/{draft_id}/surface-calibration")
+def calibrate_recording_draft_surface(
+    draft_id: str,
+    request: DraftSurfaceCalibrationRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.calibrate_recording_draft_surface(draft_id, request.model_dump())
+
+
+@router.post("/drafts/{draft_id}/surface-calibration/auto")
+def auto_calibrate_recording_draft_surface(
+    draft_id: str,
+    request: DraftAutoSurfaceCalibrationRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.auto_calibrate_recording_draft_surface(
+        draft_id, request.model_dump()
+    )
+
+
+@router.post("/drafts/{draft_id}/tcp-trajectory")
+def create_recording_draft_tcp_trajectory(
+    draft_id: str,
+    request: DraftTCPPathRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.create_recording_draft_tcp_trajectory(
+        draft_id, request.model_dump()
+    )
+
+
+@router.post("/drafts/{draft_id}/candidate")
+def register_recording_draft_candidate(
+    draft_id: str,
+    request: DraftCandidateRegistrationRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.register_recording_draft_candidate(draft_id, request.model_dump())
 
 
 @router.post("/search")
@@ -35,8 +111,12 @@ def search_skills(
 
 
 @router.get("/{skill_id}")
-def get_skill(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
-    return service.get_skill(skill_id)
+def get_skill(
+    skill_id: str,
+    service: ServiceDependency,
+    version: str | None = None,
+) -> dict[str, Any]:
+    return service.get_skill(skill_id, version)
 
 
 @router.get("/{skill_id}/versions")

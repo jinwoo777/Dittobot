@@ -32,6 +32,17 @@ def _image_part(path: Path, detail: str) -> dict[str, str]:
     }
 
 
+def _file_part(path: Path, detail: str) -> dict[str, str]:
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    payload = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {
+        "type": "input_file",
+        "filename": path.name,
+        "file_data": f"data:{media_type};base64,{payload}",
+        "detail": detail,
+    }
+
+
 def parse_structured_response(
     *,
     client: OpenAI,
@@ -42,6 +53,7 @@ def parse_structured_response(
     output_type: type[SchemaT],
     trace_id: str,
     image_paths: list[Path] | None = None,
+    file_paths: list[Path] | None = None,
     image_detail: str = "auto",
     tool_dispatcher: SafeFunctionDispatcher | None = None,
     maximum_tool_rounds: int = 4,
@@ -65,14 +77,17 @@ def parse_structured_response(
     ]
     for path in image_paths or []:
         content.append(_image_part(path, image_detail))
+    for path in file_paths or []:
+        content.append(_file_part(path, image_detail))
 
     started = time.monotonic()
     LOGGER.info(
-        "openai_request_started trace_id=%s model=%s schema=%s image_count=%d",
+        "openai_request_started trace_id=%s model=%s schema=%s image_count=%d file_count=%d",
         trace_id,
         model,
         output_type.__name__,
         len(image_paths or []),
+        len(file_paths or []),
     )
 
     response_input: list[dict[str, Any]] = [{"role": "user", "content": content}]

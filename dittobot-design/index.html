@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="dittobot-api-base" content="">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; img-src 'self' http://127.0.0.1:8000 http://localhost:8000 data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <title>Dittobot Operator Console</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f8f7fb;
+      --panel: #f2f0f6;
+      --panel-strong: #ebe8f1;
+      --border: #ded9e6;
+      --text: #292333;
+      --muted: #706979;
+      --accent: #7752d6;
+      --accent-soft: #eee8fb;
+      --ok: #27835c;
+      --ok-soft: #e7f5ee;
+      --warn: #a26916;
+      --warn-soft: #fff3dc;
+      --danger: #bd3d3d;
+      --danger-soft: #fdeaea;
+      font-family: Inter, Pretendard, "Noto Sans KR", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: var(--bg); color: var(--text); }
+    button { font: inherit; }
+    button:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 32%, transparent); outline-offset: 2px; }
+    .shell { display: grid; grid-template-columns: 270px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { position: sticky; top: 0; height: 100vh; padding: 30px 22px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--panel); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
+    .brand-mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 60% 40% 56% 44%; color: white; font-weight: 800; background: linear-gradient(145deg, #9a7ae8, #6540c2); box-shadow: 0 6px 18px #7250c940; }
+    .brand strong { display: block; font-size: 19px; }
+    .brand small { display: block; margin-top: 3px; color: var(--muted); font: 12px ui-monospace, monospace; }
+    .nav { display: grid; gap: 4px; }
+    .nav button { border: 0; border-radius: 11px; padding: 12px 14px; text-align: left; color: var(--muted); background: transparent; cursor: pointer; }
+    .nav button[aria-current="page"] { color: #5736aa; background: var(--accent-soft); font-weight: 650; }
+    .connection { margin-top: auto; display: grid; gap: 10px; }
+    .mode { width: fit-content; padding: 7px 10px; border-radius: 9px; color: var(--warn); background: var(--warn-soft); font: 700 11px ui-monospace, monospace; letter-spacing: .04em; }
+    .mini-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: 0 0 auto; }
+    .dot.ok { background: var(--ok); }
+    .dot.danger { background: var(--danger); }
+    main { width: min(1120px, 100%); padding: 46px 54px 72px; }
+    .page[hidden] { display: none; }
+    .eyebrow { margin: 0 0 9px; color: var(--accent); font: 700 12px ui-monospace, monospace; letter-spacing: .11em; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 36px); letter-spacing: -.025em; }
+    .subtitle { max-width: 680px; margin: 9px 0 0; color: var(--muted); line-height: 1.6; }
+    .toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; flex-wrap: wrap; margin-bottom: 28px; }
+    .filters { display: flex; gap: 7px; }
+    .chip { padding: 8px 16px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: var(--panel); cursor: pointer; }
+    .chip[aria-pressed="true"] { color: #5736aa; border-color: var(--accent); background: var(--accent-soft); }
+    .banner { margin-bottom: 20px; padding: 11px 14px; border-radius: 10px; color: var(--warn); background: var(--warn-soft); font: 12px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+    .banner.ok { color: var(--ok); background: var(--ok-soft); }
+    .banner.danger { color: var(--danger); background: var(--danger-soft); }
+    .list { display: grid; gap: 10px; }
+    .skill-card { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 15px; background: var(--panel); cursor: pointer; }
+    .skill-card:hover { border-color: #c8bfd8; background: var(--panel-strong); }
+    .skill-card h2 { margin: 0 0 6px; font: 650 17px ui-monospace, monospace; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .tag { display: inline-block; margin-left: 8px; padding: 3px 8px; border-radius: 6px; font: 700 11px ui-monospace, monospace; }
+    .tag.candidate { color: var(--warn); background: var(--warn-soft); }
+    .tag.draft { color: #3d669f; background: #e7f0fb; }
+    .tag.tested { color: var(--ok); background: var(--ok-soft); }
+    .tag.active { color: #5736aa; background: var(--accent-soft); }
+    .button { border: 1px solid var(--border); border-radius: 10px; padding: 9px 15px; color: var(--text); background: var(--panel); cursor: pointer; }
+    .button.primary { color: white; border-color: var(--accent); background: var(--accent); font-weight: 700; }
+    .button.danger { color: var(--danger); border-color: var(--danger); background: transparent; }
+    .button:disabled { opacity: .45; cursor: not-allowed; }
+    .empty { padding: 42px 18px; border: 1px dashed var(--border); border-radius: 15px; color: var(--muted); text-align: center; }
+    .detail-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+    .nodes { display: grid; gap: 8px; margin-bottom: 24px; }
+    .node { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; padding: 15px 18px; border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 0 13px 13px 0; background: var(--panel); }
+    .node.running { border-left-color: var(--accent); }
+    .node.ok { border-left-color: var(--ok); }
+    .node.error { border-left-color: var(--danger); }
+    .node strong { font: 650 14px ui-monospace, monospace; }
+    .node p { margin: 5px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .node-state { align-self: center; color: var(--muted); font: 700 11px ui-monospace, monospace; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .safety { display: flex; gap: 9px; flex-wrap: wrap; margin: 24px 0; }
+    .safety span { padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--muted); font: 11px ui-monospace, monospace; }
+    .monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .8fr); gap: 18px; }
+    .panel { padding: 22px; border: 1px solid var(--border); border-radius: 17px; background: var(--panel); }
+    .camera-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .camera-view { position: relative; min-height: 220px; display: grid; place-items: center; overflow: hidden; border-radius: 13px; color: #cfc4e6; background: linear-gradient(#7957c715 1px, transparent 1px), linear-gradient(90deg, #7957c715 1px, transparent 1px), #25222b; background-size: 12.5% 12.5%; font: 12px ui-monospace, monospace; }
+    .camera-view img { width: 100%; height: 100%; min-height: 220px; object-fit: contain; background: #111; }
+    .camera-label { position: absolute; left: 10px; top: 9px; z-index: 1; padding: 4px 7px; border-radius: 6px; color: white; background: #17131fc9; font: 700 10px ui-monospace, monospace; }
+    .camera-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .camera-controls label { color: var(--muted); font-size: 12px; }
+    .camera-controls input { width: 70px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+    .calibration-card { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 13px; background: #fffdfd99; }
+    .calibration-card h3 { margin: 0 0 7px; font-size: 14px; }
+    .calibration-card p { margin: 6px 0; }
+    .calibration-progress { width: 100%; accent-color: var(--primary); }
+    .calibration-result { max-height: 220px; margin: 9px 0 0; overflow: auto; white-space: pre-wrap; font-size: 11px; }
+    .recording-status { margin: 10px 0 0; color: var(--muted); font: 11px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+    .run-title { margin: 4px 0 14px; font: 650 16px ui-monospace, monospace; }
+    .run-status { display: inline-block; padding: 5px 10px; border-radius: 999px; color: var(--muted); background: var(--panel-strong); font-size: 12px; }
+    .run-steps { min-height: 96px; margin: 18px 0; padding: 0; list-style: none; color: var(--muted); font: 12px/1.8 ui-monospace, monospace; }
+    .run-steps .done { color: var(--ok); }
+    .run-steps .current { color: var(--accent); font-weight: 700; }
+    .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .create-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 18px; margin-top: 26px; }
+    .form-grid { display: grid; gap: 12px; }
+    .form-grid label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+    .form-grid input, .form-grid select, .form-grid textarea { width: 100%; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; color: var(--text); background: var(--bg); font: inherit; }
+    .form-grid textarea { min-height: 108px; resize: vertical; line-height: 1.5; }
+    .recording-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; margin-bottom: 12px; }
+    .recording-picker select { min-width: 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; color: var(--text); background: var(--bg); }
+    .playback-controls { display: grid; grid-template-columns: auto minmax(100px, 1fr) auto; align-items: center; gap: 9px; margin-top: 12px; }
+    .playback-controls input { width: 100%; }
+    .playback-position { min-width: 74px; color: var(--muted); text-align: right; font: 11px ui-monospace, monospace; }
+    .draft-result { max-height: 330px; margin: 12px 0 0; padding: 13px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: var(--bg); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.55 ui-monospace, monospace; }
+    .notice { margin: 0; padding: 10px 12px; border-radius: 9px; color: var(--warn); background: var(--warn-soft); font-size: 12px; line-height: 1.55; }
+    .draft-card { border-left: 4px solid #7aa0d8; }
+    .draft-card p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .draft-inspector { margin-top: 18px; }
+    .draft-inspector[hidden] { display: none; }
+    .draft-inspector-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
+    .draft-inspector h2 { margin: 0; font: 700 20px ui-monospace, monospace; }
+    .draft-evidence { display: flex; gap: 7px; flex-wrap: wrap; margin: 12px 0 18px; }
+    .evidence-chip { padding: 6px 9px; border-radius: 8px; color: var(--muted); background: var(--panel-strong); font: 11px ui-monospace, monospace; }
+    .evidence-chip.ok { color: var(--ok); background: var(--ok-soft); }
+    .readiness-list { display: grid; gap: 8px; margin: 12px 0 16px; padding: 0; list-style: none; }
+    .readiness-item { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+    .readiness-item strong { display: block; font-size: 13px; }
+    .readiness-item small { display: block; margin-top: 3px; color: var(--muted); line-height: 1.45; }
+    .readiness-mark { color: var(--danger); font-weight: 800; }
+    .readiness-item.passed .readiness-mark { color: var(--ok); }
+    .readiness-item.advisory .readiness-mark { color: var(--muted); }
+    .draft-next-action { margin: 0 0 16px; padding: 11px 13px; border-radius: 10px; color: var(--warn); background: var(--warn-soft); font-size: 12px; line-height: 1.55; }
+    .draft-semantic-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+    .draft-semantic-list { margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .draft-semantic-list li { padding: 7px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+    .teaching-image { cursor: crosshair; }
+    .point-overlay { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+    .point-marker { position: absolute; width: 22px; height: 22px; display: grid; place-items: center; transform: translate(-50%, -50%); border: 2px solid white; border-radius: 50%; color: white; background: var(--accent); box-shadow: 0 1px 6px #0009; font: 800 10px ui-monospace, monospace; }
+    .geometry-teaching { margin-top: 14px; padding: 16px; border: 1px solid #cbbbea; border-radius: 13px; background: var(--accent-soft); }
+    .geometry-teaching[hidden] { display: none; }
+    .geometry-teaching h3 { margin: 0 0 7px; font-size: 16px; }
+    .geometry-teaching p { margin: 6px 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .geometry-teaching label { display: grid; gap: 5px; margin: 10px 0; color: var(--muted); font-size: 12px; }
+    .geometry-teaching input { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    @media (max-width: 800px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { position: static; width: 100%; height: auto; padding: 18px; }
+      .brand { margin-bottom: 16px; }
+      .nav { grid-template-columns: repeat(2, 1fr); }
+      .nav button { text-align: center; padding-inline: 7px; }
+      .connection { margin-top: 18px; }
+      main { padding: 32px 18px 56px; }
+      .monitor-grid { grid-template-columns: 1fr; }
+      .create-layout { grid-template-columns: 1fr; }
+      .camera-grid { grid-template-columns: 1fr; }
+      .draft-semantic-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">D</div>
+        <div><strong>dittobot</strong><small>M0609 · RG2 · D435i</small></div>
+      </div>
+      <nav class="nav" aria-label="주요 화면">
+        <button type="button" data-page="skills" aria-current="page">스킬 관리</button>
+        <button type="button" data-page="create">스킬 만들기</button>
+        <button type="button" data-page="detail">스킬 상세</button>
+        <button type="button" data-page="monitor">실시간 모니터링</button>
+      </nav>
+      <div class="connection">
+        <span class="mode">MOCK API</span>
+        <div class="mini-status"><span id="connection-dot" class="dot"></span><span id="connection-label">FastAPI 연결 확인 중</span></div>
+      </div>
+    </aside>
+
+    <main>
+      <section id="page-skills" class="page">
+        <div class="toolbar">
+          <header><p class="eyebrow">01 · REGISTRY</p><h1>스킬 관리</h1><p class="subtitle">분석 초안의 승격 준비도를 확인하고, SQLite에 등록된 스킬 버전을 검증·활성화하거나 Mock으로 실행합니다.</p></header>
+          <div class="filters" aria-label="스킬 필터">
+            <button type="button" class="chip" data-filter="all" aria-pressed="true">전체</button>
+            <button type="button" class="chip" data-filter="draft" aria-pressed="false">분석 초안</button>
+            <button type="button" class="chip" data-filter="candidate" aria-pressed="false">후보</button>
+            <button type="button" class="chip" data-filter="active" aria-pressed="false">활성</button>
+          </div>
+        </div>
+        <div id="api-banner" class="banner" role="status" aria-live="polite">FastAPI 연결 확인 중…</div>
+        <div id="skill-list" class="list"></div>
+        <div id="skill-empty" class="empty" hidden>등록된 스킬이 없습니다.</div>
+        <section id="draft-inspector" class="panel draft-inspector" hidden aria-live="polite">
+          <div class="draft-inspector-head">
+            <div><p class="eyebrow">PROMOTION READINESS</p><h2 id="draft-inspector-title">분석 초안</h2><p id="draft-inspector-summary" class="subtitle"></p></div>
+            <button id="close-draft-inspector" type="button" class="button" aria-label="초안 상세 닫기">닫기</button>
+          </div>
+          <div id="draft-evidence" class="draft-evidence"></div>
+          <div class="draft-semantic-grid">
+            <div><p class="eyebrow">SEMANTIC PRIMITIVES</p><ul id="draft-primitive-list" class="draft-semantic-list"></ul></div>
+            <div><p class="eyebrow">UNRESOLVED EVIDENCE</p><ul id="draft-ambiguity-list" class="draft-semantic-list"></ul></div>
+          </div>
+          <p class="eyebrow">승격 체크리스트</p>
+          <ul id="draft-readiness-list" class="readiness-list"></ul>
+          <p id="draft-next-action" class="draft-next-action"></p>
+          <div class="actions">
+            <button id="review-draft-recording" type="button" class="button">녹화 다시 보기</button>
+            <button id="auto-surface-calibration" type="button" class="button">Depth 평면 자동 추출</button>
+            <button id="start-surface-calibration" type="button" class="button">표면 TF 보정</button>
+            <button id="start-path-teaching" type="button" class="button">경로 티칭 시작</button>
+            <button id="auto-tcp-path" type="button" class="button">GPT TCP 경로 적용</button>
+            <button id="register-draft-candidate" type="button" class="button primary" disabled>Candidate로 등록</button>
+          </div>
+        </section>
+      </section>
+
+      <section id="page-create" class="page" hidden>
+        <header><p class="eyebrow">02 · TEACHING REVIEW</p><h1>녹화로 스킬 초안 만들기</h1><p class="subtitle">저장된 RGB-D 시퀀스를 확인하고 시간 정렬된 대표 RGB + Depth 컬러맵 쌍을 GPT에 보내 의미 기반 스킬 초안을 만듭니다. API 키와 로컬 파일 경로는 브라우저에 노출되지 않습니다.</p></header>
+        <div class="create-layout">
+          <div class="panel">
+            <p class="eyebrow">RECORDED RGB-D</p>
+            <div class="recording-picker">
+              <select id="recording-select" aria-label="저장된 RGB-D 녹화 선택"><option value="">녹화를 불러오는 중…</option></select>
+              <button id="refresh-recordings" type="button" class="button">새로고침</button>
+            </div>
+            <div class="camera-grid">
+              <div id="recorded-rgb-view" class="camera-view"><span class="camera-label">RECORDED RGB</span><span id="recorded-rgb-placeholder">녹화를 선택해 주세요</span><img id="recorded-rgb-frame" alt="선택한 녹화의 RGB 프레임" hidden><div id="recorded-point-overlay" class="point-overlay"></div></div>
+              <div class="camera-view"><span class="camera-label">RECORDED DEPTH · 0–3m</span><span id="recorded-depth-placeholder">녹화를 선택해 주세요</span><img id="recorded-depth-frame" alt="선택한 녹화의 depth 프레임" hidden></div>
+            </div>
+            <div class="playback-controls">
+              <button id="toggle-recording-playback" type="button" class="button" disabled>재생</button>
+              <input id="recording-frame-index" type="range" min="0" max="0" step="1" value="0" disabled aria-label="녹화 프레임 위치">
+              <output id="recording-frame-label" class="playback-position">0 / 0</output>
+            </div>
+            <p id="recording-review-status" class="recording-status" role="status" aria-live="polite">저장된 녹화를 불러오는 중…</p>
+            <section id="geometry-teaching" class="geometry-teaching" hidden aria-live="polite">
+              <p class="eyebrow">LOCAL RGB-D GEOMETRY</p>
+              <h3 id="geometry-teaching-title">표면 TF 보정</h3>
+              <p id="geometry-teaching-instruction"></p>
+              <label id="surface-anchor-label">표면 anchor ID
+                <input id="surface-anchor-id" type="text" value="teaching_surface" pattern="[A-Za-z][A-Za-z0-9_.-]{0,63}" maxlength="64">
+              </label>
+              <p id="geometry-point-summary"></p>
+              <div class="actions">
+                <button id="reset-geometry-points" type="button" class="button">현재 점 초기화</button>
+                <button id="add-path-sample" type="button" class="button" hidden>현재 프레임 샘플 추가</button>
+                <button id="save-geometry-evidence" type="button" class="button primary" disabled>증거 저장</button>
+                <button id="cancel-geometry-teaching" type="button" class="button">취소</button>
+              </div>
+              <p class="notice">이 보정과 경로는 surface-relative Candidate/Mock 검증용입니다. 실제 로봇 실행에는 ROS TF의 robot_base → surface와 별도 hand-eye 검증이 필요합니다.</p>
+            </section>
+          </div>
+          <form id="recording-skill-form" class="panel form-grid">
+            <p class="eyebrow">SEMANTIC SKILL DRAFT</p>
+            <p id="openai-capability" class="notice">OpenAI 연결 상태 확인 중…</p>
+            <label>스킬 ID
+              <input id="draft-skill-name" type="text" value="recorded_skill" pattern="[a-z][a-z0-9_]{2,63}" maxlength="64" required autocomplete="off">
+            </label>
+            <label>작업 설명
+              <textarea id="draft-instruction" maxlength="2000" required placeholder="예: 걸레로 테이블 표면을 왼쪽에서 오른쪽으로 닦는 동작"></textarea>
+            </label>
+            <label>GPT에 보낼 대표 RGB-D 프레임 쌍 수
+              <input id="draft-keyframe-count" type="number" min="1" max="300" step="1" value="100" required>
+            </label>
+            <button id="analyze-recording" type="submit" class="button primary" disabled>GPT로 분석해 스킬 초안 만들기</button>
+            <p class="notice">현재 모델은 video input을 지원하지 않아 최대 300쌍의 RGB → 정렬 Depth 컬러맵 이미지를 시간순으로 보냅니다. 이미지 입력이 거부되면 RGB-D ZIP을 로컬에 보관하고 PDF 콘택트시트로 자동 재전송합니다.</p>
+            <p class="notice">TCP 티칭: 엄지와 검지 등 두 손가락을 집게 jaw처럼 의도적으로 펴고, 두 fingertip이 함께 보이도록 움직여 주세요. 분석은 두 끝점의 중점을 정성적 TCP 프록시로 추적하지만 로봇 좌표로 사용하지 않습니다.</p>
+            <p class="notice">이 단계의 결과는 실행 불가 semantic draft입니다. 실제 스킬 승격에는 로컬 robot/tool pose, TF 및 안전 검증이 추가로 필요합니다.</p>
+            <p id="draft-status" class="recording-status" role="status" aria-live="polite">녹화를 선택해 주세요.</p>
+            <pre id="draft-result" class="draft-result" hidden></pre>
+          </form>
+        </div>
+      </section>
+
+      <section id="page-detail" class="page" hidden>
+        <div class="detail-head">
+          <header><p class="eyebrow">03 · SKILLGRAPH</p><h1 id="detail-title">스킬을 선택하세요</h1><p id="detail-subtitle" class="subtitle">스킬 관리 화면에서 버전을 선택해 주세요.</p></header>
+          <button id="validate-skill" type="button" class="button primary">전체 Mock 검증</button>
+        </div>
+        <div id="detail-nodes" class="nodes"></div>
+        <div class="actions">
+          <button id="activate-skill" type="button" class="button primary">검증 후 활성화</button>
+          <button type="button" class="button" data-page="skills">목록으로</button>
+        </div>
+      </section>
+
+      <section id="page-monitor" class="page" hidden>
+        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">Scene/binding/runtime은 Mock 전용입니다. 별도 gate가 적용된 eye-in-hand calibration만 제한된 DSR 이동 경계를 사용합니다.</p></header>
+        <div class="safety"><span id="estop-chip">● E-STOP READY</span><span id="force-chip">○ FORCE SUPERVISOR IDLE</span><span id="workspace-chip">○ WORKSPACE MONITOR IDLE</span><span>● MOCK MODE</span></div>
+        <div class="monitor-grid">
+          <div class="panel">
+            <p class="eyebrow">REALSENSE RGB-D</p>
+            <div class="camera-grid">
+              <div class="camera-view"><span class="camera-label">RGB</span><span id="rgb-placeholder">카메라를 시작해 주세요</span><img id="rgb-stream" alt="RealSense RGB 실시간 영상" hidden></div>
+              <div class="camera-view"><span class="camera-label">DEPTH · 0–3m</span><span id="depth-placeholder">정렬 Depth 대기 중</span><img id="depth-stream" alt="RealSense 정렬 depth 컬러맵" hidden></div>
+            </div>
+            <div class="camera-controls">
+              <button id="start-camera" type="button" class="button primary">RGB-D 켜기</button>
+              <button id="stop-camera" type="button" class="button" disabled>카메라 끄기</button>
+              <label for="record-duration">최대 초</label>
+              <input id="record-duration" type="number" min="1" max="60" step="1" value="30" inputmode="numeric">
+              <button id="start-recording" type="button" class="button danger" disabled>모션 녹화 시작</button>
+              <button id="stop-recording" type="button" class="button" disabled>녹화 중지</button>
+            </div>
+            <p id="camera-status" class="recording-status" role="status" aria-live="polite">RealSense 정지됨 · 사용자가 시작할 때만 카메라가 열립니다.</p>
+            <div class="calibration-card">
+              <h3>Eye-in-hand Calibration</h3>
+              <p class="muted">고정 10×7 Chessboard · 25mm · J1/J2 고정 · J3–J6 최대 ±5° · 출력 T_flange_camera</p>
+              <p class="notice">J1/J2를 0°에 놓고 보드 고정, 작업공간 비움, E-stop 준비를 확인하세요. Calibrate를 누르면 J1/J2는 고정한 채 J3–J6가 먼저 [90,0,90,0]으로 이동합니다. 실제 이동에는 모든 hardware/calibration gate가 필요합니다.</p>
+              <div class="camera-controls">
+                <button id="start-handeye-calibration" type="button" class="button primary" disabled>Calibrate</button>
+                <button id="abort-handeye-calibration" type="button" class="button danger" disabled>Calibration 중단</button>
+                <button id="import-legacy-handeye" type="button" class="button" disabled>NPY TF 복사·검증</button>
+              </div>
+              <progress id="calibration-progress" class="calibration-progress" max="21" value="0"></progress>
+              <p id="calibration-status" class="recording-status" role="status" aria-live="polite">보정 상태 확인 중…</p>
+              <pre id="calibration-result" class="calibration-result" hidden></pre>
+            </div>
+          </div>
+          <div class="panel">
+            <span id="run-status" class="run-status">대기</span>
+            <p id="run-title" class="run-title">실행 중인 스킬 없음</p>
+            <ul id="run-steps" class="run-steps"><li>활성 스킬의 실행 버튼을 눌러주세요.</li></ul>
+            <div class="control-grid">
+              <button type="button" class="button" disabled title="백엔드 API 미구현">일시정지</button>
+              <button type="button" class="button" disabled title="백엔드 API 미구현">재개</button>
+              <button id="estop-run" type="button" class="button danger">안전정지</button>
+              <button id="abort-run" type="button" class="button danger">중단</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="./api-client.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

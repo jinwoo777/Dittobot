@@ -12,13 +12,24 @@ from .schemas import (
     DemonstrationAnalysis,
     DemonstrationAnalysisInput,
     EmbeddingResult,
+    HandShapeObservation,
     MotionStyle,
+    NormalizedImagePoint,
+    NormalizedImageRegion,
     PrimitiveRecommendation,
+    RecordingSceneObservation,
+    RecordingSkillDraft,
+    RecordingSkillDraftInput,
+    RecordingSkillDraftPrimitive,
     RuntimeIntent,
     SemanticPhase,
     SkillGraphProposal,
     SkillGraphProposalNode,
+    TCPProxyFrameState,
+    TCPProxyObservation,
+    ToolShapeObservation,
     TranscriptResult,
+    WorkSurfaceObservation,
 )
 
 
@@ -100,6 +111,137 @@ class MockOpenAIClient:
             rationale_summary="Deterministic mock result combining local fit candidates.",
         )
         return analysis, APICallMetadata(trace_id=trace_id)
+
+    def analyze_recording_skill_draft(
+        self, request: RecordingSkillDraftInput, trace_id: str
+    ) -> tuple[RecordingSkillDraft, APICallMetadata]:
+        """Return a deterministic non-executable draft for offline UI/tests."""
+
+        lowered = request.operator_instruction.lower()
+        preferred_operations = (
+            ["motion.move_l", "contact.search_surface", "contact.follow_path"]
+            if "닦" in request.operator_instruction or "wipe" in lowered
+            else ["motion.move_l"]
+        )
+        operations = [
+            operation
+            for operation in preferred_operations
+            if operation in request.primitive_catalog
+        ]
+        if not operations:
+            operations = [request.primitive_catalog[0]]
+        preferred_roles = ["tool", "target_surface"]
+        roles = [role for role in preferred_roles if role in request.entity_role_catalog]
+        if not roles:
+            roles = [request.entity_role_catalog[0]]
+        frame_count = len(request.keyframe_indices)
+        midpoint_index = request.keyframe_indices[frame_count // 2]
+        tcp_states = [
+            TCPProxyFrameState(
+                frame_index=frame_index,
+                gripper_state="pinching",
+                landmarks_detected=True,
+                jaw_tip_a_normalized=NormalizedImagePoint(
+                    x=0.32 + 0.30 * position / max(1, frame_count - 1),
+                    y=0.48,
+                ),
+                jaw_tip_b_normalized=NormalizedImagePoint(
+                    x=0.38 + 0.30 * position / max(1, frame_count - 1),
+                    y=0.48,
+                ),
+                midpoint_normalized=NormalizedImagePoint(
+                    x=0.35 + 0.30 * position / max(1, frame_count - 1),
+                    y=0.48,
+                ),
+                confidence=0.8,
+            )
+            for position, frame_index in enumerate(request.keyframe_indices)
+        ]
+        trajectory_usable = frame_count >= 4
+        draft = RecordingSkillDraft(
+            suggested_skill_id=request.name_hint,
+            display_name=request.name_hint.replace("_", " "),
+            task_description=request.operator_instruction,
+            observed_task_summary=(
+                f"Chronological review of {len(request.keyframe_indices)} selected RGB frames."
+            ),
+            required_entity_roles=roles,
+            primitive_sequence=[
+                RecordingSkillDraftPrimitive(
+                    operation=operation,
+                    rationale="Allowed semantic operation suggested from the frame sequence.",
+                    confidence=0.8,
+                )
+                for operation in operations
+            ],
+            scene_observation=RecordingSceneObservation(
+                person_hand=HandShapeObservation(
+                    detected=True,
+                    shape="two_finger_gripper",
+                    representative_frame_index=midpoint_index,
+                    region_normalized=NormalizedImageRegion(
+                        x_min=0.25, y_min=0.25, x_max=0.75, y_max=0.70
+                    ),
+                    description="Mock hand uses two extended fingertips as gripper jaws.",
+                    confidence=0.8,
+                ),
+                tool=ToolShapeObservation(
+                    detected="tool" in roles,
+                    shape="wiper" if "tool" in roles else "not_detected",
+                    representative_frame_index=midpoint_index,
+                    region_normalized=(
+                        NormalizedImageRegion(
+                            x_min=0.30, y_min=0.40, x_max=0.70, y_max=0.75
+                        )
+                        if "tool" in roles
+                        else None
+                    ),
+                    description=(
+                        "Mock elongated wiping tool."
+                        if "tool" in roles
+                        else "No separate tool is visible."
+                    ),
+                    confidence=0.75,
+                ),
+                work_surface=WorkSurfaceObservation(
+                    detected=True,
+                    shape="planar_rectangular",
+                    representative_frame_index=midpoint_index,
+                    region_normalized=NormalizedImageRegion(
+                        x_min=0.05, y_min=0.30, x_max=0.95, y_max=0.95
+                    ),
+                    plane_likelihood=0.9,
+                    description="Mock dominant workbench plane.",
+                    confidence=0.9,
+                ),
+            ),
+            tcp_proxy_observation=TCPProxyObservation(
+                detected=True,
+                observed_states=tcp_states,
+                trajectory_status="complete",
+                valid_landmark_frame_count=frame_count,
+                usable_for_local_depth_path=trajectory_usable,
+                failure_reason=(
+                    None
+                    if trajectory_usable
+                    else "Fewer than four keyframes were supplied for a local depth path."
+                ),
+                depth_consistency="consistent",
+                motion_summary=(
+                    "Mock two-finger gripper proxy follows the demonstrated semantic path."
+                ),
+                confidence=0.8,
+                semantic_only=True,
+                robot_tcp_pose_available=False,
+            ),
+            unresolved_ambiguities=[
+                "RGB frames do not provide robot-base pose, TF, or measured force evidence."
+            ],
+            confidence=0.8,
+            executable=False,
+            requires_pose_trajectory=True,
+        )
+        return draft, APICallMetadata(trace_id=trace_id)
 
     def resolve_intent(
         self,

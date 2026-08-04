@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -79,6 +79,195 @@ class DemonstrationAnalysisInput(StrictModel):
     motion_fitting_candidates: list[dict[str, Any]]
     confidence_summary: dict[str, float]
     keyframe_paths: list[str] = Field(default_factory=list, max_length=12)
+
+
+class RecordingSkillDraftPrimitive(StrictModel):
+    """One chronological primitive suggestion without geometry or safety numbers."""
+
+    operation: str = Field(pattern=r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+    rationale: str = Field(min_length=1, max_length=500)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class TCPProxyTeachingDefinition(StrictModel):
+    """Operator-approved visual convention for a non-executable TCP proxy."""
+
+    proxy_type: Literal["two_finger_gripper"] = "two_finger_gripper"
+    jaw_tip_landmarks: Literal["two_visible_fingertips"] = "two_visible_fingertips"
+    tcp_proxy_rule: Literal["midpoint_between_fingertips"] = (
+        "midpoint_between_fingertips"
+    )
+    coordinate_policy: Literal["semantic_observation_only"] = "semantic_observation_only"
+
+
+class NormalizedImagePoint(StrictModel):
+    """Non-metric image location; local RGB-D code must recover 3-D geometry."""
+
+    x: float = Field(ge=0.0, le=1.0)
+    y: float = Field(ge=0.0, le=1.0)
+
+
+class NormalizedImageRegion(StrictModel):
+    """Normalized image ROI supplied only as a hint to local depth processing."""
+
+    x_min: float = Field(ge=0.0, le=1.0)
+    y_min: float = Field(ge=0.0, le=1.0)
+    x_max: float = Field(ge=0.0, le=1.0)
+    y_max: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _ordered_bounds(self) -> NormalizedImageRegion:
+        if self.x_max <= self.x_min or self.y_max <= self.y_min:
+            raise ValueError("normalized image region bounds must be ordered")
+        return self
+
+
+class TCPProxyFrameState(StrictModel):
+    """Audited two-finger state for exactly one supplied RGB-D frame pair."""
+
+    frame_index: int = Field(ge=0)
+    gripper_state: Literal["open", "pinching", "closed", "occluded", "uncertain"]
+    landmarks_detected: bool
+    jaw_tip_a_normalized: NormalizedImagePoint | None = None
+    jaw_tip_b_normalized: NormalizedImagePoint | None = None
+    midpoint_normalized: NormalizedImagePoint | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _landmark_fields_are_all_or_none(self) -> TCPProxyFrameState:
+        landmarks = (
+            self.jaw_tip_a_normalized,
+            self.jaw_tip_b_normalized,
+            self.midpoint_normalized,
+        )
+        if self.landmarks_detected and any(item is None for item in landmarks):
+            raise ValueError("detected fingertip landmarks require both tips and midpoint")
+        if not self.landmarks_detected and any(item is not None for item in landmarks):
+            raise ValueError("undetected fingertip landmarks cannot contain image positions")
+        return self
+
+
+class TCPProxyObservation(StrictModel):
+    """Frame-complete visual TCP audit with non-metric image coordinates."""
+
+    detected: bool
+    observed_states: list[TCPProxyFrameState] = Field(min_length=1, max_length=300)
+    trajectory_status: Literal["complete", "partial", "not_detected"]
+    valid_landmark_frame_count: int = Field(ge=0, le=300)
+    usable_for_local_depth_path: bool
+    failure_reason: str | None = Field(default=None, min_length=1, max_length=1000)
+    depth_consistency: Literal["consistent", "ambiguous", "inconsistent", "unavailable"]
+    motion_summary: str = Field(min_length=1, max_length=1000)
+    confidence: float = Field(ge=0.0, le=1.0)
+    semantic_only: Literal[True] = True
+    robot_tcp_pose_available: Literal[False] = False
+
+    @model_validator(mode="after")
+    def _detection_requires_evidence(self) -> TCPProxyObservation:
+        valid_count = sum(item.landmarks_detected for item in self.observed_states)
+        if self.valid_landmark_frame_count != valid_count:
+            raise ValueError("valid_landmark_frame_count does not match observed states")
+        if self.detected is not (valid_count > 0):
+            raise ValueError("TCP proxy detected flag does not match landmark evidence")
+        if self.usable_for_local_depth_path is not (valid_count >= 4):
+            raise ValueError("local depth path requires at least four landmark frames")
+        expected_status = (
+            "not_detected"
+            if valid_count == 0
+            else "complete"
+            if valid_count == len(self.observed_states)
+            else "partial"
+        )
+        if self.trajectory_status != expected_status:
+            raise ValueError("trajectory_status does not match frame landmark coverage")
+        if self.usable_for_local_depth_path and self.failure_reason is not None:
+            raise ValueError("usable TCP trajectory cannot contain a failure reason")
+        if not self.usable_for_local_depth_path and self.failure_reason is None:
+            raise ValueError("unusable TCP trajectory requires an explicit failure reason")
+        return self
+
+
+class HandShapeObservation(StrictModel):
+    detected: bool
+    shape: Literal[
+        "two_finger_gripper", "open_hand", "closed_hand", "other", "occluded", "not_detected"
+    ]
+    representative_frame_index: int = Field(ge=0)
+    region_normalized: NormalizedImageRegion | None = None
+    description: str = Field(min_length=1, max_length=500)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class ToolShapeObservation(StrictModel):
+    detected: bool
+    shape: Literal[
+        "gripper", "wiper", "brush", "driver", "container", "other", "not_detected"
+    ]
+    representative_frame_index: int = Field(ge=0)
+    region_normalized: NormalizedImageRegion | None = None
+    description: str = Field(min_length=1, max_length=500)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class WorkSurfaceObservation(StrictModel):
+    detected: bool
+    shape: Literal[
+        "planar_rectangular", "planar_irregular", "curved", "ambiguous", "not_detected"
+    ]
+    representative_frame_index: int = Field(ge=0)
+    region_normalized: NormalizedImageRegion | None = None
+    plane_likelihood: float = Field(ge=0.0, le=1.0)
+    description: str = Field(min_length=1, max_length=500)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class RecordingSceneObservation(StrictModel):
+    """Semantic image regions; never a metric plane or execution authority."""
+
+    person_hand: HandShapeObservation
+    tool: ToolShapeObservation
+    work_surface: WorkSurfaceObservation
+
+
+class RecordingSkillDraft(StrictModel):
+    """Non-executable semantic interpretation of chronological RGB-D evidence."""
+
+    suggested_skill_id: str = Field(pattern=r"^[a-z][a-z0-9_]{2,63}$")
+    display_name: str = Field(min_length=1, max_length=120)
+    task_description: str = Field(min_length=1, max_length=2000)
+    observed_task_summary: str = Field(min_length=1, max_length=2000)
+    required_entity_roles: list[str] = Field(default_factory=list, max_length=8)
+    primitive_sequence: list[RecordingSkillDraftPrimitive] = Field(
+        default_factory=list, max_length=32
+    )
+    scene_observation: RecordingSceneObservation
+    tcp_proxy_observation: TCPProxyObservation
+    unresolved_ambiguities: list[str] = Field(default_factory=list, max_length=32)
+    confidence: float = Field(ge=0.0, le=1.0)
+    executable: Literal[False] = False
+    requires_pose_trajectory: Literal[True] = True
+
+
+class RecordingSkillDraftInput(StrictModel):
+    """Bounded metadata paired with chronological aligned RGB-depth image pairs."""
+
+    recording_id: str = Field(pattern=r"^rgbd_[A-Za-z0-9_-]{1,96}$")
+    name_hint: str = Field(pattern=r"^[a-z][a-z0-9_]{2,63}$")
+    operator_instruction: str = Field(min_length=1, max_length=2000)
+    recording_summary: dict[str, Any]
+    primitive_catalog: list[str] = Field(min_length=1, max_length=64)
+    entity_role_catalog: list[str] = Field(min_length=1, max_length=16)
+    keyframe_indices: list[int] = Field(min_length=1, max_length=300)
+    image_pair_order: Literal["rgb_then_aligned_depth_per_keyframe"] = (
+        "rgb_then_aligned_depth_per_keyframe"
+    )
+    depth_visualization: Literal["turbo_colormap_near_warm_invalid_black"] = (
+        "turbo_colormap_near_warm_invalid_black"
+    )
+    tcp_proxy_definition: TCPProxyTeachingDefinition = Field(
+        default_factory=TCPProxyTeachingDefinition
+    )
+    limitations: list[str] = Field(min_length=1, max_length=16)
 
 
 class RuntimeIntent(StrictModel):

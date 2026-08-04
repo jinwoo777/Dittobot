@@ -55,10 +55,20 @@ FastAPI are lazy/optional edges where their modules are used. The official OpenA
 is a declared dependency, but network client construction happens only for `OPENAI_MODE=live`.
 Mock CLI flows do not contact the network.
 
+Eye-in-hand calibration is a separate local boundary. A gated calibration controller pairs fresh
+RealSense RGB frames with DSR joint/flange observations, detects a fixed 10×7 board locally, solves
+`T_flange_camera`, and persists validation artifacts. It does not use OpenAI, register a skill,
+publish ROS TF, or grant runtime hardware authority.
+The legacy-NPY path is part of the same boundary: it preserves the source bytes, derives
+`T_flange_camera` from read-only live flange/TCP poses, and validates against persisted board
+observations. Only a passing result may be linked as candidate provenance; no result can grant
+runtime authority.
+
 `SimulationRobotAdapter` is currently an alias of `MockRobotAdapter`; it is not Gazebo, Isaac,
-MoveIt, or a physics simulator. Doosan and RG2 classes are unconfigured protocol boundaries that
-fail with authorization/`NotConfiguredError` rather than calling a guessed vendor API. No `rclpy`
-node, ROS 2 topic/action/service adapter, or rosbag adapter is implemented.
+MoveIt, or a physics simulator. Runtime Doosan/RG2 classes remain unconfigured protocol boundaries.
+Only the separately gated calibration adapter lazily creates an `rclpy` node and calls a fixed set
+of DSR tutorial functions. No general ROS 2 topic/action/service runtime or rosbag adapter is
+implemented.
 
 ## Monitoring boundary
 
@@ -75,5 +85,16 @@ API.
 By default SQLite is `data/robot_skills.db` and the artifact root is `data/`. The application
 writes teaching metadata/capture JSON under `demonstrations/`, SceneSnapshot JSON under `scenes/`,
 and graph/code/report/manifest files under `skills/<skill_id>/<version>/`. Execution runs and
-events are currently SQLite rows. Bulk RGB/depth/audio/video/point-cloud recording is represented
-by interfaces and URI/checksum fields but is not automatically performed by the CLI/API MVP.
+events are currently SQLite rows. The explicitly triggered UI Camera API writes RGB JPEG,
+color-aligned depth NPZ, and a checksum manifest beneath `demonstrations/rgbd_<id>/`; these bulk
+payloads never enter SQLite. Finalized manifests are the only source for UI sequence replay and
+server-selected OpenAI RGB plus aligned-depth-colormap keyframe pairs. OpenAI returns a strict
+non-executable semantic draft with frame-complete normalized fingertip landmarks (or explicit
+failure), hand/tool shapes, and a work-surface ROI. Explicit UI actions can fit
+`T_camera_surface` from local raw depth with deterministic RANSAC/SVD or use the three-point method,
+then deproject GPT or manually selected fingertip evidence with recorded intrinsics and materialize a
+hardware-incompatible Candidate for compile/Mock validation. This does not activate the skill or
+provide `T_base_camera`, robot FK, or a hardware-verified TCP trajectory. Audio, ROS TF, robot joint
+states, video containers, and point clouds are not automatically recorded by the CLI/API MVP.
+Calibration sessions are the explicit exception for robot joint/flange evidence and are written
+under `calibrations/`; they are not demonstration frames or SkillGraph motion targets.

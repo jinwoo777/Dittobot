@@ -15,7 +15,24 @@ The legacy `ENABLE_HARDWARE_EXECUTION` gate is still mandatory. Connection, E-st
 tool, supervisor, profile, IK, limit, singularity, collision, and clearance checks must also pass
 using hardware evidence. The current Doosan/RG2 adapters always reject use, and the reusable
 orchestrator also rejects monitors whose `hardware_verified` flag is false. No current
-configuration can turn the Mock validators into hardware approval.
+configuration can turn the Mock validators into runtime hardware approval.
+
+Eye-in-hand calibration is a narrower hardware exception and does not execute SkillGraphs. It
+requires all five hardware gates plus `ENABLE_HANDEYE_CALIBRATION`, an explicitly approved fixed
+pose plan, and a cell-safety verification acknowledgement. The robot must begin at the agreed
+reference joint pose. Automatic reference positioning is limited to J3–J6; J1/J2 must already be
+within 0.25deg of zero, are anchored at their measured values, and are checked after every move.
+Any deviation aborts the session.
+The approved micro-motion plan also constrains J3–J6 to ±5deg from that reference and limits each
+joint's change between adjacent observations to 5deg.
+These software gates are not collision detection or a safety-rated function. The supplied DSR
+`movej`/`stop` behavior and all 21 poses must be physically commissioned before enabling them.
+Legacy NPY import uses the same explicit hardware authorization because it reads live robot frame
+state, but it issues no motion command. It always writes a candidate-only result. A TCP-name
+mismatch or any board-residual/span failure prevents the transform from being attached as usable
+SkillGraph provenance. Failure does not block a surface-relative Mock Candidate, but that Candidate
+remains hardware-incompatible; even a passing NPY candidate cannot publish TF or enable hardware
+execution.
 
 Unknown/unsupported relevant space fails closed. Preflight and explicit workspace primitives can
 validate bound targets and path segments. `GlobalWorkspaceSupervisor` polls an injected obstacle
