@@ -330,7 +330,7 @@ class MVPApplication:
         if mode not in {"mock", "single", "burst"}:
             raise ValueError("MVP scene capture supports mock/single/burst only")
         frame_count = 1 if mode == "single" else self.settings.scene_burst_frame_count
-        scene = capture_mock_scene(frame_count=frame_count)
+        scene = capture_mock_scene(mode=mode, frame_count=frame_count)
         self.repository.record_scene(scene)
         self.store.put_json(
             f"scenes/{scene.scene_id}.json", scene.model_dump(mode="json")
@@ -1712,12 +1712,75 @@ class MVPApplication:
         if not intent:
             raise ValueError("skill intent is required")
 
-        # 새 스킬의 최소 빈 그래프
+        # 새 스킬의 기본 그래프
+        #
+        # SkillGraph 스키마가 요구하는 메타데이터까지 모두 포함한다.
+        # skill_id는 시스템 내부 식별자이므로 ASCII/숫자/underscore/hyphen만 사용한다.
+        skill_id = re.sub(r"[^A-Za-z0-9_-]", "_", name).strip("_")
+
+        if not skill_id:
+            skill_id = f"skill_{semantic_version.replace('.', '_')}"
+
         graph = {
-            "skill_id": name,
+            "schema_version": "1.0",
+            "skill_id": skill_id,
             "version": semantic_version,
-            "nodes": [],
+            "name": name,
+            "description": description or name,
+            "skill_type": "motion",
+
+            "source_demonstrations": [],
+            "operator_style": None,
+            "required_tools": [],
+            "required_entity_roles": {},
+            "bindings": {},
+
+            "nodes": [
+                {
+                    "node_id": "move_1",
+                    "operation": "motion.move_l",
+                    "arguments": {
+                        "target": {
+                            "anchor_id": "$surface",
+                            "anchor_type": "surface",
+                            "position_m": {
+                                "x": 0.0,
+                                "y": 0.0,
+                                "z": 0.0,
+                            },
+                            "orientation_xyzw": {
+                                "x": 0.0,
+                                "y": 0.0,
+                                "z": 0.0,
+                                "w": 1.0,
+                            },
+                        },
+                        "motion_profile_id": "linear_slow",
+                    },
+                }
+            ],
+
             "edges": [],
+            "start_node": "move_1",
+            "terminal_nodes": ["move_1"],
+
+            "motion_profiles": ["linear_slow"],
+            "force_profiles": [],
+
+            "preconditions": [],
+            "postconditions": [],
+            "recovery_policy": "global_safe_stop",
+
+            "global_policy_requirements": [
+                "global_safety_supervisor",
+                "workspace_monitor",
+                "force_supervisor",
+                "emergency_stop_monitor",
+            ],
+
+            "uncertainty": {},
+            "validation_status": "unvalidated",
+            "lifecycle_status": "draft",
         }
 
         version = self.repository.register_skill_version(
@@ -1757,6 +1820,136 @@ class MVPApplication:
     def get_skill(self, skill_id: str, version: str | None = None) -> dict[str, Any]:
         row = self._find_version(skill_id, version)
         return self._version_summary(row, include_graph=True)
+
+    def get_primitive_catalog(self) -> dict[str, Any]:
+        """Return primitive metadata for the block-based skill editor."""
+
+        primitives = []
+
+        for metadata in get_default_registry().catalog():
+            schema = metadata.typed_parameter_schema
+
+            properties = schema.get("properties", {})
+            required = schema.get("required", [])
+
+            primitives.append(
+                {
+                    "operation_name": metadata.operation_name,
+                    "description": metadata.description,
+                    "parameter_schema": schema,
+                    "required_parameters": required,
+                    "allowed_skill_types": list(metadata.allowed_skill_types),
+                    "required_preconditions": list(metadata.required_preconditions),
+                    "side_effects": list(metadata.side_effects),
+                    "maximum_timeout_s": metadata.maximum_timeout_s,
+                    "recovery_operation": metadata.recovery_operation,
+                    "hardware_support": metadata.hardware_support,
+                    "simulation_support": metadata.simulation_support,
+                    "mock_support": metadata.mock_support,
+                }
+            )
+
+        return {
+            "primitives": primitives,
+        }
+
+    def update_skill_node(
+        self,
+        skill_id: str,
+        node_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update one node's arguments in an editable skill version."""
+
+        row = self._find_version(skill_id, request.get("version"))
+
+        # 기존 DB graph를 최신 SkillGraph 모델로 강제 검증하지 않는다.
+        # 구버전 graph도 UI에서 노드 arguments를 수정할 수 있도록
+        # raw JSON을 직접 수정한다.
+        graph = dict(row.graph_json)
+
+        nodes = graph.get("nodes", [])
+
+        if not isinstance(nodes, list):
+            raise ValueError("skill graph nodes must be an array")
+
+        target_node = None
+
+        for node in nodes:
+            if isinstance(node, dict) and node.get("node_id") == node_id:
+                target_node = node
+                break
+
+        if target_node is None:
+            raise KeyError(
+                f"unknown node {node_id!r} in skill {skill_id!r}"
+            )
+
+        new_arguments = request.get("arguments")
+
+        if not isinstance(new_arguments, dict):
+            raise ValueError("arguments must be an object")
+
+        existing_arguments = target_node.get("arguments", {})
+
+        if not isinstance(existing_arguments, dict):
+            existing_arguments = {}
+
+        def deep_merge(
+            original: dict[str, Any],
+            updates: dict[str, Any],
+        ) -> dict[str, Any]:
+            result = dict(original)
+
+            for key, value in updates.items():
+                if (
+                    key in result
+                    and isinstance(result[key], dict)
+                    and isinstance(value, dict)
+                ):
+                    result[key] = deep_merge(result[key], value)
+                else:
+                    result[key] = value
+
+            return result
+
+        merged_arguments = deep_merge(
+            existing_arguments,
+            new_arguments,
+        )
+
+        operation = target_node.get("operation")
+
+        if not isinstance(operation, str):
+            raise ValueError("node operation is missing")
+
+        registry = get_default_registry()
+
+        normalized_arguments = registry.validate_arguments(
+            operation,
+            merged_arguments,
+        )
+
+        target_node["arguments"] = normalized_arguments.model_dump(
+            mode="json"
+        )
+
+        graph["nodes"] = nodes
+
+        self.repository.update_skill_version_graph(
+            version_id=row.id,
+            graph=graph,
+        )
+
+        updated_row = self._find_version(
+            skill_id,
+            row.semantic_version,
+        )
+
+        return self._version_summary(
+            updated_row,
+            include_graph=True,
+        )
 
     def get_skill_versions(self, skill_id: str) -> dict[str, Any]:
         rows = self._versions(skill_id)

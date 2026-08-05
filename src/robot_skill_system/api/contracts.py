@@ -179,6 +179,10 @@ class SkillCreateRequest(BaseModel):
     description: str = ""
     semantic_version: str = "0.1.0"
 
+class SkillNodeUpdateRequest(BaseModel):
+    arguments: dict[str, Any]
+    version: str | None = None
+
 class RuntimeResolveRequest(APIModel):
     text: str
     scene_id: str | None = None
@@ -207,6 +211,5 @@ class RuntimeExecuteRequest(RuntimePreflightRequest):
 class RuntimeAbortRequest(APIModel):
     run_id: str
     reason: str = "operator_request"
-
 
 JSONDict = dict[str, Any]

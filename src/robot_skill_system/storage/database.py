@@ -279,6 +279,35 @@ class StorageRepository:
             result = version
         return result
 
+    def update_skill_version_graph(
+        self,
+        *,
+        version_id: str,
+        graph: Any,
+    ) -> SkillVersionRecord:
+        """Update the graph of an editable skill version."""
+
+        graph_json = _jsonable(graph)
+
+        with self.database.session() as session:
+            version = session.get(SkillVersionRecord, version_id)
+
+            if version is None:
+                raise KeyError(version_id)
+
+            # 활성화된 버전은 직접 수정하지 않는다.
+            if version.status == "active":
+                raise ValueError(
+                    "active skill versions cannot be edited directly"
+                )
+
+            version.graph_json = graph_json
+            version.graph_checksum_sha256 = _canonical_checksum(graph_json)
+
+            result = version
+
+        return result
+
     def record_validation_run(
         self,
         *,

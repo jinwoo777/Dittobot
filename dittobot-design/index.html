@@ -145,6 +145,100 @@
     .geometry-teaching p { margin: 6px 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
     .geometry-teaching label { display: grid; gap: 5px; margin: 10px 0; color: var(--muted); font-size: 12px; }
     .geometry-teaching input { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .skill-node-block {
+      border: 1px solid var(--border, #d9dee7);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 16px;
+      background: var(--surface, #ffffff);
+    }
+
+    .skill-node-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+    }
+
+    .skill-node-header > div {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .skill-node-number {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+
+      width: 30px;
+      height: 30px;
+
+      border-radius: 50%;
+
+      background: var(--primary, #2563eb);
+      color: white;
+
+      font-weight: 700;
+    }
+
+    .skill-node-operation {
+      font-size: 18px;
+    }
+
+    .skill-node-parameters {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .parameter-row {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .parameter-label {
+      font-weight: 600;
+      color: var(--text-secondary, #667085);
+    }
+
+    .parameter-input {
+      width: 100%;
+      box-sizing: border-box;
+
+      border: 1px solid #d0d5dd;
+      border-radius: 8px;
+
+      padding: 10px 12px;
+
+      font-size: 14px;
+      background: #fff;
+    }
+
+    .parameter-input:focus {
+      outline: none;
+      border-color: #2563eb;
+    }
+
+    .parameter-object {
+      min-height: 100px;
+      resize: vertical;
+      font-family: monospace;
+    }
+
+    .skill-node-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 18px;
+    }
+
+    .empty-parameters {
+      color: #98a2b3;
+      padding: 10px 0;
+    }
+    
     @media (max-width: 800px) {
       .shell { grid-template-columns: 1fr; }
       .sidebar { position: static; width: 100%; height: auto; padding: 18px; }

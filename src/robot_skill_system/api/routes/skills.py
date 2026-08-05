@@ -20,6 +20,7 @@ from robot_skill_system.api.contracts import (
     SkillUpdateRequest,
     SkillValidateRequest,
     SkillCreateRequest,
+    SkillNodeUpdateRequest,
 )
 from robot_skill_system.api.dependencies import ServiceDependency
 
@@ -36,14 +37,6 @@ def create_skill(
     service: ServiceDependency,
 ) -> dict[str, Any]:
     return service.create_skill(request.model_dump())
-
-@router.delete("/{skill_id}")
-def delete_skill(
-    skill_id: str,
-    service: ServiceDependency,
-) -> dict[str, Any]:
-    return service.delete_skill(skill_id)
-
 
 @router.post("/induce")
 def induce_skill(
@@ -124,6 +117,11 @@ def search_skills(
 ) -> dict[str, Any]:
     return service.search_skills(request.model_dump())
 
+@router.get("/primitives/catalog")
+def get_primitive_catalog(
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.get_primitive_catalog()
 
 @router.get("/{skill_id}")
 def get_skill(
@@ -133,6 +131,18 @@ def get_skill(
 ) -> dict[str, Any]:
     return service.get_skill(skill_id, version)
 
+@router.put("/{skill_id}/nodes/{node_id}")
+def update_skill_node(
+    skill_id: str,
+    node_id: str,
+    request: SkillNodeUpdateRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.update_skill_node(
+        skill_id,
+        node_id,
+        request.model_dump(),
+    )
 
 @router.get("/{skill_id}/versions")
 def get_versions(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
@@ -142,9 +152,8 @@ def get_versions(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
 def delete_skill(
     skill_id: str,
     service: ServiceDependency,
-    version: str | None = None,
 ) -> dict[str, Any]:
-    return service.delete_skill(skill_id, version)
+    return service.delete_skill(skill_id)
 
 @router.post("/{skill_id}/compile")
 def compile_skill(
@@ -197,3 +206,4 @@ def promote_skill_version(
     skill_id: str, version: str, service: ServiceDependency
 ) -> dict[str, Any]:
     return service.activate_skill(skill_id, {"version": version})
+

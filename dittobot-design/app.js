@@ -53,6 +53,7 @@
       nodes: [],
       loading: false,
     },
+    primitiveCatalog: [],
   };
 
   const api = new window.DittobotApiClient();
@@ -209,6 +210,7 @@
     status: row.status,
     description: row.description || graph.description || "",
     nodes: nodes.map((node) => ({
+      nodeId: node.node_id,
       operation: node.operation || node.node_id || "unknown",
       arguments: node.arguments || {},
       status: "idle",
@@ -577,26 +579,393 @@
 
   function renderDetail() {
     const skill = selectedSkill();
+
     dom.detailNodes.replaceChildren();
-    dom.validateSkill.disabled = !skill || state.apiStatus !== "connected";
-    dom.activateSkill.disabled = !skill || state.apiStatus !== "connected" || skill.uiState === "active";
+
+    dom.validateSkill.disabled =
+      !skill || state.apiStatus !== "connected";
+
+    dom.activateSkill.disabled =
+      !skill ||
+      state.apiStatus !== "connected" ||
+      skill.uiState === "active";
+
     if (!skill) {
       dom.detailTitle.textContent = "스킬을 선택하세요";
-      dom.detailSubtitle.textContent = "스킬 관리 화면에서 버전을 선택해 주세요.";
+      dom.detailSubtitle.textContent =
+        "스킬 관리 화면에서 버전을 선택해 주세요.";
       return;
     }
 
-    dom.detailTitle.textContent = skill.displayName || skill.id;
-    dom.detailSubtitle.textContent = `v${skill.version} · 노드 ${skill.nodes.length}개 · API는 스킬 전체 Mock 회귀 검증을 수행합니다.`;
-    skill.nodes.forEach((skillNode) => {
-      const node = create("div", { className: `node ${skillNode.status}`.trim() });
-      const description = create("div");
-      description.append(create("strong", { text: skillNode.operation }));
-      description.append(create("p", { text: nodeArgumentsText(skillNode.arguments) }));
-      const label = skillNode.status === "running" ? "검증 중" : skillNode.status === "ok" ? "통과" : skillNode.status === "error" ? "실패" : "대기";
-      node.append(description, create("span", { className: "node-state", text: label }));
-      dom.detailNodes.append(node);
+    dom.detailTitle.textContent =
+      skill.displayName || skill.id;
+
+    dom.detailSubtitle.textContent =
+      `v${skill.version} · 노드 ${skill.nodes.length}개`;
+
+    skill.nodes.forEach((skillNode, index) => {
+      const block = create("div", {
+        className: `skill-node-block ${skillNode.status}`.trim(),
+      });
+
+      // =========================
+      // 헤더
+      // =========================
+
+      const header = create("div", {
+        className: "skill-node-header",
+      });
+
+      const titleArea = create("div");
+
+      titleArea.append(
+        create("span", {
+          className: "skill-node-number",
+          text: `${index + 1}`,
+        }),
+      );
+
+      titleArea.append(
+        create("strong", {
+          className: "skill-node-operation",
+          text: skillNode.operation,
+        }),
+      );
+
+      header.append(titleArea);
+
+      // =========================
+      // 파라미터 영역
+      // =========================
+
+      const parameters = create("div", {
+        className: "skill-node-parameters",
+      });
+
+      const args = skillNode.arguments || {};
+
+      const primitive = getPrimitiveMetadata(skillNode.operation);
+
+      const parameterSchema =
+        primitive?.typed_parameter_schema ||
+        primitive?.parameter_schema ||
+        {};
+
+      const properties =
+        parameterSchema.properties || {};
+
+      const definitions =
+        parameterSchema.$defs || {};
+
+      // 실제 저장된 arguments를 기준으로 표시
+      const entries = Object.entries(args);
+
+      if (!entries.length) {
+        parameters.append(
+          create("div", {
+            className: "empty-parameters",
+            text: "파라미터 없음",
+          }),
+        );
+      }
+
+      entries.forEach(([name, value]) => {
+        // 해당 파라미터의 schema
+        const schema = properties[name] || {};
+
+        // $ref 해석
+        let resolvedSchema = schema;
+
+        if (
+          schema.$ref &&
+          schema.$ref.startsWith("#/$defs/")
+        ) {
+          const definitionName = schema.$ref.replace(
+            "#/$defs/",
+            "",
+          );
+
+          resolvedSchema =
+            definitions[definitionName] || schema;
+        }
+
+        // schema가 없으면 실제 값 타입으로 추정
+        if (!resolvedSchema.type) {
+          if (Array.isArray(value)) {
+            resolvedSchema = {
+              type: "array",
+            };
+          } else if (
+            value !== null &&
+            typeof value === "object"
+          ) {
+            resolvedSchema = {
+              type: "object",
+            };
+          } else if (typeof value === "number") {
+            resolvedSchema = {
+              type: "number",
+            };
+          } else if (typeof value === "boolean") {
+            resolvedSchema = {
+              type: "boolean",
+            };
+          } else {
+            resolvedSchema = {
+              type: "string",
+            };
+          }
+        }
+
+        const row = createParameterEditor(
+          name,
+          resolvedSchema,
+          value,
+        );
+
+        const input = row.querySelector(
+          "[data-parameter-name]",
+        );
+
+        if (input) {
+          input.addEventListener("change", () => {
+            let newValue;
+
+            try {
+              // boolean
+              if (resolvedSchema.type === "boolean") {
+                newValue = input.checked;
+              }
+
+              // number
+              else if (resolvedSchema.type === "number") {
+                newValue = Number(input.value);
+
+                if (!Number.isFinite(newValue)) {
+                  throw new Error(
+                    `${name}은 숫자여야 합니다.`,
+                  );
+                }
+              }
+
+              // integer
+              else if (resolvedSchema.type === "integer") {
+                newValue = Number.parseInt(
+                  input.value,
+                  10,
+                );
+
+                if (!Number.isFinite(newValue)) {
+                  throw new Error(
+                    `${name}은 정수여야 합니다.`,
+                  );
+                }
+              }
+
+              // object / array
+              else if (
+                resolvedSchema.type === "object" ||
+                resolvedSchema.type === "array" ||
+                (
+                  value !== null &&
+                  typeof value === "object"
+                )
+              ) {
+                newValue = JSON.parse(input.value);
+              }
+
+              // string
+              else {
+                newValue = input.value;
+              }
+
+              console.log(
+                "파라미터 변경:",
+                name,
+                newValue,
+              );
+
+              saveNodeParameter(
+                skill,
+                skillNode,
+                name,
+                newValue,
+              );
+
+            } catch (error) {
+              setBanner(
+                `${name} 수정 실패: ${errorText(error)}`,
+                "danger",
+              );
+            }
+          });
+        }
+
+        parameters.append(row);
+      });
+
+
+      // =========================
+      // 버튼
+      // =========================
+
+      const actions = create("div", {
+        className: "skill-node-actions",
+      });
+
+      const saveButton = create("button", {
+        className: "button primary",
+        text: "파라미터 적용",
+      });
+
+      saveButton.type = "button";
+
+      saveButton.addEventListener("click", () => {
+        const success = updateSkillNodeParameters(
+          skillNode,
+          parameters,
+        );
+
+        if (success) {
+          setBanner(
+            `${index + 1}번 블록 파라미터가 수정되었습니다.`,
+            "ok",
+          );
+
+          renderDetail();
+        }
+      });
+
+      actions.append(saveButton);
+
+
+      // =========================
+      // 최종 블록
+      // =========================
+
+      block.append(
+        header,
+        parameters,
+        actions,
+      );
+
+      dom.detailNodes.append(block);
     });
+  }
+
+  function updateSkillNodeParameters(skillNode, container) {
+    const inputs = container.querySelectorAll(
+      "[data-parameter-name]",
+    );
+
+    try {
+      inputs.forEach((input) => {
+        const name = input.dataset.parameterName;
+        const original = skillNode.arguments[name];
+
+        let value;
+
+        // 숫자
+        if (typeof original === "number") {
+          value = Number(input.value);
+
+          if (!Number.isFinite(value)) {
+            throw new Error(`${name}은 숫자여야 합니다.`);
+          }
+        }
+
+        // boolean
+        else if (typeof original === "boolean") {
+          value = input.value === "true";
+        }
+
+        // 배열
+        else if (Array.isArray(original)) {
+          value = JSON.parse(input.value);
+
+          if (!Array.isArray(value)) {
+            throw new Error(`${name}은 배열이어야 합니다.`);
+          }
+        }
+
+        // object
+        else if (
+          original !== null &&
+          typeof original === "object"
+        ) {
+          value = JSON.parse(input.value);
+
+          if (
+            value === null ||
+            typeof value !== "object" ||
+            Array.isArray(value)
+          ) {
+            throw new Error(`${name}은 객체여야 합니다.`);
+          }
+        }
+
+        // string
+        else {
+          value = input.value;
+        }
+
+        skillNode.arguments[name] = value;
+      });
+
+      return true;
+
+    } catch (error) {
+      setBanner(
+        `파라미터 수정 실패: ${errorText(error)}`,
+        "danger",
+      );
+
+      return false;
+    }
+  }
+
+  function createNumberControl(name, schema, value) {
+    const wrapper = create("div", {
+      className: "parameter-control",
+    });
+
+    const header = create("div", {
+      className: "parameter-control-header",
+    });
+
+    const label = create("span", {
+      text: name,
+    });
+
+    const valueLabel = create("span", {
+      className: "parameter-value",
+    });
+
+    const input = document.createElement("input");
+
+    input.type = "range";
+    input.className = "parameter-slider";
+
+    input.min = schema.minimum ?? 0;
+    input.max = schema.maximum ?? 1;
+    input.step = schema.type === "integer" ? 1 : 0.01;
+
+    input.value =
+      value ??
+      schema.default ??
+      ((Number(input.min) + Number(input.max)) / 2);
+
+    valueLabel.textContent = input.value;
+
+    input.addEventListener("input", () => {
+      valueLabel.textContent = input.value;
+    });
+
+    header.append(label, valueLabel);
+
+    wrapper.append(header, input);
+
+    return wrapper;
   }
 
   function renderMonitor() {
@@ -987,6 +1356,153 @@
     }
 
     renderManualNodes();
+  }
+
+  async function loadPrimitiveCatalog() {
+    try {
+      const result = await api.getPrimitiveCatalog();
+      state.primitiveCatalog = result.primitives || [];
+    } catch (error) {
+      console.error("Primitive catalog loading failed:", error);
+      state.primitiveCatalog = [];
+    }
+  }
+
+  function getPrimitiveMetadata(operation) {
+    return state.primitiveCatalog.find(
+      (primitive) => primitive.operation_name === operation
+    );
+  }
+
+  function createParameterEditor(name, schema, value) {
+    const row = create("div", {
+      className: "parameter-row",
+    });
+
+    const label = create("div", {
+      className: "parameter-label",
+      text: name,
+    });
+
+    row.append(label);
+
+    let input;
+
+    // enum
+    if (schema.enum) {
+      input = document.createElement("select");
+      input.className = "parameter-input";
+
+      schema.enum.forEach((option) => {
+        const item = document.createElement("option");
+        item.value = option;
+        item.textContent = option;
+        input.append(item);
+      });
+
+      input.value = value ?? schema.default ?? schema.enum[0];
+    }
+
+    // boolean
+    else if (schema.type === "boolean") {
+      input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = value ?? schema.default ?? false;
+      input.className = "parameter-input";
+    }
+
+    // number
+    else if (
+      schema.type === "number" ||
+      schema.type === "integer"
+    ) {
+      input = document.createElement("input");
+      input.type = "number";
+      input.className = "parameter-input";
+
+      if (schema.minimum !== undefined) {
+        input.min = schema.minimum;
+      }
+
+      if (schema.maximum !== undefined) {
+        input.max = schema.maximum;
+      }
+
+      input.step =
+        schema.type === "integer"
+          ? "1"
+          : "0.01";
+
+      if (value !== undefined) {
+        input.value = value;
+      } else if (schema.default !== undefined) {
+        input.value = schema.default;
+      }
+    }
+
+    // object
+    else if (schema.type === "object") {
+      input = document.createElement("textarea");
+      input.className = "parameter-input parameter-object";
+      input.rows = 5;
+
+      input.value =
+        value !== undefined
+          ? JSON.stringify(value, null, 2)
+          : "{}";
+    }
+
+    // array
+    else if (schema.type === "array") {
+      input = document.createElement("textarea");
+      input.className = "parameter-input parameter-object";
+      input.rows = 5;
+
+      input.value =
+        value !== undefined
+          ? JSON.stringify(value, null, 2)
+          : "[]";
+    }
+
+    // string
+    else {
+      input = document.createElement("input");
+      input.type = "text";
+      input.className = "parameter-input";
+
+      if (value !== undefined) {
+        input.value = value;
+      }
+    }
+
+    input.dataset.parameterName = name;
+
+    row.append(input);
+
+    return row;
+  }
+
+  let saveTimer = null;
+
+  function scheduleNodeSave(skill, skillNode, name, value) {
+    skillNode.arguments[name] = value;
+
+    clearTimeout(saveTimer);
+
+    saveTimer = setTimeout(async () => {
+      try {
+        await api.updateSkillNode(
+          skill.id,
+          skillNode.node_id,
+          {
+            [name]: value,
+          },
+          skill.version,
+        );
+      } catch (error) {
+        console.error(error);
+      }
+    }, 400);
   }
 
   function toggleRecordingPlayback() {
@@ -1571,6 +2087,51 @@
       setBanner(`중단 요청 실패: ${errorText(error)}`, "danger");
     }
     renderMonitor();
+  }
+
+  async function saveNodeParameter(skill, skillNode, name, value) {
+    skillNode.arguments = skillNode.arguments || {};
+    skillNode.arguments[name] = value;
+
+    const nodeId = skillNode.nodeId;
+
+    console.log("노드 파라미터 저장:", {
+      skillId: skill.id,
+      nodeId,
+      name,
+      value,
+    });
+
+    if (!nodeId) {
+      console.error("nodeId를 찾을 수 없습니다.", skillNode);
+      setBanner("노드 ID를 찾을 수 없습니다.", "danger");
+      return;
+    }
+
+    try {
+      const updated = await api.updateSkillNode(
+        skill.id,
+        nodeId,
+        {
+          [name]: value,
+        },
+        skill.version,
+      );
+
+      console.log("노드 파라미터 저장 완료", updated);
+
+      setBanner(
+        `${name} 파라미터가 저장되었습니다.`,
+        "ok",
+      );
+    } catch (error) {
+      console.error("노드 파라미터 저장 실패", error);
+
+      setBanner(
+        `파라미터 저장 실패: ${errorText(error)}`,
+        "danger",
+      );
+    }
   }
 
   document.querySelectorAll("[data-page]").forEach((button) => {

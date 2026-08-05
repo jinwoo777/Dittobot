@@ -156,6 +156,10 @@
       return this.request(`/skills/${encodeURIComponent(skillId)}${suffix}`);
     }
 
+    getPrimitiveCatalog() {
+      return this.request("/primitives/catalog");
+    }
+
     validateSkill(skillId, version) {
       return this.request(`/skills/${encodeURIComponent(skillId)}/validate`, {
         method: "POST",
@@ -327,6 +331,20 @@
         body: { run_id: runId, reason },
       });
     }
+
+    updateSkillNode(skillId, nodeId, argumentsValue, version = null) {
+      return this.request(
+        `/skills/${encodeURIComponent(skillId)}/nodes/${encodeURIComponent(nodeId)}`,
+        {
+          method: "PUT",
+          body: {
+            arguments: argumentsValue,
+            version,
+          },
+        },
+      );
+    }
+
   }
 
   Object.assign(window, { DittobotApiClient, DittobotApiError });
