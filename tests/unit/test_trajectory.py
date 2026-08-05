@@ -18,7 +18,11 @@ from robot_skill_system.capture import (
 )
 from robot_skill_system.capture.image_sequence import ArrayImageSequenceAdapter
 from robot_skill_system.demonstrations.preprocessing import preprocess_trajectory
-from robot_skill_system.demonstrations.primitive_fitter import recommend_primitive
+from robot_skill_system.demonstrations.primitive_fitter import (
+    PrimitiveFittingError,
+    fit_periodic_primitive_geometry,
+    recommend_primitive,
+)
 from robot_skill_system.demonstrations.quality import validate_repeat_consistency
 from robot_skill_system.demonstrations.recorder import load_demonstration
 from robot_skill_system.demonstrations.segmentation import segment_trajectory
@@ -82,6 +86,30 @@ def test_periodic_trajectory_recommends_move_periodic() -> None:
     assert recommendation.selected_fit.cycle_count == pytest.approx(3.0, rel=0.03)
     assert recommendation.selected_fit.amplitude_m == pytest.approx(0.045, rel=0.06)
     assert recommendation.selected_fit.period_s is not None
+
+
+def test_fixed_center_periodic_geometry_is_derived_only_from_local_samples() -> None:
+    samples = generate_periodic_trajectory(cycles=3.0, drift_m=0.0).samples
+    recommendation = recommend_primitive(samples)
+
+    geometry = fit_periodic_primitive_geometry(
+        samples, recommendation.selected_fit
+    )
+
+    assert geometry.center_m == pytest.approx((0.2, -0.1, 0.002), abs=1.0e-6)
+    assert geometry.amplitude_vector_m == pytest.approx((0.045, 0.0, 0.0), abs=1.0e-6)
+    assert geometry.repetitions == 3
+    assert geometry.observed_cycle_count == pytest.approx(3.0, rel=0.03)
+    assert geometry.residuals.maximum_m <= 0.004
+
+
+def test_translating_periodic_fit_is_not_forced_into_fixed_center_schema() -> None:
+    samples = generate_periodic_trajectory(cycles=3.0, drift_m=0.025).samples
+    recommendation = recommend_primitive(samples)
+    assert recommendation.recommended_primitive_id == "motion.move_periodic"
+
+    with pytest.raises(PrimitiveFittingError, match="fixed-centre periodic"):
+        fit_periodic_primitive_geometry(samples, recommendation.selected_fit)
 
 
 def test_noise_is_smoothed_before_line_classification() -> None:

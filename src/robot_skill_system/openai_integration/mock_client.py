@@ -25,6 +25,7 @@ from .schemas import (
     SemanticPhase,
     SkillGraphProposal,
     SkillGraphProposalNode,
+    TargetObjectObservation,
     TCPProxyFrameState,
     TCPProxyObservation,
     ToolShapeObservation,
@@ -135,7 +136,12 @@ class MockOpenAIClient:
         if not roles:
             roles = [request.entity_role_catalog[0]]
         frame_count = len(request.keyframe_indices)
-        midpoint_index = request.keyframe_indices[frame_count // 2]
+        representative_index = (
+            request.first_frame_index
+            if request.visual_input_policy == "first_rgb_plus_local_fingertip_trace"
+            and request.first_frame_index is not None
+            else request.keyframe_indices[frame_count // 2]
+        )
         tcp_states = [
             TCPProxyFrameState(
                 frame_index=frame_index,
@@ -163,7 +169,11 @@ class MockOpenAIClient:
             display_name=request.name_hint.replace("_", " "),
             task_description=request.operator_instruction,
             observed_task_summary=(
-                f"Chronological review of {len(request.keyframe_indices)} selected RGB frames."
+                f"Chronological review of {len(request.fingertip_trace)} local fingertip "
+                "trace frames and one initial RGB frame."
+                if request.visual_input_policy
+                == "first_rgb_plus_local_fingertip_trace"
+                else f"Chronological review of {len(request.keyframe_indices)} selected RGB frames."
             ),
             required_entity_roles=roles,
             primitive_sequence=[
@@ -178,7 +188,7 @@ class MockOpenAIClient:
                 person_hand=HandShapeObservation(
                     detected=True,
                     shape="two_finger_gripper",
-                    representative_frame_index=midpoint_index,
+                    representative_frame_index=representative_index,
                     region_normalized=NormalizedImageRegion(
                         x_min=0.25, y_min=0.25, x_max=0.75, y_max=0.70
                     ),
@@ -188,7 +198,7 @@ class MockOpenAIClient:
                 tool=ToolShapeObservation(
                     detected="tool" in roles,
                     shape="wiper" if "tool" in roles else "not_detected",
-                    representative_frame_index=midpoint_index,
+                    representative_frame_index=representative_index,
                     region_normalized=(
                         NormalizedImageRegion(
                             x_min=0.30, y_min=0.40, x_max=0.70, y_max=0.75
@@ -203,10 +213,18 @@ class MockOpenAIClient:
                     ),
                     confidence=0.75,
                 ),
+                target_object=TargetObjectObservation(
+                    detected=False,
+                    class_name=None,
+                    representative_frame_index=representative_index,
+                    region_normalized=None,
+                    description="No separate target object is required for the mock surface task.",
+                    confidence=0.7,
+                ),
                 work_surface=WorkSurfaceObservation(
                     detected=True,
                     shape="planar_rectangular",
-                    representative_frame_index=midpoint_index,
+                    representative_frame_index=representative_index,
                     region_normalized=NormalizedImageRegion(
                         x_min=0.05, y_min=0.30, x_max=0.95, y_max=0.95
                     ),

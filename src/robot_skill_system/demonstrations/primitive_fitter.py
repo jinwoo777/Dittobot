@@ -26,6 +26,18 @@ class PrimitiveFittingError(ValueError):
     """Raised when a requested fit has insufficient or degenerate geometry."""
 
 
+@dataclass(frozen=True, slots=True)
+class PeriodicPrimitiveGeometry:
+    """Locally verified arguments for the fixed-centre periodic primitive schema."""
+
+    center_m: Vector3
+    amplitude_vector_m: Vector3
+    repetitions: int
+    observed_period_s: float
+    observed_cycle_count: float
+    residuals: FitResiduals
+
+
 @dataclass(frozen=True)
 class PrimitiveFitterConfig:
     """Geometry classification thresholds, independent of robot profiles."""
@@ -383,6 +395,104 @@ def fit_periodic(
     )
 
 
+def fit_periodic_primitive_geometry(
+    trajectory: ProcessedTrajectory | Sequence[PoseSample],
+    fit: PrimitiveFit,
+    *,
+    maximum_error_m: float = 0.004,
+    maximum_cycle_rounding_error: float = 0.10,
+) -> PeriodicPrimitiveGeometry:
+    """Fit the stricter geometry representable by ``motion.move_periodic``.
+
+    The general periodic detector permits a translating trend and multi-axis
+    harmonics.  The runtime primitive has only a fixed centre, one amplitude
+    vector, and an integer repetition count.  This second local fit therefore
+    rejects demonstrations that the runtime schema cannot reproduce within the
+    requested positional error.  No model-supplied value participates.
+    """
+
+    if not np.isfinite(maximum_error_m) or maximum_error_m <= 0.0:
+        raise ValueError("maximum_error_m must be finite and positive")
+    if not np.isfinite(maximum_cycle_rounding_error) or not (
+        0.0 <= maximum_cycle_rounding_error <= 0.25
+    ):
+        raise ValueError("maximum_cycle_rounding_error must be in [0, 0.25]")
+    if fit.primitive_id != "motion.move_periodic":
+        raise PrimitiveFittingError("selected local fit is not periodic")
+    if (
+        fit.period_s is None
+        or fit.amplitude_m is None
+        or fit.cycle_count is None
+        or fit.confidence < 0.45
+    ):
+        raise PrimitiveFittingError("periodic fit lacks verified local parameters")
+
+    samples = _samples(trajectory)
+    positions = _positions(trajectory)
+    if len(samples) < 8:
+        raise PrimitiveFittingError("periodic primitive requires at least eight samples")
+    timestamps_s = np.asarray(
+        [sample.timestamp_ns for sample in samples], dtype=np.float64
+    ) / 1.0e9
+    if np.any(np.diff(timestamps_s) <= 0.0):
+        raise PrimitiveFittingError("periodic primitive requires increasing timestamps")
+    relative_time_s = timestamps_s - timestamps_s[0]
+    angular_frequency = 2.0 * np.pi / fit.period_s
+    phase = angular_frequency * relative_time_s
+    design = np.column_stack(
+        (np.ones(len(relative_time_s)), np.sin(phase), np.cos(phase))
+    )
+    coefficients, _, rank, _ = np.linalg.lstsq(design, positions, rcond=None)
+    if rank < 3:
+        raise PrimitiveFittingError("fixed-centre periodic fit is rank deficient")
+
+    center = coefficients[0]
+    harmonic_coefficients = coefficients[1:]
+    _, singular_values, right_vectors = np.linalg.svd(
+        harmonic_coefficients, full_matrices=False
+    )
+    if not len(singular_values) or singular_values[0] <= 1.0e-12:
+        raise PrimitiveFittingError("fixed-centre periodic amplitude is degenerate")
+    direction = right_vectors[0]
+    dominant_component_index = int(np.argmax(np.abs(direction)))
+    if direction[dominant_component_index] < 0.0:
+        direction = -direction
+    scalar_coefficients = harmonic_coefficients @ direction
+    amplitude_m = float(np.linalg.norm(scalar_coefficients))
+    if amplitude_m <= 1.0e-9 or float(np.max(np.abs(direction * amplitude_m))) > 1.0:
+        raise PrimitiveFittingError("fixed-centre periodic amplitude is outside schema bounds")
+
+    scalar_harmonic = design[:, 1:] @ scalar_coefficients
+    reconstructed = center + scalar_harmonic[:, None] * direction
+    residual = _residuals(np.linalg.norm(positions - reconstructed, axis=1))
+    numerical_tolerance_m = 1.0e-9
+    if residual.maximum_m > maximum_error_m + numerical_tolerance_m:
+        raise PrimitiveFittingError(
+            "fixed-centre periodic representation exceeds the positional error bound"
+        )
+    if abs(amplitude_m - fit.amplitude_m) > maximum_error_m + numerical_tolerance_m:
+        raise PrimitiveFittingError(
+            "fixed-centre amplitude disagrees with the selected periodic fit"
+        )
+
+    repetitions = int(round(fit.cycle_count))
+    if not 1 <= repetitions <= 100 or (
+        abs(fit.cycle_count - repetitions) > maximum_cycle_rounding_error
+    ):
+        raise PrimitiveFittingError(
+            "observed periodic cycle count is not safely representable as repetitions"
+        )
+    amplitude_vector = direction * amplitude_m
+    return PeriodicPrimitiveGeometry(
+        center_m=_vector3(center),
+        amplitude_vector_m=_vector3(amplitude_vector),
+        repetitions=repetitions,
+        observed_period_s=fit.period_s,
+        observed_cycle_count=fit.cycle_count,
+        residuals=residual,
+    )
+
+
 def _fixed_state_fit(
     trajectory: ProcessedTrajectory | Sequence[PoseSample],
     primitive_id: str,
@@ -510,11 +620,13 @@ fit_primitive = recommend_primitive
 fit_trajectory = recommend_primitive
 
 __all__ = [
+    "PeriodicPrimitiveGeometry",
     "PrimitiveFitterConfig",
     "PrimitiveFittingError",
     "fit_arc",
     "fit_line",
     "fit_periodic",
+    "fit_periodic_primitive_geometry",
     "fit_primitive",
     "fit_trajectory",
     "recommend_primitive",

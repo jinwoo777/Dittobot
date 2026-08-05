@@ -158,6 +158,47 @@ class HandEyeCalibrationController:
             "legacy_transform": self._latest_legacy_transform,
         }
 
+    def capture_base_to_flange_snapshot(self) -> dict[str, Any]:
+        """Read one stationary teaching pose through the authorized robot boundary.
+
+        Closed hardware gates return explicit unavailable evidence instead of
+        preventing camera-relative recording and Mock Candidate creation.
+        """
+
+        if not self.hardware_authorized:
+            return {
+                "available": False,
+                "reason": "hardware_authorization_closed",
+                "captured_at_ns": time.time_ns(),
+            }
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return {
+                    "available": False,
+                    "reason": "handeye_calibration_in_progress",
+                    "captured_at_ns": time.time_ns(),
+                }
+        robot = self.robot_factory()
+        connected = False
+        try:
+            robot.connect()
+            connected = True
+            matrix = np.asarray(robot.get_base_to_flange_matrix(), dtype=np.float64)
+            if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+                raise ValueError("robot returned an invalid T_base_flange matrix")
+            return {
+                "available": True,
+                "captured_at_ns": time.time_ns(),
+                "transform_convention": "T_base_flange",
+                "translation_unit": "m",
+                "base_to_flange": matrix.tolist(),
+                "active_tcp_name": robot.get_active_tcp_name(),
+                "robot_adapter": robot.adapter_name,
+            }
+        finally:
+            if connected:
+                robot.disconnect()
+
     def import_legacy_npy(self, *, operator_id: str) -> dict[str, Any]:
         """Back up, convert, and validate a legacy TCP-camera NPY without motion."""
 

@@ -11,6 +11,7 @@ from robot_skill_system.settings import OpenAIMode, Settings
 from ._live import parse_structured_response
 from .client import OpenAIClientFactory, RetryExecutor, new_trace_id
 from .mock_client import MockOpenAIClient
+from .motion_policy import MOTION_SIMPLIFICATION_INSTRUCTIONS
 from .schemas import APICallMetadata, DemonstrationAnalysis, DemonstrationAnalysisInput
 from .semantic_validation import validate_demonstration_analysis
 
@@ -19,6 +20,7 @@ Return only the strict schema. Treat entity IDs and local motion-fit intervals a
 Never invent XYZ poses, orientation, speed, acceleration, force values, code, or robot calls.
 Use only IDs from entity_catalog, primitive_catalog, approved_motion_profiles, and
 approved_force_profiles. Mark ambiguity explicitly."""
+ANALYZER_INSTRUCTIONS += f"\n\n{MOTION_SIMPLIFICATION_INSTRUCTIONS}"
 
 
 class DemonstrationAnalyzer:

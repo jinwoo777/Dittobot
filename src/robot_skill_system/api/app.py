@@ -16,7 +16,15 @@ def create_app(service: Any | None = None) -> Any:
     except ImportError as exc:  # pragma: no cover - environment-dependent guard
         raise RuntimeError("Install the 'api' optional dependencies to run FastAPI") from exc
 
-    from robot_skill_system.api.routes import calibration, camera, runtime, scenes, skills, teaching
+    from robot_skill_system.api.routes import (
+        calibration,
+        camera,
+        runtime,
+        scenes,
+        skills,
+        task_planes,
+        teaching,
+    )
     from robot_skill_system.capture.rgbd_recording import CameraStateError
     from robot_skill_system.exceptions import HardwareExecutionDenied, NotConfiguredError
 
@@ -41,6 +49,7 @@ def create_app(service: Any | None = None) -> Any:
     app.include_router(runtime.router)
     app.include_router(camera.router)
     app.include_router(calibration.router)
+    app.include_router(task_planes.router)
 
     settings = getattr(service, "settings", None)
     repository_root = getattr(settings, "repo_root", None)

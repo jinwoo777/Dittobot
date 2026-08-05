@@ -173,6 +173,10 @@ def validate_recording_skill_draft(
         draft.scene_observation.tool.representative_frame_index,
         draft.scene_observation.work_surface.representative_frame_index,
     }
+    if draft.scene_observation.target_object is not None:
+        scene_indices.add(
+            draft.scene_observation.target_object.representative_frame_index
+        )
     unknown_scene_indices = scene_indices - expected_indices
     if unknown_scene_indices:
         raise SemanticCatalogViolationError(

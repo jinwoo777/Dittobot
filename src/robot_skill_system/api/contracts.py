@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from robot_skill_system.skills.models import BindingSpec, SkillType
+
 
 class APIModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -84,7 +86,16 @@ class RecordingSkillDraftRequest(APIModel):
         pattern=r"^[a-z][a-z0-9_]{2,63}$",
     )
     operator_instruction: str = Field(min_length=1, max_length=2000)
-    keyframe_count: int = Field(default=100, ge=1, le=300)
+    keyframe_count: int = Field(
+        default=1,
+        ge=1,
+        le=300,
+        deprecated=True,
+        description=(
+            "Deprecated and ignored. Drafting always sends the first manifest RGB frame and "
+            "tracks every manifest frame locally."
+        ),
+    )
 
 
 class PixelPointRequest(APIModel):
@@ -130,8 +141,8 @@ class DraftTCPPathRequest(APIModel):
 
     @model_validator(mode="after")
     def validate_method_evidence(self) -> DraftTCPPathRequest:
-        if self.method == "manual_two_fingertip" and len(self.annotations) < 4:
-            raise ValueError("manual TCP teaching requires at least four annotated frames")
+        if self.method == "manual_two_fingertip" and len(self.annotations) < 2:
+            raise ValueError("manual TCP teaching requires at least two annotated frames")
         if self.method in {"mediapipe_rgbd", "openai_rgbd"} and self.annotations:
             raise ValueError("automatic TCP extraction does not accept manual annotations")
         return self
@@ -171,6 +182,60 @@ class SkillUpdateRequest(APIModel):
     base_version: str | None = None
     operator_role: str = "expert"
     has_force_measurements: bool = False
+
+
+class SkillEditorBlockRequest(APIModel):
+    """One operation in the deliberately sequential block editor."""
+
+    operation: str = Field(pattern=r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillEditorPreviewRequest(APIModel):
+    """Typed, code-free input shared by block preview and Candidate creation."""
+
+    skill_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(min_length=1, max_length=2000)
+    skill_type: SkillType = SkillType.COMPOSITE
+    blocks: list[SkillEditorBlockRequest] = Field(min_length=1, max_length=128)
+    bindings: dict[str, BindingSpec] = Field(default_factory=dict)
+
+
+class SkillEditorCandidateRequest(SkillEditorPreviewRequest):
+    """Explicit acknowledgement required before persisting a Mock-only Candidate."""
+
+    acknowledge_mock_only: bool
+
+    @model_validator(mode="after")
+    def validate_mock_acknowledgement(self) -> SkillEditorCandidateRequest:
+        if not self.acknowledge_mock_only:
+            raise ValueError("block Candidate creation requires Mock-only acknowledgement")
+        return self
+
+
+class SkillParameterEditRequest(APIModel):
+    """Complete replacement arguments for one existing immutable graph node."""
+
+    node_id: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_.:-]*$")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class SkillParameterCandidateRequest(APIModel):
+    """Checksum-guarded node argument edits that always create a child version."""
+
+    expected_parent_checksum_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    edits: list[SkillParameterEditRequest] = Field(min_length=1, max_length=128)
+    acknowledge_mock_only: bool
+
+    @model_validator(mode="after")
+    def validate_parameter_candidate(self) -> SkillParameterCandidateRequest:
+        if not self.acknowledge_mock_only:
+            raise ValueError("parameter Candidate creation requires Mock-only acknowledgement")
+        node_ids = [edit.node_id for edit in self.edits]
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError("parameter Candidate edits must have unique node_id values")
+        return self
 
 
 class RuntimeResolveRequest(APIModel):

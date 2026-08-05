@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from robot_skill_system.capture import MockCapture, MockCaptureConfig
+from robot_skill_system.capture.interfaces import CameraIntrinsics
 from robot_skill_system.demonstrations.rgbd_geometry import (
     PixelPoint,
     calibrate_surface_from_three_points,
@@ -10,6 +13,7 @@ from robot_skill_system.demonstrations.rgbd_geometry import (
     segment_dominant_depth_plane,
     validate_surface_relative_path,
 )
+from robot_skill_system.perception import deprojection
 
 
 def test_three_point_surface_tf_and_manual_two_finger_path_are_metric() -> None:
@@ -72,3 +76,37 @@ def test_dominant_depth_plane_is_fitted_from_raw_aligned_depth() -> None:
     assert diagnostics["inlier_ratio"] == pytest.approx(1.0)
     assert diagnostics["rms_residual_m"] < 1e-8
     assert diagnostics["plane_normal_camera"][2] == pytest.approx(-1.0)
+
+
+def test_manual_surface_geometry_fails_closed_when_distortion_cannot_be_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable() -> object:
+        raise ValueError(
+            "distortion-aware metric deprojection requires optional pyrealsense2"
+        )
+
+    monkeypatch.setattr(deprojection, "_load_pyrealsense2", unavailable)
+    capture = MockCapture(MockCaptureConfig(width_px=64, height_px=48))
+    frame = next(capture.stream())
+    distorted = replace(
+        frame,
+        color_intrinsics=CameraIntrinsics(
+            width_px=64,
+            height_px=48,
+            fx_px=64.0,
+            fy_px=64.0,
+            cx_px=31.5,
+            cy_px=23.5,
+            distortion_model="brown_conrady",
+            distortion_coefficients=(0.1, 0.01, 0.0, 0.0, 0.0),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="requires optional pyrealsense2"):
+        calibrate_surface_from_three_points(
+            distorted,
+            origin_px=PixelPoint(16.0, 12.0),
+            positive_x_px=PixelPoint(24.0, 12.0),
+            positive_y_px=PixelPoint(16.0, 20.0),
+        )

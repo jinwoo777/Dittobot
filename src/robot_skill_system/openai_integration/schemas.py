@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES = 6_000
+
 
 class StrictModel(BaseModel):
     """Base schema that rejects model-supplied fields outside the contract."""
@@ -122,6 +124,54 @@ class NormalizedImageRegion(StrictModel):
         return self
 
 
+class CompactFingertipTraceLandmark(BaseModel):
+    """One locally detected fingertip location without depth or metric geometry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    landmark_index: Literal[4, 8]
+    normalized_xy: tuple[float, float] | None = None
+    pixel_xy: tuple[int, int] | None = None
+
+    @model_validator(mode="after")
+    def _coordinates_are_consistent(self) -> CompactFingertipTraceLandmark:
+        if (self.normalized_xy is None) is not (self.pixel_xy is None):
+            raise ValueError("trace landmark normalized and pixel coordinates are all-or-none")
+        if self.normalized_xy is not None and not all(
+            0.0 <= component <= 1.0 for component in self.normalized_xy
+        ):
+            raise ValueError("trace normalized coordinates must be in [0, 1]")
+        if self.pixel_xy is not None and any(component < 0 for component in self.pixel_xy):
+            raise ValueError("trace pixel coordinates must be non-negative")
+        return self
+
+
+class CompactFingertipTraceFrame(BaseModel):
+    """Thumb/index-only image-space evidence for one full-recording frame."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    frame_index: int = Field(ge=0)
+    timestamp_ns: int = Field(ge=0)
+    thumb_tip: CompactFingertipTraceLandmark
+    index_tip: CompactFingertipTraceLandmark
+    status: Literal["valid", "uncertain"]
+
+    @model_validator(mode="after")
+    def _landmark_ids_and_status_match(self) -> CompactFingertipTraceFrame:
+        if self.thumb_tip.landmark_index != 4 or self.index_tip.landmark_index != 8:
+            raise ValueError("compact trace must use MediaPipe thumb=4 and index=8")
+        detected = (
+            self.thumb_tip.normalized_xy is not None
+            and self.index_tip.normalized_xy is not None
+        )
+        if (self.status == "valid") is not detected:
+            raise ValueError(
+                "compact trace status must describe image-space fingertip availability"
+            )
+        return self
+
+
 class TCPProxyFrameState(StrictModel):
     """Audited two-finger state for exactly one supplied RGB-D frame pair."""
 
@@ -209,6 +259,29 @@ class ToolShapeObservation(StrictModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
+class TargetObjectObservation(StrictModel):
+    """First-frame semantic target ROI; local depth owns its metric anchor."""
+
+    detected: bool
+    class_name: str | None = Field(default=None, min_length=1, max_length=80)
+    representative_frame_index: int = Field(ge=0)
+    region_normalized: NormalizedImageRegion | None = None
+    description: str = Field(min_length=1, max_length=500)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _detected_object_requires_a_region(self) -> TargetObjectObservation:
+        if self.detected and (
+            self.class_name is None or self.region_normalized is None
+        ):
+            raise ValueError("detected target objects require class_name and image region")
+        if not self.detected and (
+            self.class_name is not None or self.region_normalized is not None
+        ):
+            raise ValueError("undetected target objects cannot contain class_name or region")
+        return self
+
+
 class WorkSurfaceObservation(StrictModel):
     detected: bool
     shape: Literal[
@@ -226,6 +299,7 @@ class RecordingSceneObservation(StrictModel):
 
     person_hand: HandShapeObservation
     tool: ToolShapeObservation
+    target_object: TargetObjectObservation | None = None
     work_surface: WorkSurfaceObservation
 
 
@@ -258,6 +332,14 @@ class RecordingSkillDraftInput(StrictModel):
     primitive_catalog: list[str] = Field(min_length=1, max_length=64)
     entity_role_catalog: list[str] = Field(min_length=1, max_length=16)
     keyframe_indices: list[int] = Field(min_length=1, max_length=300)
+    first_frame_index: int | None = Field(default=None, ge=0)
+    fingertip_trace: list[CompactFingertipTraceFrame] = Field(
+        default_factory=list, max_length=MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES
+    )
+    visual_input_policy: Literal[
+        "rgbd_keyframes",
+        "first_rgb_plus_local_fingertip_trace",
+    ] = "rgbd_keyframes"
     image_pair_order: Literal["rgb_then_aligned_depth_per_keyframe"] = (
         "rgb_then_aligned_depth_per_keyframe"
     )
@@ -268,6 +350,32 @@ class RecordingSkillDraftInput(StrictModel):
         default_factory=TCPProxyTeachingDefinition
     )
     limitations: list[str] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _validate_full_recording_trace_policy(self) -> RecordingSkillDraftInput:
+        if self.visual_input_policy == "rgbd_keyframes":
+            return self
+        if self.first_frame_index is None:
+            raise ValueError("first-frame trace analysis requires first_frame_index")
+        if self.keyframe_indices != [self.first_frame_index]:
+            raise ValueError("first-frame trace analysis supplies exactly the first RGB frame")
+        if not self.fingertip_trace:
+            raise ValueError("first-frame trace analysis requires the full fingertip trace")
+        indices = [item.frame_index for item in self.fingertip_trace]
+        timestamps = [item.timestamp_ns for item in self.fingertip_trace]
+        if len(set(indices)) != len(indices) or indices != sorted(indices):
+            raise ValueError("compact fingertip trace frame indices must be unique and ordered")
+        if any(
+            current <= previous
+            for previous, current in zip(timestamps, timestamps[1:], strict=False)
+        ):
+            raise ValueError("compact fingertip trace timestamps must be strictly increasing")
+        expected_count = int(self.recording_summary.get("frame_count") or 0)
+        if expected_count and len(self.fingertip_trace) != expected_count:
+            raise ValueError("compact fingertip trace must cover every manifest frame")
+        if indices[0] != self.first_frame_index:
+            raise ValueError("compact fingertip trace must start at first_frame_index")
+        return self
 
 
 class RuntimeIntent(StrictModel):
