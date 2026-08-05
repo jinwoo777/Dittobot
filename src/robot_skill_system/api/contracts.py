@@ -172,6 +172,12 @@ class SkillUpdateRequest(APIModel):
     operator_role: str = "expert"
     has_force_measurements: bool = False
 
+class SkillCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    intent: str = Field(min_length=1, max_length=128)
+    variant: str = Field(default="default", min_length=1, max_length=128)
+    description: str = ""
+    semantic_version: str = "0.1.0"
 
 class RuntimeResolveRequest(APIModel):
     text: str

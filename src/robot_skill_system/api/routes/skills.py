@@ -19,6 +19,7 @@ from robot_skill_system.api.contracts import (
     SkillSearchRequest,
     SkillUpdateRequest,
     SkillValidateRequest,
+    SkillCreateRequest,
 )
 from robot_skill_system.api.dependencies import ServiceDependency
 
@@ -28,6 +29,20 @@ router = APIRouter(prefix="/skills", tags=["skills"])
 @router.get("")
 def list_skills(service: ServiceDependency) -> dict[str, Any]:
     return service.list_skills()
+
+@router.post("/create")
+def create_skill(
+    request: SkillCreateRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.create_skill(request.model_dump())
+
+@router.delete("/{skill_id}")
+def delete_skill(
+    skill_id: str,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.delete_skill(skill_id)
 
 
 @router.post("/induce")
@@ -123,6 +138,13 @@ def get_skill(
 def get_versions(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
     return service.get_skill_versions(skill_id)
 
+@router.delete("/{skill_id}")
+def delete_skill(
+    skill_id: str,
+    service: ServiceDependency,
+    version: str | None = None,
+) -> dict[str, Any]:
+    return service.delete_skill(skill_id, version)
 
 @router.post("/{skill_id}/compile")
 def compile_skill(

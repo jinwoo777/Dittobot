@@ -1695,6 +1695,65 @@ class MVPApplication:
             ]
         }
 
+    def create_skill(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Create a new standalone skill without induction or recording."""
+
+        name = str(request.get("name", "")).strip()
+        intent = str(request.get("intent", "")).strip()
+        variant = str(request.get("variant", "default")).strip() or "default"
+        description = str(request.get("description", "")).strip()
+        semantic_version = (
+            str(request.get("semantic_version", "0.1.0")).strip() or "0.1.0"
+        )
+
+        if not name:
+            raise ValueError("skill name is required")
+
+        if not intent:
+            raise ValueError("skill intent is required")
+
+        # 새 스킬의 최소 빈 그래프
+        graph = {
+            "skill_id": name,
+            "version": semantic_version,
+            "nodes": [],
+            "edges": [],
+        }
+
+        version = self.repository.register_skill_version(
+            name=name,
+            intent=intent,
+            semantic_version=semantic_version,
+            graph=graph,
+            status="draft",
+            variant=variant,
+            description=description,
+            validation_status="pending",
+            hardware_compatible=False,
+        )
+
+        return {
+            "skill_id": version.skill_id,
+            "version": version.semantic_version,
+            "name": name,
+            "intent": intent,
+            "variant": variant,
+            "description": description,
+            "status": version.status,
+            "validation_status": version.validation_status,
+            "message": "스킬이 생성되었습니다.",
+        }
+
+    def delete_skill(self, skill_id: str) -> dict[str, Any]:
+        """Delete a skill from the registry."""
+
+        result = self.repository.delete_skill(skill_id)
+
+        return {
+            "ok": True,
+            **result,
+        }
+
     def get_skill(self, skill_id: str, version: str | None = None) -> dict[str, Any]:
         row = self._find_version(skill_id, version)
         return self._version_summary(row, include_graph=True)

@@ -49,6 +49,10 @@
       samples: [],
       busy: false,
     },
+    manualSkill: {
+      nodes: [],
+      loading: false,
+    },
   };
 
   const api = new window.DittobotApiClient();
@@ -139,6 +143,17 @@
     draftResult: element("draft-result"),
     estopRun: element("estop-run"),
     abortRun: element("abort-run"),
+    manualSkillForm: element("manual-skill-form"),
+    manualSkillId: element("manual-skill-id"),
+    manualSkillName: element("manual-skill-name"),
+    manualSkillDescription: element("manual-skill-description"),
+    manualOperation: element("manual-operation"),
+    manualTarget: element("manual-target"),
+    manualSpeed: element("manual-speed"),
+    manualNodeDescription: element("manual-node-description"),
+    addManualNode: element("add-manual-node"),
+    manualNodeList: element("manual-node-list"),
+    manualSkillStatus: element("manual-skill-status"),
   };
 
   function create(tagName, { className = "", text = "" } = {}) {
@@ -158,26 +173,48 @@
   }
 
   function normalizeSkill(row) {
-    const graph = row.skill_graph || {};
-    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
-    let uiState = "candidate";
-    if (row.status === "active") uiState = "active";
-    else if (row.validation_status === "passed") uiState = "tested";
-    return {
-      key: `${row.skill_id}@${row.version}`,
-      id: row.skill_id,
-      version: row.version,
-      uiState,
-      validationStatus: row.validation_status,
-      status: row.status,
-      description: row.description || graph.description || "",
-      nodes: nodes.map((node) => ({
-        operation: node.operation || node.node_id || "unknown",
-        arguments: node.arguments || {},
-        status: "idle",
-      })),
-    };
-  }
+  const graph = row.skill_graph || {};
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+
+  const skillNames = {
+    pick_tool: "공구 잡기",
+    lift_tool: "공구 들어올리기",
+    move_tool: "공구 이동하기",
+    place_tool: "공구 내려놓기",
+    insert_tool: "공구 삽입하기",
+    hand_over_tool: "공구 전달하기",
+    pick_object: "물체 잡기",
+    lift_object: "물체 들어올리기",
+    place_object: "물체 내려놓기",
+  };
+
+  const displayName =
+    skillNames[row.skill_id]
+    || skillNames[graph.skill_id]
+    || row.description
+    || graph.description
+    || row.skill_id;
+
+  let uiState = "candidate";
+  if (row.status === "active") uiState = "active";
+  else if (row.validation_status === "passed") uiState = "tested";
+
+  return {
+    key: `${row.skill_id}@${row.version}`,
+    id: row.skill_id,
+    displayName,
+    version: row.version,
+    uiState,
+    validationStatus: row.validation_status,
+    status: row.status,
+    description: row.description || graph.description || "",
+    nodes: nodes.map((node) => ({
+      operation: node.operation || node.node_id || "unknown",
+      arguments: node.arguments || {},
+      status: "idle",
+    })),
+  };
+}
 
   function normalizeDraft(row) {
     const draft = row.draft || {};
@@ -204,6 +241,59 @@
       promotionEvidence: row.promotion_evidence || {},
       createdAtNs: Number(row.created_at_ns || 0),
     };
+  }
+
+  function addManualNode() {
+    const operation = dom.manualOperation.value;
+    const target = dom.manualTarget.value.trim();
+    const speed = Number(dom.manualSpeed.value);
+    const description = dom.manualNodeDescription.value.trim();
+
+    state.manualSkill.nodes.push({
+      node_id: `node_${state.manualSkill.nodes.length + 1}`,
+      operation,
+      arguments: {
+        target,
+        speed,
+        description,
+      },
+    });
+
+    dom.manualTarget.value = "";
+    dom.manualNodeDescription.value = "";
+
+    renderManualNodes();
+  }
+
+  function renderManualNodes() {
+    dom.manualNodeList.replaceChildren();
+
+    state.manualSkill.nodes.forEach((node, index) => {
+      const item = create("div", {
+        className: "manual-node",
+      });
+
+      item.append(
+        create("strong", {
+          text: `${index + 1}. ${node.operation}`,
+        }),
+      );
+
+      const remove = create("button", {
+        className: "button danger",
+        text: "삭제",
+      });
+
+      remove.type = "button";
+
+      remove.addEventListener("click", () => {
+        state.manualSkill.nodes.splice(index, 1);
+        renderManualNodes();
+      });
+
+      item.append(remove);
+      dom.manualNodeList.append(item);
+    });
   }
 
   function selectedSkill() {
@@ -301,6 +391,7 @@
         dom.draftInspector.scrollIntoView({ behavior: "smooth", block: "nearest" });
       });
       actions.append(detail);
+
       card.append(summary, actions);
       dom.skillList.append(card);
     });
@@ -308,7 +399,7 @@
     visibleSkills.forEach((skill) => {
       const card = create("article", { className: "skill-card" });
       const summary = create("div");
-      summary.append(create("h2", { text: skill.id }));
+      summary.append(create("h2", { text: skill.displayName || skill.id }));
       const meta = create("div", { className: "meta" });
       meta.append(document.createTextNode(`v${skill.version} · 노드 ${skill.nodes.length}개`));
       meta.append(create("span", { className: `tag ${skill.uiState}`, text: tagText(skill.uiState) }));
@@ -316,12 +407,45 @@
 
       const actions = create("div", { className: "actions" });
       const detail = create("button", { className: "button", text: "상세" });
+      const deleteButton = create("button", {
+        className: "button danger",
+        text: "삭제",
+      });
+
+      deleteButton.type = "button";
+
+      deleteButton.addEventListener("click", async () => {
+        const confirmed = window.confirm(
+          `${skill.id} v${skill.version}을 삭제하시겠습니까?\n\n삭제한 스킬은 복구할 수 없습니다.`,
+        );
+
+        if (!confirmed) return;
+
+        deleteButton.disabled = true;
+        setBanner(`${skill.id} v${skill.version} 삭제 중…`);
+
+        try {
+          await api.deleteSkill(skill.id);
+
+          if (state.selectedKey === skill.key) {
+            state.selectedKey = null;
+          }
+
+          await loadRegistry(`${skill.id} v${skill.version} 삭제 완료`);
+        } catch (error) {
+          deleteButton.disabled = false;
+          setBanner(`스킬 삭제 실패: ${errorText(error)}`, "danger");
+        }
+      });
+
       detail.type = "button";
       detail.addEventListener("click", () => {
         state.selectedKey = skill.key;
         showPage("detail");
       });
-      actions.append(detail);
+
+      actions.append(detail, deleteButton);
+
       if (skill.uiState === "active") {
         const run = create("button", { className: "button primary", text: "Mock 실행" });
         run.type = "button";
@@ -462,7 +586,7 @@
       return;
     }
 
-    dom.detailTitle.textContent = skill.id;
+    dom.detailTitle.textContent = skill.displayName || skill.id;
     dom.detailSubtitle.textContent = `v${skill.version} · 노드 ${skill.nodes.length}개 · API는 스킬 전체 Mock 회귀 검증을 수행합니다.`;
     skill.nodes.forEach((skillNode) => {
       const node = create("div", { className: `node ${skillNode.status}`.trim() });
@@ -826,6 +950,43 @@
       dom.recordingReviewStatus.textContent = `녹화 목록 실패: ${errorText(error)}`;
     }
     renderRecordingReview();
+  }
+
+  async function createManualSkill(event) {
+    event.preventDefault();
+
+    if (!dom.manualSkillForm.reportValidity()) return;
+
+    state.manualSkill.loading = true;
+
+    try {
+      const result = await api.createSkill({
+        name: dom.manualSkillName.value.trim(),
+        intent: dom.manualSkillId.value.trim(),
+        variant: "default",
+        description: dom.manualSkillDescription.value.trim(),
+        semantic_version: "0.1.0",
+      });
+
+      state.manualSkill.nodes = [];
+
+      dom.manualSkillForm.reset();
+
+      await loadRegistry(
+        `${result.name || result.intent || "스킬"} 생성 완료`,
+      );
+
+      showPage("skills");
+    } catch (error) {
+      setBanner(
+        `스킬 생성 실패: ${errorText(error)}`,
+        "danger",
+      );
+    } finally {
+      state.manualSkill.loading = false;
+    }
+
+    renderManualNodes();
   }
 
   function toggleRecordingPlayback() {
@@ -1474,7 +1635,15 @@
   dom.cancelGeometryTeaching.addEventListener("click", cancelGeometryTeaching);
   dom.recordingSkillForm.addEventListener("submit", createRecordingSkillDraft);
   window.addEventListener("resize", renderGeometryMarkers);
+  dom.addManualNode.addEventListener(
+    "click",
+    addManualNode,
+  );
 
+  dom.manualSkillForm.addEventListener(
+    "submit",
+    createManualSkill,
+  );
   renderAll();
   loadRegistry().then(() => Promise.all([
     refreshCameraStatus(),

@@ -86,6 +86,31 @@
       return this.request("/skills");
     }
 
+    createSkill({
+      name,
+      intent,
+      variant = "default",
+      description = "",
+      semanticVersion = "0.1.0",
+    }) {
+      return this.request("/skills/create", {
+        method: "POST",
+        body: {
+          name,
+          intent,
+          variant,
+          description,
+          semantic_version: semanticVersion,
+        },
+      });
+    }
+
+    deleteSkill(skillId) {
+      return this.request(`/skills/${encodeURIComponent(skillId)}`, {
+        method: "DELETE",
+      });
+    }
+
     listSkillDrafts() {
       return this.request("/skills/drafts");
     }

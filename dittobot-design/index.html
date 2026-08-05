@@ -219,6 +219,148 @@
 
       <section id="page-create" class="page" hidden>
         <header><p class="eyebrow">02 · TEACHING REVIEW</p><h1>녹화로 스킬 초안 만들기</h1><p class="subtitle">저장된 RGB-D 시퀀스를 확인하고 시간 정렬된 대표 RGB + Depth 컬러맵 쌍을 GPT에 보내 의미 기반 스킬 초안을 만듭니다. API 키와 로컬 파일 경로는 브라우저에 노출되지 않습니다.</p></header>
+        <section class="panel manual-skill-panel">
+          <div class="section-header">
+            <div>
+              <h2>스킬 직접 생성</h2>
+              <p>
+                녹화 없이 동작을 직접 구성하여 새로운 스킬을 생성합니다.
+              </p>
+            </div>
+          </div>
+
+          <form id="manual-skill-form">
+
+            <div class="form-grid">
+
+              <label>
+                스킬 ID
+                <input
+                  id="manual-skill-id"
+                  type="text"
+                  placeholder="pick_object"
+                  required
+                >
+              </label>
+
+              <label>
+                스킬 이름
+                <input
+                  id="manual-skill-name"
+                  type="text"
+                  placeholder="물체 잡기"
+                  required
+                >
+              </label>
+
+            </div>
+
+            <label>
+              설명
+              <textarea
+                id="manual-skill-description"
+                rows="3"
+                placeholder="로봇이 대상 물체를 잡는 동작"
+              ></textarea>
+            </label>
+
+            <div class="manual-node-builder">
+
+              <h3>동작 추가</h3>
+
+              <div class="form-grid">
+
+                <label>
+                  동작
+                  <select id="manual-operation">
+                    <option value="grasp">잡기</option>
+                    <option value="lift">들어올리기</option>
+                    <option value="move">이동</option>
+                    <option value="place">놓기</option>
+                    <option value="press">누르기</option>
+                    <option value="pull">당기기</option>
+                    <option value="push">밀기</option>
+                    <option value="rotate">회전</option>
+                  </select>
+                </label>
+
+                <label>
+                  대상
+                  <input
+                    id="manual-target"
+                    type="text"
+                    placeholder="object"
+                  >
+                </label>
+
+              </div>
+
+              <div class="form-grid">
+
+                <label>
+                  속도
+                  <input
+                    id="manual-speed"
+                    type="number"
+                    value="30"
+                    min="1"
+                    max="100"
+                  >
+                </label>
+
+                <label>
+                  동작 설명
+                  <input
+                    id="manual-node-description"
+                    type="text"
+                    placeholder="대상을 잡는다"
+                  >
+                </label>
+
+              </div>
+
+              <button
+                id="add-manual-node"
+                class="button"
+                type="button"
+              >
+                + 동작 추가
+              </button>
+
+            </div>
+
+            <div class="manual-node-list-section">
+
+              <h3>등록할 동작</h3>
+
+              <div id="manual-node-list" class="manual-node-list">
+                <p class="muted">
+                  아직 추가된 동작이 없습니다.
+                </p>
+              </div>
+
+            </div>
+
+            <div class="actions">
+
+              <button
+                class="button primary"
+                type="submit"
+                id="create-manual-skill"
+              >
+                스킬 생성
+              </button>
+
+            </div>
+
+          </form>
+
+          <div
+            id="manual-skill-status"
+            class="status"
+          ></div>
+
+        </section>
         <div class="create-layout">
           <div class="panel">
             <p class="eyebrow">RECORDED RGB-D</p>
