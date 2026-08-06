@@ -7,6 +7,7 @@
     apiStatus: "connecting",
     skills: [],
     drafts: [],
+    taskFlowCatalog: { objects: [] },
     selectedKey: null,
     selectedDraftId: null,
     run: {
@@ -78,6 +79,8 @@
     connectionLabel: element("connection-label"),
     skillList: element("skill-list"),
     skillEmpty: element("skill-empty"),
+    taskFlowCatalog: element("task-flow-catalog"),
+    taskFlowList: element("task-flow-list"),
     draftInspector: element("draft-inspector"),
     draftInspectorTitle: element("draft-inspector-title"),
     draftInspectorSummary: element("draft-inspector-summary"),
@@ -372,6 +375,38 @@
       dom.skillList.append(card);
     });
     renderDraftInspector();
+  }
+
+  function renderTaskFlowCatalog() {
+    const objects = Array.isArray(state.taskFlowCatalog?.objects)
+      ? state.taskFlowCatalog.objects
+      : [];
+    dom.taskFlowCatalog.hidden = objects.length === 0;
+    dom.taskFlowList.replaceChildren();
+    objects.forEach((objectItem) => {
+      const card = create("article", { className: "task-flow-object" });
+      const grip = objectItem.active_grip_profile;
+      card.append(create("h3", {
+        text: `${objectItem.display_name || objectItem.canonical_id} · Grip ${grip ? grip.version : "미활성"}`,
+      }));
+      const actions = create("ul", { className: "task-flow-actions" });
+      (objectItem.actions || []).forEach((action) => {
+        const item = create("li");
+        const mappedEnd = action.mapped_end_motion?.end_motion_id || "End 미매핑";
+        item.append(
+          create("span", {
+            text: `${action.display_name || action.canonical_id} → ${mappedEnd}`,
+          }),
+          create("span", {
+            className: action.executable ? "ready" : "blocked",
+            text: action.executable ? "조합 가능" : `차단 ${action.blockers?.length || 0}`,
+          }),
+        );
+        actions.append(item);
+      });
+      card.append(actions);
+      dom.taskFlowList.append(card);
+    });
   }
 
   function renderDraftInspector() {
@@ -1581,6 +1616,7 @@
 
   function renderAll() {
     renderConnection();
+    renderTaskFlowCatalog();
     renderRegistry();
     if (state.page === "detail") renderDetail();
     if (state.page === "monitor") renderMonitor();
@@ -1791,6 +1827,7 @@
       ]);
       state.skills = (registry.skills || []).map(normalizeSkill);
       state.drafts = (draftCatalog.drafts || []).map(normalizeDraft);
+      state.taskFlowCatalog = registry.task_flow_catalog || { objects: [] };
       state.editor.catalog = Array.isArray(editorCatalog.primitives)
         ? editorCatalog.primitives
         : [];
@@ -1806,6 +1843,7 @@
       state.apiStatus = "error";
       state.skills = [];
       state.drafts = [];
+      state.taskFlowCatalog = { objects: [] };
       state.selectedKey = null;
       state.selectedDraftId = null;
       setBanner(`API 연결 실패: ${errorText(error)}`, "danger");
