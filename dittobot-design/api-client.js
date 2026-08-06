@@ -86,6 +86,12 @@
       return this.request("/skills");
     }
 
+    deleteSkill(skillId) {
+      return this.request(`/skills/${encodeURIComponent(skillId)}`, {
+        method: "DELETE",
+      });
+    }
+
     skillEditorCatalog() {
       return this.request("/skills/editor/catalog");
     }

@@ -741,6 +741,20 @@
     .block-palette { display: grid; gap: 8px; }
     .block-palette select { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
     .block-list { display: grid; gap: 10px; }
+    .blockly-workspace {
+      width: 100%;
+      height: min(68vh, 720px);
+      min-height: 480px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      background: #fff;
+    }
+    .blockly-workspace .blocklyToolboxDiv { background: var(--surface-soft); }
+    .blockly-parameter-editor { display: grid; gap: 12px; margin-top: 14px; }
+    .blockly-parameter-editor[hidden] { display: none; }
+    .blockly-status { margin: 10px 0 0; }
+    .blockly-status.danger { color: var(--danger); }
     .block-card { padding: 14px; border: 1px solid #cbbbea; border-left: 4px solid var(--accent); border-radius: 11px; background: var(--accent-soft); }
     .block-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
     .block-card-head strong { font: 650 13px ui-monospace, monospace; }
@@ -958,7 +972,7 @@
                 <option value="recovery">recovery</option>
               </select>
             </label>
-            <div class="block-palette">
+            <div class="block-palette" aria-label="Blockly 접근성용 primitive 추가">
               <label for="block-operation-select">승인 primitive 추가</label>
               <select id="block-operation-select"><option value="">catalog 로딩 중…</option></select>
               <button id="add-skill-block" type="button" class="button">블록 추가</button>
@@ -971,10 +985,17 @@
           </form>
           <div class="panel">
             <div class="detail-head">
-              <div><p class="eyebrow">ORDERED BLOCKS</p><p class="subtitle">위에서 아래 순서로만 실행됩니다.</p></div>
+              <div><p class="eyebrow">BLOCKLY WORKSPACE</p><p class="subtitle">왼쪽 toolbox에서 primitive를 끌어와 위에서 아래로 한 줄로 연결하세요.</p></div>
               <div class="actions"><button id="preview-skill-blocks" type="button" class="button">검증 미리보기</button><button id="create-block-candidate" type="button" class="button primary">Candidate 생성</button></div>
             </div>
-            <div id="skill-block-list" class="block-list"><p class="empty">primitive 블록을 추가해 주세요.</p></div>
+            <div id="skill-block-list" class="block-list">
+              <div id="blocklyDiv" class="blockly-workspace" aria-label="순차 primitive Blockly 작업공간"></div>
+              <p id="blockly-status" class="notice blockly-status" role="status" aria-live="polite">primitive 블록을 추가해 주세요.</p>
+              <section id="blockly-parameter-editor" class="blockly-parameter-editor" hidden>
+                <div><p class="eyebrow">SELECTED BLOCK PARAMETERS</p><h3 id="blockly-parameter-title">블록을 선택하세요</h3></div>
+                <div id="blockly-parameter-fields" class="block-parameters"></div>
+              </section>
+            </div>
             <pre id="block-editor-result" class="draft-result editor-result" hidden></pre>
           </div>
         </section>
@@ -1050,6 +1071,7 @@
       </section>
     </main>
   </div>
+  <script src="./vendor/blockly/blockly.min.js"></script>
   <script src="./api-client.js"></script>
   <script src="./app.js"></script>
 </body>

@@ -58,6 +58,7 @@ def test_editor_catalog_exposes_canonical_typed_primitives_and_profile_ids(
     assert "/skills/editor/preview" in paths
     assert "/skills/editor/candidates" in paths
     assert "/skills/{skill_id}/versions/{version}/parameter-candidates" in paths
+    assert "delete" in paths["/skills/{skill_id}"]
     catalog = service.get_skill_editor_catalog()
     operations = {item["operation_name"]: item for item in catalog["primitives"]}
     assert "motion.move_l" in operations
@@ -285,3 +286,54 @@ def test_parameter_child_does_not_replace_active_parent(
     assert unchanged_active["status"] == "active"
     assert unchanged_active["graph_checksum_sha256"] == active_checksum
     assert unchanged_active["skill_graph"]["nodes"][1]["arguments"]["width_m"] == 0.02
+
+
+def test_inactive_block_skill_can_be_deleted_with_all_candidate_versions(
+    service: MVPApplication,
+) -> None:
+    payload = {**_gripper_skill_payload(), "acknowledge_mock_only": True}
+    created = service.create_skill_editor_candidate(payload)
+    parent = created["candidate"]
+    child = service.create_skill_parameter_candidate(
+        "block_gripper_demo",
+        parent["version"],
+        {
+            "expected_parent_checksum_sha256": parent["graph_checksum_sha256"],
+            "edits": [
+                {
+                    "node_id": "block_002",
+                    "arguments": {"tool": "$tool", "width_m": 0.04},
+                }
+            ],
+            "acknowledge_mock_only": True,
+        },
+    )
+    assert child["candidate"]["version"] == "0.2.0-candidate"
+    artifact_directory = service.store.path_for("skills/block_gripper_demo")
+    assert artifact_directory.is_dir()
+
+    deleted = service.delete_skill("block_gripper_demo")
+
+    assert deleted["deleted"] is True
+    assert deleted["skill_id"] == "block_gripper_demo"
+    assert deleted["deleted_versions"] == 2
+    assert deleted["deleted_artifacts"] >= 8
+    assert not artifact_directory.exists()
+    assert service.list_skills()["skills"] == []
+    with pytest.raises(KeyError, match="unknown skill"):
+        service.get_skill("block_gripper_demo")
+
+    recreated = service.create_skill_editor_candidate(payload)
+    assert recreated["candidate"]["version"] == "0.1.0-candidate"
+
+
+def test_active_block_skill_cannot_be_deleted(service: MVPApplication) -> None:
+    payload = {**_gripper_skill_payload(), "acknowledge_mock_only": True}
+    created = service.create_skill_editor_candidate(payload)
+    service.activate_skill(
+        "block_gripper_demo",
+        {"version": created["candidate"]["version"]},
+    )
+
+    with pytest.raises(ValueError, match="active skill cannot be deleted"):
+        service.delete_skill("block_gripper_demo")

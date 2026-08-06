@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -77,6 +78,18 @@ class LocalArtifactStore:
 
     def path_for(self, relative_uri: str) -> Path:
         return self._resolve(relative_uri)
+
+    def delete_tree(self, relative_uri: str) -> int:
+        """Delete one validated artifact subtree and return its file count."""
+
+        target = self._resolve(relative_uri)
+        if not target.exists():
+            return 0
+        if not target.is_dir():
+            raise ValueError("artifact subtree URI must reference a directory")
+        deleted_files = sum(1 for item in target.rglob("*") if item.is_file())
+        shutil.rmtree(target)
+        return deleted_files
 
     def _resolve(self, relative_uri: str) -> Path:
         if "\\" in relative_uri:

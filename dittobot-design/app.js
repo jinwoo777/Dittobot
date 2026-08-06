@@ -60,6 +60,10 @@
       blocks: [],
       bindings: {},
       loading: false,
+      workspace: null,
+      selectedBlocklyBlockId: null,
+      blocklyError: null,
+      blocklyCatalogSignature: "",
       parameterNodeId: null,
       parameterArguments: null,
     },
@@ -167,6 +171,11 @@
     previewSkillBlocks: element("preview-skill-blocks"),
     createBlockCandidate: element("create-block-candidate"),
     skillBlockList: element("skill-block-list"),
+    blocklyDiv: element("blocklyDiv"),
+    blocklyStatus: element("blockly-status"),
+    blocklyParameterEditor: element("blockly-parameter-editor"),
+    blocklyParameterTitle: element("blockly-parameter-title"),
+    blocklyParameterFields: element("blockly-parameter-fields"),
     blockBindingList: element("block-binding-list"),
     blockEditorResult: element("block-editor-result"),
     parameterEditor: element("parameter-editor"),
@@ -306,6 +315,30 @@
     }
   }
 
+  async function deleteInactiveSkill(skill, button) {
+    const versions = state.skills.filter((item) => item.id === skill.id);
+    if (versions.some((item) => item.uiState === "active")) {
+      setBanner("활성 스킬은 삭제할 수 없습니다.", "danger");
+      return;
+    }
+    const confirmed = window.confirm(
+      `${skill.id}의 후보 버전 ${versions.length}개를 모두 삭제하시겠습니까?\n\n삭제한 레지스트리 데이터는 복구할 수 없습니다.`,
+    );
+    if (!confirmed) return;
+    button.disabled = true;
+    setBanner(`${skill.id} 삭제 중…`);
+    try {
+      const result = await api.deleteSkill(skill.id);
+      if (state.selectedKey?.startsWith(`${skill.id}@`)) state.selectedKey = null;
+      await loadRegistry(
+        `${result.skill_id} 삭제 완료 · 버전 ${result.deleted_versions}개 제거`,
+      );
+    } catch (error) {
+      button.disabled = false;
+      setBanner(`스킬 삭제 실패: ${errorText(error)}`, "danger");
+    }
+  }
+
   function renderRegistry() {
     dom.skillList.replaceChildren();
     const visibleSkills = state.skills.filter((skill) => {
@@ -364,6 +397,22 @@
         showPage("detail");
       });
       actions.append(detail);
+      const hasActiveVersion = state.skills.some(
+        (item) => item.id === skill.id && item.uiState === "active",
+      );
+      const deleteButton = create("button", {
+        className: "button danger",
+        text: "삭제",
+      });
+      deleteButton.type = "button";
+      deleteButton.disabled = state.apiStatus !== "connected" || hasActiveVersion;
+      deleteButton.title = hasActiveVersion
+        ? "활성 버전이 있는 스킬은 삭제할 수 없습니다."
+        : "이 스킬 ID의 모든 후보 버전을 삭제합니다.";
+      deleteButton.addEventListener("click", () => {
+        deleteInactiveSkill(skill, deleteButton);
+      });
+      actions.append(deleteButton);
       if (skill.uiState === "active") {
         const run = create("button", { className: "button primary", text: "Mock 실행" });
         run.type = "button";
@@ -889,7 +938,14 @@
     dom.createRecordingTab.setAttribute("aria-pressed", String(!blockMode));
     dom.createBlockTab.setAttribute("aria-selected", String(blockMode));
     dom.createBlockTab.setAttribute("aria-pressed", String(blockMode));
-    if (blockMode) renderSkillBlocks();
+    if (blockMode) {
+      renderSkillBlocks();
+      window.requestAnimationFrame(() => {
+        if (state.editor.workspace && window.Blockly) {
+          window.Blockly.svgResize(state.editor.workspace);
+        }
+      });
+    }
   }
 
   function renderPrimitiveOptions() {
@@ -903,58 +959,204 @@
       option.selected = primitive.operation_name === selected;
       dom.blockOperationSelect.append(option);
     });
-    dom.addSkillBlock.disabled = !state.editor.catalog.length;
+    dom.addSkillBlock.disabled = !state.editor.catalog.length || !window.Blockly;
+  }
+
+  function blocklyTypeForOperation(operation) {
+    return `dittobot_${operation.replace(/[^A-Za-z0-9_]/g, "_")}`;
+  }
+
+  function writeBlocklyBlockData(blocklyBlock, editorBlock) {
+    blocklyBlock.data = JSON.stringify({
+      operation: editorBlock.operation,
+      arguments: cloneValue(editorBlock.arguments || {}),
+    });
+  }
+
+  function readBlocklyBlockData(blocklyBlock) {
+    const primitive = state.editor.catalog.find(
+      (item) => blocklyTypeForOperation(item.operation_name) === blocklyBlock.type,
+    );
+    if (!primitive) return null;
+    let stored = {};
+    try {
+      stored = JSON.parse(blocklyBlock.data || "{}");
+    } catch (_error) {
+      stored = {};
+    }
+    return {
+      blockId: blocklyBlock.id,
+      operation: primitive.operation_name,
+      arguments: cloneValue(stored.arguments || primitive.default_arguments || {}),
+    };
+  }
+
+  function registerBlocklyPrimitive(primitive) {
+    const blockType = blocklyTypeForOperation(primitive.operation_name);
+    window.Blockly.Blocks[blockType] = {
+      init() {
+        this.appendDummyInput()
+          .appendField(primitive.operation_name);
+        this.appendDummyInput()
+          .appendField(primitive.description || "승인된 primitive");
+        this.setPreviousStatement(true);
+        this.setNextStatement(true);
+        this.setColour({
+          motion: 215,
+          gripper: 25,
+          contact: 345,
+          control: 120,
+        }[primitive.operation_name.split(".")[0]] || 265);
+        this.setTooltip(primitive.description || primitive.operation_name);
+        this.setHelpUrl("");
+        this.data = JSON.stringify({
+          operation: primitive.operation_name,
+          arguments: cloneValue(primitive.default_arguments || {}),
+        });
+      },
+    };
+  }
+
+  function buildBlocklyToolbox() {
+    const groups = new Map();
+    state.editor.catalog.forEach((primitive) => {
+      const group = primitive.operation_name.split(".")[0] || "primitive";
+      if (!groups.has(group)) groups.set(group, []);
+      groups.get(group).push({
+        kind: "block",
+        type: blocklyTypeForOperation(primitive.operation_name),
+      });
+    });
+    return {
+      kind: "categoryToolbox",
+      contents: [...groups.entries()].map(([name, contents]) => ({
+        kind: "category",
+        name: name.toUpperCase(),
+        colour: {
+          motion: "#4c77d9",
+          gripper: "#d97732",
+          contact: "#c43c78",
+          control: "#4c9b63",
+        }[name] || "#7755aa",
+        contents,
+      })),
+    };
+  }
+
+  function syncBlocksFromBlockly() {
+    const workspace = state.editor.workspace;
+    if (!workspace) return;
+    const allBlocks = workspace.getAllBlocks(false);
+    if (!allBlocks.length) {
+      state.editor.blocks = [];
+      state.editor.selectedBlocklyBlockId = null;
+      state.editor.blocklyError = null;
+      return;
+    }
+    const topBlocks = workspace.getTopBlocks(true);
+    if (topBlocks.length !== 1) {
+      state.editor.blocks = [];
+      state.editor.blocklyError = "모든 primitive를 위에서 아래로 하나의 체인에 연결해 주세요.";
+      return;
+    }
+    const ordered = [];
+    let current = topBlocks[0];
+    while (current) {
+      const block = readBlocklyBlockData(current);
+      if (block) ordered.push(block);
+      current = current.getNextBlock();
+    }
+    if (ordered.length !== allBlocks.length) {
+      state.editor.blocks = [];
+      state.editor.blocklyError = "분리된 블록이 있습니다. 하나의 순차 체인만 만들 수 있습니다.";
+      return;
+    }
+    state.editor.blocks = ordered;
+    state.editor.blocklyError = null;
+    if (!ordered.some((block) => block.blockId === state.editor.selectedBlocklyBlockId)) {
+      state.editor.selectedBlocklyBlockId = ordered[0]?.blockId || null;
+    }
+  }
+
+  function renderBlocklyParameterEditor() {
+    const selected = state.editor.blocks.find(
+      (block) => block.blockId === state.editor.selectedBlocklyBlockId,
+    ) || state.editor.blocks[0] || null;
+    dom.blocklyParameterEditor.hidden = !selected;
+    dom.blocklyParameterFields.replaceChildren();
+    if (!selected) return;
+    state.editor.selectedBlocklyBlockId = selected.blockId;
+    const index = state.editor.blocks.indexOf(selected);
+    dom.blocklyParameterTitle.textContent = `${index + 1}. ${selected.operation}`;
+    const primitive = primitiveByOperation(selected.operation);
+    renderArgumentEditor(
+      dom.blocklyParameterFields,
+      primitive,
+      selected.arguments,
+      (argumentsValue) => {
+        selected.arguments = argumentsValue;
+        const blocklyBlock = state.editor.workspace?.getBlockById(selected.blockId);
+        if (blocklyBlock) writeBlocklyBlockData(blocklyBlock, selected);
+        renderSkillBlocks();
+      },
+    );
+  }
+
+  function initializeBlockly() {
+    if (state.editor.workspace || !window.Blockly || !state.editor.catalog.length) return;
+    state.editor.catalog.forEach(registerBlocklyPrimitive);
+    state.editor.workspace = window.Blockly.inject(dom.blocklyDiv, {
+      toolbox: buildBlocklyToolbox(),
+      media: "./vendor/blockly/media/",
+      trashcan: true,
+      move: { scrollbars: true, drag: true, wheel: true },
+      zoom: { controls: true, wheel: true, startScale: 0.9, maxScale: 1.4, minScale: 0.5 },
+      grid: { spacing: 24, length: 3, colour: "#d7d3e4", snap: true },
+    });
+    state.editor.blocklyCatalogSignature = state.editor.catalog
+      .map((primitive) => primitive.operation_name)
+      .join("|");
+    state.editor.workspace.addChangeListener((event) => {
+      if (event.isUiEvent && event.type !== "selected") return;
+      if (event.type === "selected") {
+        state.editor.selectedBlocklyBlockId = event.newElementId || null;
+      }
+      syncBlocksFromBlockly();
+      renderSkillBlocks();
+    });
   }
 
   function renderSkillBlocks() {
     renderPrimitiveOptions();
-    dom.skillBlockList.replaceChildren();
-    if (!state.editor.blocks.length) {
-      dom.skillBlockList.append(create("p", { className: "empty", text: "primitive 블록을 추가해 주세요." }));
+    initializeBlockly();
+    if (!window.Blockly) {
+      state.editor.blocklyError = "Blockly 라이브러리를 불러오지 못했습니다.";
+    } else if (state.editor.workspace && state.editor.catalog.length) {
+      const signature = state.editor.catalog
+        .map((primitive) => primitive.operation_name)
+        .join("|");
+      if (signature !== state.editor.blocklyCatalogSignature) {
+        state.editor.catalog.forEach(registerBlocklyPrimitive);
+        state.editor.workspace.updateToolbox(buildBlocklyToolbox());
+        state.editor.blocklyCatalogSignature = signature;
+      }
     }
-    state.editor.blocks.forEach((block, index) => {
-      const primitive = primitiveByOperation(block.operation);
-      const card = create("article", { className: "block-card" });
-      const head = create("div", { className: "block-card-head" });
-      head.append(create("strong", { text: `${index + 1}. ${block.operation}` }));
-      const actions = create("div", { className: "actions" });
-      [["↑", -1], ["↓", 1]].forEach(([label, offset]) => {
-        const move = create("button", { className: "button", text: label });
-        move.type = "button";
-        move.disabled = index + offset < 0 || index + offset >= state.editor.blocks.length;
-        move.addEventListener("click", () => {
-          const next = state.editor.blocks.slice();
-          [next[index], next[index + offset]] = [next[index + offset], next[index]];
-          state.editor.blocks = next;
-          renderSkillBlocks();
-        });
-        actions.append(move);
-      });
-      const remove = create("button", { className: "button danger", text: "삭제" });
-      remove.type = "button";
-      remove.addEventListener("click", () => {
-        state.editor.blocks.splice(index, 1);
-        renderSkillBlocks();
-      });
-      actions.append(remove);
-      head.append(actions);
-      const fields = create("div", { className: "block-parameters" });
-      renderArgumentEditor(fields, primitive, block.arguments, (argumentsValue) => {
-        block.arguments = argumentsValue;
-        renderSkillBlocks();
-      });
-      card.append(head, fields);
-      dom.skillBlockList.append(card);
-    });
+    renderBlocklyParameterEditor();
     renderBlockBindings();
     const hasBindingConflict = collectBlockBindingHints()
       .some(([, hint]) => hint === "conflict");
     const ready = state.apiStatus === "connected"
       && state.editor.blocks.length > 0
       && !state.editor.loading
+      && !state.editor.blocklyError
       && !hasBindingConflict;
     dom.previewSkillBlocks.disabled = !ready;
     dom.createBlockCandidate.disabled = !ready;
+    dom.blocklyStatus.textContent = state.editor.blocklyError
+      || (state.editor.blocks.length
+        ? `${state.editor.blocks.length}개 primitive가 순차 연결되었습니다. 블록을 선택해 파라미터를 편집하세요.`
+        : "toolbox에서 primitive 블록을 추가해 주세요.");
+    dom.blocklyStatus.classList.toggle("danger", Boolean(state.editor.blocklyError));
   }
 
   function blockEditorPayload() {
@@ -1514,10 +1716,36 @@
   function addSelectedSkillBlock() {
     const primitive = primitiveByOperation(dom.blockOperationSelect.value);
     if (!primitive) return;
-    state.editor.blocks.push({
+    initializeBlockly();
+    const workspace = state.editor.workspace;
+    if (!workspace) return;
+    const editorBlock = {
       operation: primitive.operation_name,
       arguments: cloneValue(primitive.default_arguments || {}),
-    });
+    };
+    window.Blockly.Events.disable();
+    let blocklyBlock;
+    try {
+      blocklyBlock = workspace.newBlock(blocklyTypeForOperation(primitive.operation_name));
+      editorBlock.blockId = blocklyBlock.id;
+      writeBlocklyBlockData(blocklyBlock, editorBlock);
+      blocklyBlock.initSvg();
+      blocklyBlock.render();
+      const topBlocks = workspace.getTopBlocks(true);
+      const root = topBlocks.find((block) => block.id !== blocklyBlock.id);
+      let tail = root || null;
+      while (tail?.getNextBlock()) tail = tail.getNextBlock();
+      if (tail?.nextConnection && blocklyBlock.previousConnection) {
+        tail.nextConnection.connect(blocklyBlock.previousConnection);
+      } else {
+        blocklyBlock.moveBy(48, 48);
+      }
+    } finally {
+      window.Blockly.Events.enable();
+    }
+    state.editor.selectedBlocklyBlockId = blocklyBlock.id;
+    blocklyBlock.select();
+    syncBlocksFromBlockly();
     dom.blockEditorResult.hidden = true;
     renderSkillBlocks();
   }

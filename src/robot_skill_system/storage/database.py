@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event, func, or_, select
+from sqlalchemy import Engine, create_engine, delete, event, func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from robot_skill_system.storage.orm import (
@@ -25,6 +25,7 @@ from robot_skill_system.storage.orm import (
     SemanticCatalogRecord,
     SkillEmbeddingRecord,
     SkillRecord,
+    SkillVariantRecord,
     SkillVersionRecord,
     StageDefinitionRecord,
     TaskFlowPlanRecord,
@@ -1727,6 +1728,86 @@ class StorageRepository:
             ):
                 raise ValueError("rollback target must be a previously active stable version")
         return self.activate_skill_version(target_version_id)
+
+    def delete_skill(self, skill_id: str) -> dict[str, Any]:
+        """Delete one inactive skill identity and its registry-only version data."""
+
+        with self.database.session() as session:
+            skill = session.get(SkillRecord, skill_id)
+            if skill is None:
+                skill = session.scalar(
+                    select(SkillRecord).where(SkillRecord.name == skill_id)
+                )
+            if skill is None:
+                versions = list(session.scalars(select(SkillVersionRecord)))
+                matched = next(
+                    (
+                        version
+                        for version in versions
+                        if (version.graph_json or {}).get("skill_id") == skill_id
+                    ),
+                    None,
+                )
+                skill = matched.skill if matched is not None else None
+            if skill is None:
+                raise KeyError(f"unknown skill {skill_id!r}")
+            if skill.active_version_id is not None:
+                raise ValueError("active skill cannot be deleted")
+
+            versions = list(
+                session.scalars(
+                    select(SkillVersionRecord).where(
+                        SkillVersionRecord.skill_id == skill.id
+                    )
+                )
+            )
+            version_ids = [version.id for version in versions]
+            if version_ids:
+                linked_stage = session.scalar(
+                    select(StageDefinitionRecord.id).where(
+                        StageDefinitionRecord.skill_version_id.in_(version_ids)
+                    )
+                )
+                linked_plan = session.scalar(
+                    select(TaskFlowPlanRecord.id).where(
+                        TaskFlowPlanRecord.composite_skill_version_id.in_(version_ids)
+                    )
+                )
+                if linked_stage is not None or linked_plan is not None:
+                    raise ValueError(
+                        "catalog or task-flow linked skill cannot be deleted"
+                    )
+                session.execute(
+                    update(ExecutionRunRecord)
+                    .where(ExecutionRunRecord.skill_version_id.in_(version_ids))
+                    .values(skill_version_id=None)
+                )
+                session.execute(
+                    delete(SkillEmbeddingRecord).where(
+                        SkillEmbeddingRecord.skill_version_id.in_(version_ids)
+                    )
+                )
+                session.execute(
+                    delete(ValidationRunRecord).where(
+                        ValidationRunRecord.skill_version_id.in_(version_ids)
+                    )
+                )
+                for version in versions:
+                    version.parent_version_id = None
+                session.flush()
+                for version in versions:
+                    session.delete(version)
+
+            session.execute(
+                delete(SkillVariantRecord).where(
+                    SkillVariantRecord.skill_id == skill.id
+                )
+            )
+            session.delete(skill)
+            return {
+                "skill_id": skill_id,
+                "deleted_versions": len(versions),
+            }
 
     def search_active_skills_keyword(
         self, query: str, *, limit: int = 10
