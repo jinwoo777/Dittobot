@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     induce.add_argument("--demo", required=True, type=Path)
     induce.add_argument("--skill-id", default="wipe_surface")
     induce.add_argument("--variant", default="safe")
+    induce.add_argument("--text", dest="transcript_text")
 
     update = subparsers.add_parser("update-skill", help="create an immutable candidate update")
     update.add_argument("--skill-id", "--skill", dest="skill_id", required=True)
@@ -192,22 +193,23 @@ def _dispatch(args: argparse.Namespace, settings: Settings) -> Mapping[str, Any]
             scene = app.capture_scene({"mode": args.mode})
             return {"backend": args.backend, **scene}
         if args.command == "induce-skill":
-            return app.induce_skill(
-                {
-                    "demo_path": str(args.demo),
-                    "name": args.skill_id,
-                    "variant": args.variant,
-                }
-            )
+            induce_request: dict[str, Any] = {
+                "demo_path": str(args.demo),
+                "name": args.skill_id,
+                "variant": args.variant,
+            }
+            if args.transcript_text:
+                induce_request["transcript_text"] = args.transcript_text
+            return app.induce_skill(induce_request)
         if args.command == "update-skill":
-            request: dict[str, Any] = {
+            update_request: dict[str, Any] = {
                 "demo_path": str(args.demo),
                 "operator_role": args.operator_role,
                 "has_force_measurements": args.has_force_measurements,
             }
             if args.base_version:
-                request["base_version"] = args.base_version
-            return app.update_skill(args.skill_id, request)
+                update_request["base_version"] = args.base_version
+            return app.update_skill(args.skill_id, update_request)
         if args.command == "list-skills":
             return _list_skills(
                 app,
@@ -285,7 +287,11 @@ def _list_skills(
             }
         )
     skills = list(grouped.values())
-    return {"count": len(skills), "skills": skills}
+    result: dict[str, Any] = {"count": len(skills), "skills": skills}
+    hierarchy = app.list_task_flow_hierarchy()
+    if hierarchy["objects"]:
+        result["task_flow_catalog"] = hierarchy
+    return result
 
 
 def _execute(app: MVPApplication, args: argparse.Namespace) -> dict[str, Any]:
@@ -294,12 +300,14 @@ def _execute(app: MVPApplication, args: argparse.Namespace) -> dict[str, Any]:
         scene_id = str(app.capture_scene({"mode": "mock"})["scene_id"])
     resolution = app.resolve_runtime({"text": args.text, "scene_id": scene_id})
     skill_id = args.skill_id or _first_resolved_skill_id(resolution)
+    bindings = _resolved_candidate_bindings(resolution)
+    bindings.update(_parse_bindings(args.binding))
     request: dict[str, Any] = {
         "text": args.text,
         "mode": args.mode,
         "skill_id": skill_id,
         "scene_id": scene_id,
-        "bindings": _parse_bindings(args.binding),
+        "bindings": bindings,
     }
     if args.version:
         request["version"] = args.version
@@ -316,10 +324,37 @@ def _first_resolved_skill_id(resolution: Mapping[str, Any]) -> str:
         raise ValueError(
             "no active validated skill matched; run induce-skill or demo-e2e first"
         )
-    first = results[0]
+    executable_results = [
+        item
+        for item in results
+        if isinstance(item, Mapping) and item.get("executable") is not False
+    ]
+    if not executable_results:
+        raise ValueError("matched task flow is blocked by composition or preflight")
+    first = executable_results[0]
     if not isinstance(first, Mapping) or not first.get("skill_id"):
         raise ValueError("runtime resolver returned a candidate without skill_id")
     return str(first["skill_id"])
+
+
+def _resolved_candidate_bindings(resolution: Mapping[str, Any]) -> dict[str, str]:
+    candidates = resolution.get("skill_candidates", {})
+    if not isinstance(candidates, Mapping):
+        return {}
+    results = candidates.get("results", [])
+    if not isinstance(results, list):
+        return {}
+    for item in results:
+        if not isinstance(item, Mapping) or item.get("executable") is False:
+            continue
+        bindings = item.get("bindings", {})
+        if not isinstance(bindings, Mapping):
+            return {}
+        return {
+            str(placeholder): str(entity_id)
+            for placeholder, entity_id in bindings.items()
+        }
+    return {}
 
 
 def _parse_bindings(values: Sequence[str]) -> dict[str, str]:

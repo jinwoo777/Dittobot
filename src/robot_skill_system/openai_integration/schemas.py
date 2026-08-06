@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES = 6_000
 
@@ -392,6 +393,42 @@ class RuntimeIntent(StrictModel):
     unresolved_ambiguities: list[str] = Field(default_factory=list)
     ambiguity: bool = False
     confidence_rationale: str | None = None
+
+
+class TaskIntent(StrictModel):
+    """Catalog-bounded Grip -> Action intent; local code selects End Motion.
+
+    This schema deliberately contains semantic identifiers only.  Geometry,
+    control values, component versions, and execution authority are excluded.
+    """
+
+    object_class_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    action_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+    object_instance_id: str | None = Field(
+        default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+    )
+    # Keep the cardinality bound in the local validator instead of Field(max_length).
+    # Pydantic serializes the latter as JSON Schema ``maxProperties``, which the
+    # Responses API structured-output dialect does not accept.
+    role_bindings: dict[str, str] = Field(default_factory=dict)
+    confidence: float = Field(ge=0.0, le=1.0)
+    ambiguity: bool = False
+    unresolved_ambiguities: list[str] = Field(default_factory=list, max_length=32)
+    confidence_rationale: str | None = Field(default=None, max_length=1000)
+
+    @field_validator("role_bindings")
+    @classmethod
+    def validate_role_bindings(cls, value: dict[str, str]) -> dict[str, str]:
+        if len(value) > 16:
+            raise ValueError("role_bindings cannot contain more than 16 entries")
+        role_pattern = re.compile(r"^\$[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+        entity_pattern = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+        for role, entity_id in value.items():
+            if not role_pattern.fullmatch(role):
+                raise ValueError("role binding keys must use $name syntax")
+            if not entity_pattern.fullmatch(entity_id):
+                raise ValueError("role bindings must contain scene entity identifiers")
+        return value
 
 
 class SkillInvocation(StrictModel):

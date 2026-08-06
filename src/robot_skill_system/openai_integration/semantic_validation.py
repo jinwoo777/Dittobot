@@ -16,6 +16,7 @@ from .schemas import (
     RecordingSkillDraft,
     RuntimeIntent,
     SkillGraphProposal,
+    TaskIntent,
 )
 
 
@@ -97,6 +98,30 @@ def validate_runtime_intent(
             "candidate_entity_ids": _unknown(intent.candidate_entity_ids, entity_catalog),
             "motion_profile_ids": _unknown(motion_profiles, approved_motion_profiles),
             "force_profile_ids": _unknown(force_profiles, approved_force_profiles),
+        },
+    )
+
+
+def validate_task_intent(
+    intent: TaskIntent,
+    *,
+    object_catalog: Iterable[str],
+    action_catalog: Iterable[str],
+    entity_catalog: Iterable[str],
+    allowed_roles: Iterable[str],
+) -> None:
+    """Reject task-flow selections outside local catalogs and the current Scene."""
+
+    entity_ids = set(intent.role_bindings.values())
+    if intent.object_instance_id is not None:
+        entity_ids.add(intent.object_instance_id)
+    _raise_if_violations(
+        "TaskIntent",
+        {
+            "object_class_id": _unknown({intent.object_class_id}, object_catalog),
+            "action_id": _unknown({intent.action_id}, action_catalog),
+            "entity_ids": _unknown(entity_ids, entity_catalog),
+            "role_bindings": _unknown(intent.role_bindings, allowed_roles),
         },
     )
 

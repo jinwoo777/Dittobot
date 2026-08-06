@@ -2,6 +2,7 @@
 
 from robot_skill_system.primitives.models import (
     ForceProfile,
+    GraspVerificationProfile,
     MotionProfile,
     PrimitiveDefinition,
     PrimitiveMetadata,
@@ -16,6 +17,7 @@ from robot_skill_system.primitives.registry import (
 __all__ = [
     "DEFAULT_PRIMITIVE_REGISTRY",
     "ForceProfile",
+    "GraspVerificationProfile",
     "MotionProfile",
     "PrimitiveDefinition",
     "PrimitiveMetadata",

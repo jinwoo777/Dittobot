@@ -178,6 +178,30 @@ class GripperVerifyStateArguments(ToolBindingArguments):
     expected_state: GripperState
 
 
+class GraspVerificationArguments(PrimitiveArguments):
+    """Verify attachment state using code-owned object/tool bindings and a profile.
+
+    The arguments intentionally contain no thresholds.  Sensor interpretation
+    thresholds belong to the locally approved :class:`GraspVerificationProfile`.
+    """
+
+    object: str = "$object"
+    tool: str = "$gripper"
+    verification_profile_id: str
+
+    _validate_object = field_validator("object")(validate_binding_or_id)
+    _validate_tool = field_validator("tool")(validate_binding_or_id)
+    _validate_profile = field_validator("verification_profile_id")(validate_profile_id)
+
+
+class GraspVerifyHoldingArguments(GraspVerificationArguments):
+    """Verify and record that the bound tool is holding the bound object."""
+
+
+class GraspVerifyReleasedArguments(GraspVerificationArguments):
+    """Verify and record that the bound object has been released by the tool."""
+
+
 class ContactSearchArguments(PrimitiveArguments):
     """Search for an approved surface with a profile-owned speed and force."""
 
@@ -343,6 +367,20 @@ class MotionProfile(StrictModel):
         ):
             raise ValueError("Cartesian profiles require linear velocity and acceleration")
         return self
+
+
+class GraspVerificationProfile(StrictModel):
+    """Locally approved interpretation policy for grasp/release observations.
+
+    These values are configuration-owned.  They must never be copied from LLM
+    output or embedded in a SkillGraph primitive invocation.
+    """
+
+    profile_id: str
+    require_holding_signal: bool = True
+    minimum_released_width_m: float = Field(ge=0.0, le=0.2)
+
+    _validate_profile = field_validator("profile_id")(validate_profile_id)
 
 
 class UnexpectedContactPolicy(str, Enum):

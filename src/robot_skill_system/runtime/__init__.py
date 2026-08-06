@@ -42,6 +42,14 @@ from robot_skill_system.runtime.preflight import (
 )
 from robot_skill_system.runtime.safety_supervisor import GlobalSafetySupervisor
 from robot_skill_system.runtime.scene_monitor import CameraSceneMonitor, SceneFreshnessMonitor
+from robot_skill_system.runtime.task_flow_materializer import (
+    ExecutableGripProfileArtifact,
+    MaterializedTaskFlow,
+    TaskFlowMaterializationError,
+    TaskFlowMaterializer,
+    TaskFlowStorageSelection,
+    materialize_task_flow,
+)
 from robot_skill_system.runtime.workspace_monitor import (
     GlobalWorkspaceSupervisor,
     MockObstacleMonitor,
@@ -60,11 +68,13 @@ __all__ = [
     "ExecutionAbortedError",
     "ExecutionMode",
     "ExecutionResult",
+    "ExecutableGripProfileArtifact",
     "ForceSafetyError",
     "ForceSupervisor",
     "GlobalForceSupervisor",
     "GlobalSafetySupervisor",
     "GlobalWorkspaceSupervisor",
+    "MaterializedTaskFlow",
     "MockGeometryValidator",
     "MockIKCollisionValidator",
     "MockObstacleMonitor",
@@ -87,9 +97,13 @@ __all__ = [
     "SceneFreshnessMonitor",
     "SceneStaleError",
     "SkillHashMismatchError",
+    "TaskFlowMaterializationError",
+    "TaskFlowMaterializer",
+    "TaskFlowStorageSelection",
     "ValidationCheck",
     "WorkspaceSupervisor",
     "bind_relative_pose",
     "canonical_skill_checksum_sha256",
+    "materialize_task_flow",
     "verify_skill_checksum",
 ]

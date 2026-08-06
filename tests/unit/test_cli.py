@@ -51,7 +51,7 @@ def test_inspect_is_json_and_never_exposes_api_key(
     result = document["result"]
     assert isinstance(result, dict)
     assert result["hardware_enabled"] is False
-    assert result["primitive_count"] == 29
+    assert result["primitive_count"] == 31
 
 
 def test_offline_demo_then_cli_execute_is_complete_and_mock_only(

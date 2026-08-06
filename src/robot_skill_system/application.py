@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -57,6 +58,11 @@ from robot_skill_system.demonstrations.quality import (
     assess_trajectory_quality,
 )
 from robot_skill_system.demonstrations.recorder import load_demonstration
+from robot_skill_system.demonstrations.rgbd_dataset import (
+    RGBDDatasetSegmentation,
+    load_rgbd_dataset,
+    segment_rgbd_dataset,
+)
 from robot_skill_system.demonstrations.rgbd_geometry import (
     ManualTCPPathSample,
     PixelPoint,
@@ -67,6 +73,10 @@ from robot_skill_system.demonstrations.rgbd_geometry import (
     validate_surface_relative_path,
 )
 from robot_skill_system.demonstrations.segmentation import segment_trajectory
+from robot_skill_system.demonstrations.stage_segmentation import (
+    GripActionEndSegmentationConfig,
+    GripActionEndSegmentationError,
+)
 from robot_skill_system.demonstrations.synthetic import (
     generate_expert_wipe_trajectory,
     generate_novice_wipe_trajectory,
@@ -99,6 +109,11 @@ from robot_skill_system.openai_integration.schemas import (
     DemonstrationAnalysisInput,
     RecordingSkillDraftInput,
 )
+from robot_skill_system.openai_integration.task_intent_resolver import TaskIntentResolver
+from robot_skill_system.openai_integration.training_semantics import (
+    TrainingSemanticResolver,
+    TrainingTaskSemantics,
+)
 from robot_skill_system.perception.hand_pose import (
     FingerObservation,
     MediaPipeHandPoseEstimator,
@@ -109,12 +124,13 @@ from robot_skill_system.perception.semantic_anchor import (
 from robot_skill_system.primitives.models import SafetyPolicy
 from robot_skill_system.primitives.profiles import (
     load_force_profiles,
+    load_grasp_verification_profiles,
     load_motion_profiles,
     load_safety_policies,
 )
 from robot_skill_system.primitives.registry import get_default_registry
 from robot_skill_system.runtime.binder import EntityBinder
-from robot_skill_system.runtime.errors import ExecutionAbortedError
+from robot_skill_system.runtime.errors import ExecutionAbortedError, RuntimeErrorBase
 from robot_skill_system.runtime.event_log import InMemoryEventSink
 from robot_skill_system.runtime.executor import RuntimeExecutor
 from robot_skill_system.runtime.force_supervisor import GlobalForceSupervisor
@@ -122,6 +138,9 @@ from robot_skill_system.runtime.integrity import verify_skill_checksum
 from robot_skill_system.runtime.models import ExecutionMode, RuntimeContext
 from robot_skill_system.runtime.preflight import PreflightValidator
 from robot_skill_system.runtime.safety_supervisor import GlobalSafetySupervisor
+from robot_skill_system.runtime.task_flow_materializer import (
+    TaskFlowMaterializer,
+)
 from robot_skill_system.runtime.workspace_monitor import GlobalWorkspaceSupervisor
 from robot_skill_system.scene.models import (
     Pose,
@@ -158,11 +177,17 @@ from robot_skill_system.skills.updater import SkillUpdater, UpdateEvidence
 from robot_skill_system.skills.versioning import SemanticVersion, stable_version
 from robot_skill_system.storage.artifact_store import LocalArtifactStore
 from robot_skill_system.storage.database import Database, StorageRepository
+from robot_skill_system.storage.grip_point_importer import GripPointResultImporter
 from robot_skill_system.storage.orm import (
+    ActionEndMappingRecord,
     ExecutionRunRecord,
+    GripProfileVersionRecord,
     SceneRecord,
+    SemanticCatalogRecord,
     SkillRecord,
     SkillVersionRecord,
+    StageDefinitionRecord,
+    TeachingSessionRecord,
 )
 from robot_skill_system.vertical_slice import build_wipe_skill_graph, capture_mock_scene
 
@@ -2669,6 +2694,8 @@ class MVPApplication:
 
     def induce_skill(self, request: dict[str, Any]) -> dict[str, Any]:
         source = self._safe_demo_path(str(request["demo_path"]))
+        if source.is_dir() and (source / "rgbd_manifest.json").is_file():
+            return self._induce_rgbd_components(source, request)
         evidence = self._demonstration_evidence(source)
         graph, fitted_operations = build_wipe_skill_graph()
         graph = self._apply_node_argument_updates(
@@ -2772,6 +2799,526 @@ class MVPApplication:
             "generated_code_checksum_sha256": version.generated_code_checksum_sha256,
         }
 
+    @staticmethod
+    def _canonical_json_checksum(value: Any) -> str:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _put_content_addressed_json(
+        self,
+        *,
+        recording_id: str,
+        artifact_kind: str,
+        value: dict[str, Any],
+    ) -> Any:
+        checksum = self._canonical_json_checksum(value)
+        return self.store.put_json(
+            f"demonstrations/{recording_id}/induction_v1/"
+            f"{artifact_kind}_{checksum}.json",
+            value,
+        )
+
+    def _approved_training_transcript(
+        self, request: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any]]:
+        transcript = request.get("transcript_text")
+        artifact_uri = request.get("transcript_artifact_uri")
+        artifact_checksum = request.get("transcript_artifact_checksum_sha256")
+        if (artifact_uri is None) is not (artifact_checksum is None):
+            raise ValueError("transcript artifact URI and checksum must be provided together")
+        if transcript is not None and artifact_uri is not None:
+            raise ValueError("provide exactly one training transcript source")
+        if transcript is not None:
+            normalized = str(transcript).strip()
+            if normalized:
+                if len(normalized) > 2_000:
+                    raise ValueError("training transcript exceeds 2000 characters")
+                return normalized, {"kind": "request", "approved": True}
+
+        if artifact_uri is None and artifact_checksum is None:
+            return None, {"kind": "missing", "approved": False}
+        if not isinstance(artifact_uri, str) or not isinstance(artifact_checksum, str):
+            raise ValueError("transcript artifact URI and checksum must be strings")
+        with self.database.session() as session:
+            record = session.scalar(
+                select(TeachingSessionRecord).where(
+                    TeachingSessionRecord.artifact_uri == artifact_uri,
+                    TeachingSessionRecord.artifact_checksum_sha256
+                    == artifact_checksum,
+                    TeachingSessionRecord.ended_at_ns.is_not(None),
+                )
+            )
+        if record is None or record.status not in {"finished", "completed"}:
+            raise ValueError(
+                "transcript artifact must be the checksum-pinned output of a finalized "
+                "teaching session"
+            )
+        try:
+            payload = json.loads(
+                self.store.read_bytes(
+                    artifact_uri,
+                    expected_checksum_sha256=artifact_checksum,
+                ).decode("utf-8")
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("approved transcript artifact is not UTF-8 JSON") from exc
+        if not isinstance(payload, dict) or payload.get("success") is False:
+            raise ValueError("approved transcript artifact does not contain a successful session")
+        text_value = payload.get("transcript_text") or payload.get(
+            "operator_instruction"
+        )
+        if not isinstance(text_value, str) or not text_value.strip():
+            return None, {
+                "kind": "finalized_teaching_artifact",
+                "approved": True,
+                "artifact_uri": artifact_uri,
+                "artifact_checksum_sha256": artifact_checksum,
+            }
+        normalized = text_value.strip()
+        if len(normalized) > 2_000:
+            raise ValueError("approved training transcript exceeds 2000 characters")
+        return normalized, {
+            "kind": "finalized_teaching_artifact",
+            "approved": True,
+            "artifact_uri": artifact_uri,
+            "artifact_checksum_sha256": artifact_checksum,
+        }
+
+    def _resolve_training_semantics(
+        self, transcript: str
+    ) -> tuple[TrainingTaskSemantics, dict[str, Any]]:
+        objects = [
+            item
+            for item in self.repository.list_catalog_entries(kind="object")
+            if item.status != "retired"
+        ]
+        actions = [
+            item
+            for item in self.repository.list_catalog_entries(kind="action")
+            if item.status != "retired"
+        ]
+        object_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in objects
+        }
+        action_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in actions
+        }
+        action_required_roles: dict[str, tuple[str, ...]] = {}
+        for item in actions:
+            raw_roles = item.metadata_json.get("required_roles", [])
+            action_required_roles[item.canonical_id] = tuple(
+                role for role in raw_roles if isinstance(role, str)
+            ) if isinstance(raw_roles, list) else ()
+        semantics, metadata = TrainingSemanticResolver(self.settings).resolve(
+            transcript,
+            object_catalog=object_catalog,
+            action_catalog=action_catalog,
+            action_required_roles=action_required_roles,
+        )
+        return semantics, metadata.model_dump(mode="json")
+
+    def _ensure_rgbd_semantic_catalogs(
+        self,
+        *,
+        semantics: TrainingTaskSemantics,
+        manifest_checksum_sha256: str,
+    ) -> dict[str, dict[str, Any]]:
+        if semantics.object_class_id is None or semantics.action_id is None:
+            raise ValueError("resolved training semantics require object and action IDs")
+        catalog: dict[str, dict[str, Any]] = {}
+        for kind, identifier in (
+            ("object", semantics.object_class_id),
+            ("action", semantics.action_id),
+        ):
+            entry = self.repository.get_catalog_entry(
+                kind=kind, identifier=identifier, active_only=False
+            )
+            created = entry is None
+            if entry is None:
+                metadata: dict[str, Any] = {
+                    "discovered_by": "rgbd_training_semantics",
+                    "source_manifest_checksum_sha256": manifest_checksum_sha256,
+                    "semantic_only": True,
+                    "runtime_exposed": False,
+                    "hardware_compatible": False,
+                }
+                if kind == "action":
+                    metadata.update(
+                        {
+                            "required_roles": list(semantics.required_roles),
+                            "input_contract": {},
+                            "output_contract": {},
+                            "anchor_policy": {},
+                        }
+                    )
+                entry = self.repository.create_catalog_entry(
+                    kind=kind,
+                    canonical_id=identifier,
+                    display_name=identifier,
+                    aliases=[],
+                    metadata=metadata,
+                )
+            summary = self._catalog_entry_summary(entry)
+            summary["created_from_training"] = created
+            catalog[kind] = summary
+        return catalog
+
+    def _rgbd_component_candidates(
+        self,
+        *,
+        dataset: Any,
+        segmentation: RGBDDatasetSegmentation,
+        segmentation_report: Any,
+        semantics: TrainingTaskSemantics,
+        catalog: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        if semantics.object_class_id is None or semantics.action_id is None:
+            raise ValueError("component candidates require resolved semantics")
+        common_source = {
+            "recording_id": dataset.manifest.recording_id,
+            "manifest_checksum_sha256": dataset.manifest.manifest_checksum_sha256,
+            "segmentation_report_uri": segmentation_report.uri,
+            "segmentation_report_checksum_sha256": segmentation_report.checksum_sha256,
+            "candidate_only": True,
+            "executable": False,
+            "hardware_compatible": False,
+        }
+        grip_payload = {
+            "schema_version": "1.0",
+            "component_type": "grip_profile_evidence",
+            "object_class_id": semantics.object_class_id,
+            "frame_policy": "camera_relative_observation_only",
+            "grip_interval": segmentation.segmentation.grip.model_dump(mode="json"),
+            "stable_close_evidence": (
+                segmentation.segmentation.evidence.first_stable_close.model_dump(
+                    mode="json"
+                )
+            ),
+            "source": common_source,
+            "missing_hardware_evidence": [
+                "object_relative_6d_pose",
+                "approach_axis",
+                "hand_eye_and_task_plane_revision",
+                "rg2_fingertip_calibration",
+                "post_lift_object_following_verification",
+            ],
+        }
+        grip_artifact = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="grip_candidate",
+            value=grip_payload,
+        )
+        grip_version = self.repository.register_grip_profile_version(
+            object_class_id=semantics.object_class_id,
+            semantic_version=(
+                f"0.0.0-{grip_artifact.checksum_sha256[:12]}-candidate"
+            ),
+            artifact_uri=grip_artifact.uri,
+            artifact_checksum_sha256=grip_artifact.checksum_sha256,
+            object_frame_policy="camera_relative_observation_only",
+            object_frame_revision=dataset.manifest.manifest_checksum_sha256,
+            status="candidate",
+            validation_status="pending",
+            hardware_compatible=False,
+            auto_activation_allowed=False,
+            gripper_calibration_profile_id=None,
+            metadata={
+                "source": "raw_rgbd_local_segmentation",
+                "diagnostic_only": True,
+                "normalized_2d_is_not_an_execution_target": True,
+            },
+        )
+
+        action_payload = {
+            "schema_version": "1.0",
+            "component_type": "action_interval_evidence",
+            "action_id": semantics.action_id,
+            "required_roles": list(semantics.required_roles),
+            "action_interval": segmentation.segmentation.action.model_dump(mode="json"),
+            "intermediate_gripper_transitions": [
+                item.model_dump(mode="json")
+                for item in (
+                    segmentation.segmentation.evidence.action_intermediate_transitions
+                )
+            ],
+            "source": common_source,
+        }
+        action_artifact = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="action_candidate",
+            value=action_payload,
+        )
+        end_payload = {
+            "schema_version": "1.0",
+            "component_type": "end_motion_interval_evidence",
+            "action_id": semantics.action_id,
+            "end_motion_id": None,
+            "end_motion_interval": segmentation.segmentation.end_motion.model_dump(
+                mode="json"
+            ),
+            "final_stable_open": (
+                segmentation.segmentation.evidence.final_stable_open.model_dump(
+                    mode="json"
+                )
+            ),
+            "source": common_source,
+        }
+        end_artifact = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="end_motion_candidate",
+            value=end_payload,
+        )
+        return {
+            "grip": {
+                **self._grip_profile_version_summary(grip_version),
+                "object_class_id": semantics.object_class_id,
+                "catalog_status": catalog["object"]["status"],
+                "component_status": "evidence_candidate",
+                "blockers": grip_payload["missing_hardware_evidence"],
+            },
+            "action": {
+                "action_id": semantics.action_id,
+                "catalog_status": catalog["action"]["status"],
+                "component_status": "segmented_evidence_only",
+                "definition_created": False,
+                "artifact_uri": action_artifact.uri,
+                "artifact_checksum_sha256": action_artifact.checksum_sha256,
+                "hardware_compatible": False,
+                "blockers": [
+                    "anchor-relative action geometry is not available",
+                    "an executable Action SkillGraph has not been compiled",
+                ],
+            },
+            "end_motion": {
+                "end_motion_id": None,
+                "component_status": "segmented_evidence_only",
+                "definition_created": False,
+                "mapping_created": False,
+                "artifact_uri": end_artifact.uri,
+                "artifact_checksum_sha256": end_artifact.checksum_sha256,
+                "hardware_compatible": False,
+                "blockers": [
+                    "an approved anchor-relative EndMotion SkillGraph is required",
+                    "Action-to-End mapping must be selected locally after validation",
+                ],
+            },
+        }
+
+    def _induce_rgbd_components(
+        self, source: Path, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Integrity-load and split raw RGB-D evidence without fabricating a skill."""
+
+        dataset = load_rgbd_dataset(source)
+        segmentation_config = GripActionEndSegmentationConfig(
+            finger_close_threshold_m=self.settings.finger_close_threshold_m,
+            finger_state_stable_frames=self.settings.finger_state_stable_frames,
+        )
+        segmentation: RGBDDatasetSegmentation | None = None
+        segmentation_status = "succeeded"
+        segmentation_failure: dict[str, Any] | None = None
+        try:
+            segmentation = segment_rgbd_dataset(
+                dataset,
+                config=segmentation_config,
+            )
+            report_payload: dict[str, Any] = {
+                "schema_version": "1.0",
+                "report_type": "rgbd_grip_action_end_segmentation",
+                "status": "succeeded",
+                "source": {
+                    "recording_id": dataset.manifest.recording_id,
+                    "manifest_checksum_sha256": (
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                    "frame_count": dataset.manifest.frame_count,
+                    "recording_fps": dataset.manifest.recording_fps,
+                },
+                "configuration": segmentation_config.model_dump(mode="json"),
+                "observations": [
+                    item.model_dump(mode="json") for item in segmentation.observations
+                ],
+                "transitions": [
+                    item.model_dump(mode="json") for item in segmentation.transitions
+                ],
+                "segmentation": segmentation.segmentation.model_dump(mode="json"),
+                "executable": False,
+                "hardware_compatible": False,
+            }
+        except GripActionEndSegmentationError as exc:
+            segmentation_status = "structural_failure"
+            segmentation_failure = exc.failure.model_dump(mode="json")
+            report_payload = {
+                "schema_version": "1.0",
+                "report_type": "rgbd_grip_action_end_segmentation",
+                "status": segmentation_status,
+                "source": {
+                    "recording_id": dataset.manifest.recording_id,
+                    "manifest_checksum_sha256": (
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                    "frame_count": dataset.manifest.frame_count,
+                    "recording_fps": dataset.manifest.recording_fps,
+                },
+                "configuration": segmentation_config.model_dump(mode="json"),
+                "failure": segmentation_failure,
+                "executable": False,
+                "hardware_compatible": False,
+            }
+        except NotConfiguredError as exc:
+            segmentation_status = "configuration_failure"
+            segmentation_failure = {
+                "code": "mediapipe_not_configured",
+                "message": str(exc),
+            }
+            report_payload = {
+                "schema_version": "1.0",
+                "report_type": "rgbd_grip_action_end_segmentation",
+                "status": segmentation_status,
+                "source": {
+                    "recording_id": dataset.manifest.recording_id,
+                    "manifest_checksum_sha256": (
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                    "frame_count": dataset.manifest.frame_count,
+                    "recording_fps": dataset.manifest.recording_fps,
+                },
+                "configuration": segmentation_config.model_dump(mode="json"),
+                "failure": segmentation_failure,
+                "executable": False,
+                "hardware_compatible": False,
+            }
+        segmentation_report = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="segmentation_report",
+            value=report_payload,
+        )
+
+        transcript, semantic_source = self._approved_training_transcript(request)
+        semantics: TrainingTaskSemantics | None = None
+        semantic_trace: dict[str, Any] | None = None
+        semantic_status = "resolved"
+        semantic_blockers: list[str] = []
+        catalog: dict[str, dict[str, Any]] = {}
+        if transcript is None:
+            semantic_status = "semantics_missing"
+            semantic_blockers.append(
+                "transcript_text or a checksum-pinned finalized teaching artifact is required"
+            )
+        else:
+            semantics, semantic_trace = self._resolve_training_semantics(transcript)
+            if semantics.ambiguity:
+                semantic_status = "semantics_unresolved"
+                semantic_blockers.extend(semantics.unresolved_ambiguities)
+            else:
+                catalog = self._ensure_rgbd_semantic_catalogs(
+                    semantics=semantics,
+                    manifest_checksum_sha256=(
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                )
+
+        blockers = list(semantic_blockers)
+        if segmentation_failure is not None:
+            blockers.append(str(segmentation_failure["message"]))
+        components: dict[str, Any] = {
+            "grip": {"component_status": "not_created"},
+            "action": {"component_status": "not_created"},
+            "end_motion": {"component_status": "not_created"},
+        }
+        if (
+            segmentation is not None
+            and semantics is not None
+            and not semantics.ambiguity
+        ):
+            components = self._rgbd_component_candidates(
+                dataset=dataset,
+                segmentation=segmentation,
+                segmentation_report=segmentation_report,
+                semantics=semantics,
+                catalog=catalog,
+            )
+            blockers.extend(
+                [
+                    "Grip evidence lacks an object-relative 6D execution pose",
+                    "Action and EndMotion lack approved anchor-relative SkillGraphs",
+                    "an active Action-to-End mapping has not been created",
+                ]
+            )
+
+        if segmentation_status == "configuration_failure":
+            result_status = "configuration_failure"
+        elif segmentation_status != "succeeded" or semantic_status != "resolved":
+            result_status = "structural_failure"
+        else:
+            result_status = "candidate"
+        segmentation_summary: dict[str, Any] = {
+            "status": segmentation_status,
+            "report_uri": segmentation_report.uri,
+            "report_checksum_sha256": segmentation_report.checksum_sha256,
+            "failure": segmentation_failure,
+        }
+        if segmentation is not None:
+            segmentation_summary.update(
+                {
+                    "grip": segmentation.segmentation.grip.model_dump(mode="json"),
+                    "action": segmentation.segmentation.action.model_dump(mode="json"),
+                    "end_motion": segmentation.segmentation.end_motion.model_dump(
+                        mode="json"
+                    ),
+                    "warnings": [
+                        item.model_dump(mode="json")
+                        for item in segmentation.segmentation.warnings
+                    ],
+                }
+            )
+        return {
+            "skill_id": None,
+            "status": result_status,
+            "active": False,
+            "executable": False,
+            "hardware_compatible": False,
+            "source_demo": self._portable_artifact_reference(source),
+            "dataset": {
+                "recording_id": dataset.manifest.recording_id,
+                "frame_count": dataset.manifest.frame_count,
+                "manifest_checksum_sha256": (
+                    dataset.manifest.manifest_checksum_sha256
+                ),
+                "integrity_verified": True,
+            },
+            "segmentation": segmentation_summary,
+            "segmentation_report_uri": segmentation_report.uri,
+            "segmentation_report_checksum_sha256": (
+                segmentation_report.checksum_sha256
+            ),
+            "semantic_classification": {
+                "status": semantic_status,
+                "source": semantic_source,
+                "result": (
+                    semantics.model_dump(mode="json") if semantics is not None else None
+                ),
+                "trace": semantic_trace,
+            },
+            "catalog": catalog,
+            "selected_components": components,
+            "task_flow_manifest": None,
+            "fitted_operations": [],
+            "promotion_warnings": list(dict.fromkeys(blockers)),
+            "blockers": list(dict.fromkeys(blockers)),
+        }
+
     def search_skills(self, request: dict[str, Any]) -> dict[str, Any]:
         query_text = str(request["query"])
         limit = int(request.get("limit", 5))
@@ -2866,7 +3413,7 @@ class MVPApplication:
                     .order_by(SkillVersionRecord.created_at.desc())
                 ).tuples()
             )
-        return {
+        response: dict[str, Any] = {
             "skills": [
                 {
                     **self._version_summary(version, include_graph=True),
@@ -2878,6 +3425,446 @@ class MVPApplication:
                 }
                 for version, skill in rows
             ]
+        }
+        hierarchy = self.list_task_flow_hierarchy()
+        if hierarchy["objects"]:
+            response["task_flow_catalog"] = hierarchy
+        return response
+
+    @staticmethod
+    def _catalog_entry_summary(entry: SemanticCatalogRecord) -> dict[str, Any]:
+        return {
+            "id": entry.id,
+            "kind": entry.kind,
+            "canonical_id": entry.canonical_id,
+            "display_name": entry.display_name,
+            "aliases": list(entry.aliases_json),
+            "status": entry.status,
+            "metadata": dict(entry.metadata_json),
+        }
+
+    def _catalog_entry(self, kind: str, identifier: str) -> SemanticCatalogRecord:
+        entry = self.repository.get_catalog_entry(
+            kind=kind, identifier=identifier, active_only=False
+        )
+        if entry is None:
+            raise KeyError(f"unknown {kind} catalog entry {identifier!r}")
+        return entry
+
+    def _create_catalog_entry(
+        self,
+        *,
+        kind: str,
+        canonical_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = dict(request.get("metadata", {}))
+        if kind in {"action", "end_motion"}:
+            metadata["required_roles"] = list(request.get("required_roles", []))
+            metadata["input_contract"] = dict(request.get("input_contract", {}))
+            metadata["output_contract"] = dict(request.get("output_contract", {}))
+            metadata["anchor_policy"] = dict(request.get("anchor_policy", {}))
+        entry = self.repository.create_catalog_entry(
+            kind=kind,
+            canonical_id=canonical_id,
+            display_name=str(request["display_name"]),
+            aliases=list(request.get("aliases", [])),
+            metadata=metadata,
+        )
+        return self._catalog_entry_summary(entry)
+
+    def create_catalog_object(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._create_catalog_entry(
+            kind="object",
+            canonical_id=str(request["object_class_id"]),
+            request=request,
+        )
+
+    def create_catalog_action(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._create_catalog_entry(
+            kind="action",
+            canonical_id=str(request["action_id"]),
+            request=request,
+        )
+
+    def create_catalog_end_motion(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._create_catalog_entry(
+            kind="end_motion",
+            canonical_id=str(request["end_motion_id"]),
+            request=request,
+        )
+
+    def _list_catalog_entries(
+        self, *, kind: str, status: str | None, response_key: str
+    ) -> dict[str, Any]:
+        return {
+            response_key: [
+                self._catalog_entry_summary(entry)
+                for entry in self.repository.list_catalog_entries(
+                    kind=kind, status=status
+                )
+            ]
+        }
+
+    def list_catalog_objects(self, *, status: str | None = None) -> dict[str, Any]:
+        return self._list_catalog_entries(
+            kind="object", status=status, response_key="objects"
+        )
+
+    def list_catalog_actions(self, *, status: str | None = None) -> dict[str, Any]:
+        return self._list_catalog_entries(
+            kind="action", status=status, response_key="actions"
+        )
+
+    def list_catalog_end_motions(
+        self, *, status: str | None = None
+    ) -> dict[str, Any]:
+        return self._list_catalog_entries(
+            kind="end_motion", status=status, response_key="end_motions"
+        )
+
+    def get_catalog_object(self, object_class_id: str) -> dict[str, Any]:
+        summary = self._catalog_entry_summary(
+            self._catalog_entry("object", object_class_id)
+        )
+        summary["grip_profile_versions"] = self.list_grip_profiles(
+            object_class_id
+        )["grip_profile_versions"]
+        return summary
+
+    def get_catalog_action(self, action_id: str) -> dict[str, Any]:
+        summary = self._catalog_entry_summary(self._catalog_entry("action", action_id))
+        summary["definitions"] = [
+            self._stage_definition_summary(stage)
+            for stage in self.repository.list_stage_definitions(
+                kind="action", canonical_id=summary["canonical_id"]
+            )
+        ]
+        mapping = self.repository.get_action_end_mapping(
+            action_id=str(summary["canonical_id"]), active_only=False
+        )
+        summary["active_or_latest_end_mapping"] = (
+            self._action_end_mapping_summary(mapping) if mapping is not None else None
+        )
+        return summary
+
+    def get_catalog_end_motion(self, end_motion_id: str) -> dict[str, Any]:
+        summary = self._catalog_entry_summary(
+            self._catalog_entry("end_motion", end_motion_id)
+        )
+        summary["definitions"] = [
+            self._stage_definition_summary(stage)
+            for stage in self.repository.list_stage_definitions(
+                kind="end_motion", canonical_id=summary["canonical_id"]
+            )
+        ]
+        return summary
+
+    def _update_catalog_entry(
+        self, kind: str, identifier: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        entry = self._catalog_entry(kind, identifier)
+        updated = self.repository.update_catalog_entry(entry.id, **request)
+        return self._catalog_entry_summary(updated)
+
+    def update_catalog_object(
+        self, object_class_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._update_catalog_entry("object", object_class_id, request)
+
+    def update_catalog_action(
+        self, action_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._update_catalog_entry("action", action_id, request)
+
+    def _set_catalog_entry_status(
+        self, kind: str, identifier: str, status: str
+    ) -> dict[str, Any]:
+        entry = self._catalog_entry(kind, identifier)
+        updated = self.repository.set_catalog_entry_status(entry.id, status=status)
+        return self._catalog_entry_summary(updated)
+
+    def set_catalog_object_status(
+        self, object_class_id: str, status: str
+    ) -> dict[str, Any]:
+        return self._set_catalog_entry_status("object", object_class_id, status)
+
+    def set_catalog_action_status(
+        self, action_id: str, status: str
+    ) -> dict[str, Any]:
+        return self._set_catalog_entry_status("action", action_id, status)
+
+    def set_catalog_end_motion_status(
+        self, end_motion_id: str, status: str
+    ) -> dict[str, Any]:
+        return self._set_catalog_entry_status("end_motion", end_motion_id, status)
+
+    @staticmethod
+    def _grip_profile_version_summary(
+        version: GripProfileVersionRecord,
+    ) -> dict[str, Any]:
+        return {
+            "id": version.id,
+            "version": version.semantic_version,
+            "status": version.status,
+            "validation_status": version.validation_status,
+            "hardware_compatible": version.hardware_compatible,
+            "auto_activation_allowed": version.auto_activation_allowed,
+            "object_frame_policy": version.object_frame_policy,
+            "object_frame_revision": version.object_frame_revision,
+            "gripper_calibration_profile_id": (
+                version.gripper_calibration_profile_id
+            ),
+            "artifact_uri": version.artifact_uri,
+            "artifact_checksum_sha256": version.artifact_checksum_sha256,
+            "metadata": dict(version.metadata_json),
+        }
+
+    def list_grip_profiles(self, object_class_id: str) -> dict[str, Any]:
+        entry = self._catalog_entry("object", object_class_id)
+        return {
+            "object_class_id": entry.canonical_id,
+            "grip_profile_versions": [
+                self._grip_profile_version_summary(version)
+                for version in self.repository.list_grip_profile_versions(
+                    object_class_id=entry.canonical_id
+                )
+            ],
+        }
+
+    def activate_grip_profile_version(self, version_id: str) -> dict[str, Any]:
+        return self._grip_profile_version_summary(
+            self.repository.activate_grip_profile_version(
+                version_id, automatic=False
+            )
+        )
+
+    @staticmethod
+    def _stage_definition_summary(stage: StageDefinitionRecord) -> dict[str, Any]:
+        return {
+            "id": stage.id,
+            "kind": stage.stage_type,
+            "version": stage.semantic_version,
+            "skill_version_id": stage.skill_version_id,
+            "status": stage.status,
+            "validation_status": stage.validation_status,
+            "hardware_compatible": stage.hardware_compatible,
+            "graph_checksum_sha256": stage.graph_checksum_sha256,
+            "required_roles": list(stage.required_roles_json),
+            "input_contract": dict(stage.input_contract_json),
+            "output_contract": dict(stage.output_contract_json),
+            "anchor_policy": dict(stage.anchor_policy_json),
+            "metadata": dict(stage.metadata_json),
+        }
+
+    def _create_stage_definition(
+        self, *, kind: str, canonical_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        entry = self._catalog_entry(kind, canonical_id)
+        skill_version = self._find_version(
+            str(request["skill_id"]), str(request["skill_version"])
+        )
+        linked_graph = SkillGraph.model_validate(skill_version.graph_json)
+        if linked_graph.skill_id != request["skill_id"]:
+            raise ValueError("stage SkillGraph identity does not match the request")
+        if linked_graph.version != request["component_version"]:
+            raise ValueError(
+                "component_version must equal the exact linked SkillGraph version"
+            )
+        passed = skill_version.validation_status == "passed"
+        stage = self.repository.register_stage_definition(
+            kind=kind,
+            canonical_id=entry.canonical_id,
+            skill_version_id=skill_version.id,
+            semantic_version=str(request["component_version"]),
+            status="validated" if passed else "candidate",
+            validation_status="passed" if passed else "pending",
+            required_roles=list(request.get("required_roles", [])),
+            input_contract=dict(request.get("input_contract", {})),
+            output_contract=dict(request.get("output_contract", {})),
+            anchor_policy=dict(request.get("anchor_policy", {})),
+            metadata=dict(request.get("metadata", {})),
+        )
+        return self._stage_definition_summary(stage)
+
+    def create_action_definition(
+        self, action_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._create_stage_definition(
+            kind="action", canonical_id=action_id, request=request
+        )
+
+    def create_end_motion_definition(
+        self, end_motion_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._create_stage_definition(
+            kind="end_motion", canonical_id=end_motion_id, request=request
+        )
+
+    def activate_stage_definition(self, definition_id: str) -> dict[str, Any]:
+        return self._stage_definition_summary(
+            self.repository.activate_stage_definition(definition_id)
+        )
+
+    def _action_end_mapping_summary(
+        self, mapping: ActionEndMappingRecord
+    ) -> dict[str, Any]:
+        with self.database.session() as session:
+            action_stage = session.get(
+                StageDefinitionRecord, mapping.action_stage_definition_id
+            )
+            end_stage = session.get(
+                StageDefinitionRecord, mapping.end_motion_stage_definition_id
+            )
+            if action_stage is None or end_stage is None:
+                raise ValueError("action/end mapping references a missing stage")
+            action_entry = session.get(
+                SemanticCatalogRecord, action_stage.catalog_entry_id
+            )
+            end_entry = session.get(SemanticCatalogRecord, end_stage.catalog_entry_id)
+            if action_entry is None or end_entry is None:
+                raise ValueError("action/end mapping references a missing catalog entry")
+            action_id = action_entry.canonical_id
+            end_motion_id = end_entry.canonical_id
+            action_definition = self._stage_definition_summary(action_stage)
+            end_motion_definition = self._stage_definition_summary(end_stage)
+        return {
+            "id": mapping.id,
+            "action_id": action_id,
+            "action_definition_id": mapping.action_stage_definition_id,
+            "end_motion_id": end_motion_id,
+            "end_motion_definition_id": mapping.end_motion_stage_definition_id,
+            "revision": mapping.revision,
+            "status": mapping.status,
+            "mapping_checksum_sha256": mapping.mapping_checksum_sha256,
+            "action_definition": action_definition,
+            "end_motion_definition": end_motion_definition,
+            "metadata": dict(mapping.metadata_json),
+        }
+
+    def map_action_end_motion(
+        self, action_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        mapping = self.repository.map_action_to_end_motion(
+            action_id=self._catalog_entry("action", action_id).canonical_id,
+            end_motion_id=str(request["end_motion_id"]),
+            revision=request.get("revision"),
+            activate=True,
+        )
+        return self._action_end_mapping_summary(mapping)
+
+    def import_grip_point_candidates(self, request: dict[str, Any]) -> dict[str, Any]:
+        raw_path = Path(str(request.get("artifact_path") or ""))
+        path = (
+            raw_path.resolve()
+            if raw_path.is_absolute()
+            else (self.settings.repo_root / raw_path).resolve()
+        )
+        allowed_root = (self.settings.repo_root / "data/test/grip_point").resolve()
+        if path.suffix != ".json" or not path.is_relative_to(allowed_root):
+            raise ValueError(
+                "grip-point imports are restricted to JSON under data/test/grip_point"
+            )
+        imported = GripPointResultImporter(self.repository, self.store).import_file(path)
+        return {
+            "source_checksum_sha256": imported.source_checksum_sha256,
+            "hardware_compatible": False,
+            "auto_activation_allowed": False,
+            "profiles": [
+                {
+                    "object_class_id": item.object_class_id,
+                    "catalog_entry_id": item.catalog_entry_id,
+                    "grip_profile_id": item.grip_profile_id,
+                    "grip_profile_version_id": item.grip_profile_version_id,
+                    "artifact_uri": item.artifact_uri,
+                    "artifact_checksum_sha256": (
+                        item.artifact_checksum_sha256
+                    ),
+                }
+                for item in imported.profiles
+            ],
+        }
+
+    def list_task_flow_hierarchy(self) -> dict[str, Any]:
+        """List the semantic cross-product; composition decides actual compatibility."""
+
+        objects = self.repository.list_catalog_entries(kind="object")
+        actions = self.repository.list_catalog_entries(kind="action")
+        action_components: dict[str, tuple[StageDefinitionRecord | None, Any]] = {}
+        for action in actions:
+            action_components[action.canonical_id] = (
+                self.repository.active_stage_definition(
+                    kind="action", canonical_id=action.canonical_id
+                ),
+                self.repository.get_action_end_mapping(
+                    action_id=action.canonical_id, active_only=True
+                ),
+            )
+        object_items: list[dict[str, Any]] = []
+        for object_entry in objects:
+            active_grip = self.repository.active_grip_profile_version(
+                object_class_id=object_entry.canonical_id
+            )
+            object_items.append(
+                {
+                    **self._catalog_entry_summary(object_entry),
+                    "active_grip_profile": (
+                        self._grip_profile_version_summary(active_grip)
+                        if active_grip is not None
+                        else None
+                    ),
+                    "actions": [
+                        self._task_flow_hierarchy_action(
+                            object_entry=object_entry,
+                            action_entry=action_entry,
+                            active_grip=active_grip,
+                            action_stage=action_components[action_entry.canonical_id][0],
+                            mapping=action_components[action_entry.canonical_id][1],
+                        )
+                        for action_entry in actions
+                    ],
+                }
+            )
+        return {
+            "selection_policy": "active_grip_x_active_action_then_compose",
+            "has_static_object_action_allowlist": False,
+            "objects": object_items,
+        }
+
+    def _task_flow_hierarchy_action(
+        self,
+        *,
+        object_entry: SemanticCatalogRecord,
+        action_entry: SemanticCatalogRecord,
+        active_grip: GripProfileVersionRecord | None,
+        action_stage: StageDefinitionRecord | None,
+        mapping: ActionEndMappingRecord | None,
+    ) -> dict[str, Any]:
+        blockers: list[str] = []
+        if object_entry.status != "active":
+            blockers.append("object catalog entry is not active")
+        if active_grip is None:
+            blockers.append("active, passed GripProfile is missing")
+        if action_entry.status != "active":
+            blockers.append("action catalog entry is not active")
+        if action_stage is None:
+            blockers.append("active, passed ActionDefinition is missing")
+        if mapping is None:
+            blockers.append("active ActionEndMotionMapping is missing")
+        return {
+            **self._catalog_entry_summary(action_entry),
+            "active_action_definition": (
+                self._stage_definition_summary(action_stage)
+                if action_stage is not None
+                else None
+            ),
+            "mapped_end_motion": (
+                self._action_end_mapping_summary(mapping)
+                if mapping is not None
+                else None
+            ),
+            "executable": not blockers,
+            "blockers": blockers,
         }
 
     def get_skill_editor_catalog(self) -> dict[str, Any]:
@@ -3714,6 +4701,25 @@ class MVPApplication:
 
     def resolve_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         scene = self._scene(str(request["scene_id"])) if request.get("scene_id") else None
+        active_objects = self.repository.list_catalog_entries(
+            kind="object", status="active"
+        )
+        active_actions = self.repository.list_catalog_entries(
+            kind="action", status="active"
+        )
+        if active_objects or active_actions:
+            if not active_objects or not active_actions:
+                raise ValueError(
+                    "task-flow runtime requires both active object and action catalogs"
+                )
+            if scene is None:
+                raise ValueError("task-flow runtime resolution requires a current scene_id")
+            return self._resolve_task_flow_intent(
+                text=str(request["text"]),
+                scene=scene,
+                active_objects=active_objects,
+                active_actions=active_actions,
+            )
         entity_ids: list[str] = []
         if scene is not None:
             entity_ids = [
@@ -3744,7 +4750,250 @@ class MVPApplication:
             "intent": intent.model_dump(mode="json"),
             "trace": metadata.model_dump(mode="json"),
             "skill_candidates": matches,
+            "resolver_mode": "legacy_monolithic_compatibility",
         }
+
+    @staticmethod
+    def _task_scene_entities(
+        scene: SceneSnapshot,
+    ) -> dict[str, dict[str, str]]:
+        entities: dict[str, dict[str, str]] = {}
+        for object_item in scene.objects:
+            entities[object_item.instance_id] = {
+                "kind": "object",
+                "class_or_role": object_item.class_name,
+            }
+        for tool_item in scene.tools:
+            entities[tool_item.instance_id] = {
+                "kind": "tool",
+                "class_or_role": tool_item.tool_class,
+            }
+        for surface_item in scene.surfaces:
+            entities[surface_item.instance_id] = {
+                "kind": "surface",
+                "class_or_role": surface_item.role.value,
+            }
+        for region_item in scene.workspace_regions:
+            entities[region_item.region_id] = {
+                "kind": "workspace_region",
+                "class_or_role": region_item.role.value,
+            }
+        return entities
+
+    def _resolve_task_flow_intent(
+        self,
+        *,
+        text: str,
+        scene: SceneSnapshot,
+        active_objects: list[SemanticCatalogRecord],
+        active_actions: list[SemanticCatalogRecord],
+    ) -> dict[str, Any]:
+        object_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in active_objects
+        }
+        action_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in active_actions
+        }
+        stages = {
+            item.canonical_id: self.repository.active_stage_definition(
+                kind="action", canonical_id=item.canonical_id
+            )
+            for item in active_actions
+        }
+        if any(stage is None for stage in stages.values()):
+            raise ValueError("active action catalog contains no active ActionDefinition")
+        required_roles = {
+            action_id: tuple(stage.required_roles_json)
+            for action_id, stage in stages.items()
+            if stage is not None
+        }
+        intent, metadata = TaskIntentResolver(self.settings).resolve(
+            text,
+            object_catalog=object_catalog,
+            action_catalog=action_catalog,
+            scene_entities=self._task_scene_entities(scene),
+            required_roles=required_roles,
+        )
+        grip = self.repository.active_grip_profile_version(
+            object_class_id=intent.object_class_id
+        )
+        action_stage = stages[intent.action_id]
+        mapping = self.repository.get_action_end_mapping(
+            action_id=intent.action_id, active_only=True
+        )
+        blockers: list[str] = []
+        if grip is None:
+            blockers.append("active, passed GripProfile is missing")
+        if action_stage is None:
+            blockers.append("active, passed ActionDefinition is missing")
+        if mapping is None:
+            blockers.append("active ActionEndMotionMapping is missing")
+        if intent.ambiguity:
+            blockers.extend(intent.unresolved_ambiguities or ["task intent is ambiguous"])
+        selected = {
+            "grip": (
+                self._grip_profile_version_summary(grip)
+                if grip is not None
+                else None
+            ),
+            "action": (
+                self._stage_definition_summary(action_stage)
+                if action_stage is not None
+                else None
+            ),
+            "end_motion_mapping": (
+                self._action_end_mapping_summary(mapping)
+                if mapping is not None
+                else None
+            ),
+        }
+        task_flow_manifest: dict[str, Any] | None = None
+        results: list[dict[str, Any]] = []
+        if not blockers:
+            try:
+                materialized = TaskFlowMaterializer(
+                    self.repository, self.store
+                ).materialize(
+                    object_class_id=intent.object_class_id,
+                    action_id=intent.action_id,
+                    resolved_role_bindings=intent.role_bindings,
+                    require_hardware_compatible=False,
+                )
+                row = self._persist_graph(
+                    materialized.graph,
+                    status="active",
+                    validation_status="passed",
+                    variant="task_flow_composite",
+                    index_for_legacy_retrieval=False,
+                )
+                suggested_bindings = dict(intent.role_bindings)
+                if intent.object_instance_id is not None:
+                    suggested_bindings["$object"] = intent.object_instance_id
+                preflight = self._preflight_materialized_flow(
+                    row=row,
+                    graph=materialized.graph,
+                    scene=scene,
+                    binding_hints=suggested_bindings,
+                )
+                preflight_blockers = [
+                    f"{item['name']}: {item.get('detail') or 'failed'}"
+                    for item in preflight["checks"]
+                    if not item["passed"]
+                ]
+                blockers.extend(preflight_blockers)
+                storage_plan = self.repository.record_task_flow_plan(
+                    grip_profile_version_id=(
+                        materialized.selection.grip_profile_version_id
+                    ),
+                    action_end_mapping_id=(
+                        materialized.selection.action_end_mapping_record_id
+                    ),
+                    composer_version=materialized.manifest.composer_version,
+                    composite_skill_version_id=row.id,
+                    validation_status=(
+                        "passed" if preflight["passed"] else "failed"
+                    ),
+                    hardware_compatible=False,
+                    metadata={
+                        "composer_plan_checksum_sha256": (
+                            materialized.manifest.plan_checksum_sha256
+                        )
+                    },
+                )
+                task_flow_manifest = {
+                    **materialized.manifest.model_dump(mode="json"),
+                    "storage_plan_id": storage_plan.id,
+                    "storage_plan_checksum_sha256": (
+                        storage_plan.plan_checksum_sha256
+                    ),
+                    "selection": materialized.selection.model_dump(mode="json"),
+                    "preflight": preflight,
+                }
+                results.append(
+                    {
+                        "skill_id": materialized.graph.skill_id,
+                        "version": materialized.graph.version,
+                        "name": materialized.graph.name,
+                        "score": 1.0,
+                        "factors": {
+                            "selection": "exact active Grip + Action + mapped End",
+                            "embedding_used": False,
+                        },
+                        "bindings": suggested_bindings,
+                        "executable": preflight["passed"],
+                        "blockers": preflight_blockers,
+                    }
+                )
+            except (
+                RobotSkillError,
+                RuntimeErrorBase,
+                ValueError,
+            ) as exc:
+                blockers.append(f"composition rejected: {exc}")
+        return {
+            "intent": intent.model_dump(mode="json"),
+            "trace": metadata.model_dump(mode="json"),
+            "resolver_mode": "grip_action_end_hierarchical",
+            "selected_components": selected,
+            "task_flow_manifest": task_flow_manifest,
+            "skill_candidates": {
+                "mode": "hierarchical_component_selection",
+                "results": results,
+                "blockers": blockers,
+            },
+        }
+
+    def _preflight_materialized_flow(
+        self,
+        *,
+        row: SkillVersionRecord,
+        graph: SkillGraph,
+        scene: SceneSnapshot,
+        binding_hints: dict[str, str],
+    ) -> dict[str, Any]:
+        requirements = [
+            requirement.model_copy(
+                update={"instance_id": binding_hints.get(requirement.variable)}
+            )
+            if requirement.variable in binding_hints
+            else requirement
+            for requirement in graph.binding_requirements()
+        ]
+        bindings = EntityBinder().bind_entities(
+            scene,
+            requirements,
+            maximum_scene_age_ms=self.settings.scene_freshness_ms,
+        )
+        robot = MockRobotAdapter()
+        robot.connect()
+        report = PreflightValidator().validate(
+            scene=scene,
+            skill=graph,
+            bindings=bindings,
+            robot=robot,
+            execution_mode=ExecutionMode.MOCK,
+            skill_validation_status=row.validation_status,
+            expected_calibration_id=scene.calibration_id,
+            expected_tool_class=(
+                graph.required_tools[0] if graph.required_tools else None
+            ),
+            skill_uses_force=bool(graph.force_profiles),
+            motion_profiles=self._motion_profiles(),
+            force_profiles=self._force_profiles(),
+            verification_profiles=self._verification_profiles(),
+            safety_policy=self._safety_policy(),
+            robot_backend="mock",
+            enable_real_robot=False,
+            dry_run=True,
+            raise_on_failure=False,
+        )
+        return report.as_dict()
 
     def _scene_with_graph_task_plane(
         self, scene: SceneSnapshot, graph: SkillGraph
@@ -3861,6 +5110,7 @@ class MVPApplication:
             skill_uses_force=bool(graph.force_profiles),
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             safety_policy=safety_policy,
             robot_backend=self.settings.robot_backend,
             enable_real_robot=self.settings.enable_real_robot,
@@ -3870,11 +5120,26 @@ class MVPApplication:
 
     def execute_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         requested_mode = str(request.get("mode", "mock"))
+        mock_override = request.get("mock_override")
+        if mock_override is not None:
+            if requested_mode != "mock":
+                raise ValueError("validation override is available only in mode=mock")
+            if (
+                mock_override.get("override_all_overridable") is not True
+                or mock_override.get("acknowledge_mock_only") is not True
+                or not str(mock_override.get("operator_id") or "").strip()
+                or not str(mock_override.get("reason") or "").strip()
+            ):
+                raise ValueError(
+                    "Mock override requires operator, reason, and explicit acknowledgements"
+                )
         if requested_mode == "hardware":
             if not self.settings.hardware_enabled:
                 raise ValueError("hardware execution gates are not all enabled")
             raise ValueError("Doosan hardware adapter is not configured or physically validated")
-        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(request)
+        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(
+            request, allow_mock_candidate=mock_override is not None
+        )
         safety_policy = self._safety_policy()
         report = PreflightValidator().validate(
             scene=scene,
@@ -3882,11 +5147,14 @@ class MVPApplication:
             bindings=bindings,
             robot=robot,
             execution_mode=ExecutionMode(requested_mode),
-            skill_validation_status=row.validation_status,
+            skill_validation_status=(
+                "passed" if mock_override is not None else row.validation_status
+            ),
             expected_tool_class=graph.required_tools[0] if graph.required_tools else None,
             skill_uses_force=bool(graph.force_profiles),
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             safety_policy=safety_policy,
             robot_backend="mock",
             enable_real_robot=False,
@@ -3896,11 +5164,35 @@ class MVPApplication:
         gripper = MockGripperAdapter()
         gripper.connect()
         event_sink = InMemoryEventSink()
+        if mock_override is not None:
+            bypassed_check_ids = [
+                check_id
+                for check_id, bypassed
+                in (
+                    ("component_lifecycle_active", row.status != "active"),
+                    ("skill_validation", row.validation_status != "passed"),
+                )
+                if bypassed
+            ]
+            event_sink.record(
+                "mock_validation_override",
+                {
+                    "operator_id": str(mock_override["operator_id"]),
+                    "reason": str(mock_override["reason"]),
+                    "override_all_overridable": True,
+                    "acknowledge_mock_only": True,
+                    "bypassed_check_ids": bypassed_check_ids,
+                    "component_activation_changed": False,
+                    "hardware_compatibility_changed": False,
+                },
+                severity="warning",
+            )
         context = RuntimeContext(
             scene=scene,
             bindings=bindings,
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             execution_mode=ExecutionMode(requested_mode),
             skill=graph,
             safety_policy=safety_policy,
@@ -4046,7 +5338,10 @@ class MVPApplication:
             }
 
     def _runtime_parts(
-        self, request: dict[str, Any]
+        self,
+        request: dict[str, Any],
+        *,
+        allow_mock_candidate: bool = False,
     ) -> tuple[
         SkillVersionRecord,
         SkillGraph,
@@ -4058,9 +5353,20 @@ class MVPApplication:
     ]:
         row = self._find_version(str(request["skill_id"]), request.get("version"))
         if row.status != "active" or row.validation_status != "passed":
-            raise ValueError("runtime accepts only active, validated skill versions")
+            if not allow_mock_candidate:
+                raise ValueError("runtime accepts only active, validated skill versions")
+            if row.status not in {"candidate", "validated"}:
+                raise ValueError(
+                    "Mock override cannot run rejected or retired skill versions"
+                )
+            if row.validation_status == "failed":
+                raise ValueError(
+                    "Mock override cannot bypass a failed deterministic validation"
+                )
         verify_skill_checksum(row.graph_json, row.graph_checksum_sha256)
         graph = SkillGraph.model_validate(row.graph_json)
+        SkillGraphValidator().validate(graph)
+        SkillCompiler().compile(graph)
         scene = self._scene_with_graph_task_plane(
             self._scene(str(request["scene_id"])), graph
         )
@@ -4112,6 +5418,7 @@ class MVPApplication:
             skill_uses_force=bool(graph.force_profiles),
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             safety_policy=safety_policy,
             robot_backend="mock",
             enable_real_robot=False,
@@ -4123,6 +5430,7 @@ class MVPApplication:
             bindings=bindings,
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             execution_mode=ExecutionMode.MOCK,
             skill=graph,
             safety_policy=safety_policy,
@@ -4212,6 +5520,12 @@ class MVPApplication:
             self.settings.repo_root / "configs/force_profiles/default.json"
         )
 
+    def _verification_profiles(self) -> dict[str, Any]:
+        return load_grasp_verification_profiles(
+            self.settings.repo_root
+            / "configs/grasp_verification_profiles/default.json"
+        )
+
     def _safety_policy(self) -> SafetyPolicy:
         policies = load_safety_policies(
             self.settings.repo_root / "configs/safety_policies/default.json"
@@ -4226,6 +5540,7 @@ class MVPApplication:
         validation_status: str,
         variant: str,
         parent_version_id: str | None = None,
+        index_for_legacy_retrieval: bool = True,
     ) -> SkillVersionRecord:
         graph_report = SkillGraphValidator().validate(graph)
         compiled = SkillCompiler().compile(graph)
@@ -4273,7 +5588,12 @@ class MVPApplication:
             raise ValueError("skill manifest checksum verification failed")
         existing = self._find_version_optional(graph.skill_id, graph.version)
         if existing is not None:
-            self._ensure_skill_embedding(existing, graph)
+            if existing.graph_checksum_sha256 != graph_artifact.checksum_sha256:
+                raise ValueError(
+                    "existing skill identity/version has a different graph checksum"
+                )
+            if index_for_legacy_retrieval:
+                self._ensure_skill_embedding(existing, graph)
             return existing
         registered = self.repository.register_skill_version(
             name=graph.name,
@@ -4289,7 +5609,8 @@ class MVPApplication:
             validation_status=validation_status,
             hardware_compatible=False,
         )
-        self._ensure_skill_embedding(registered, graph)
+        if index_for_legacy_retrieval:
+            self._ensure_skill_embedding(registered, graph)
         return registered
 
     def _ensure_skill_embedding(
@@ -4612,6 +5933,7 @@ class MVPApplication:
             candidate = repo_candidate if repo_candidate.exists() else artifact_candidate
         allowed_roots = (
             (self.settings.repo_root / "tests/fixtures").resolve(),
+            (self.settings.repo_root / "data/demonstrations").resolve(),
             (self.settings.artifact_root / "demonstrations").resolve(),
         )
         if not any(candidate == root or root in candidate.parents for root in allowed_roots):

@@ -64,6 +64,7 @@ class RuntimeOrchestrator:
         robot: Any,
         motion_profiles: Mapping[str, Any],
         force_profiles: Mapping[str, Any],
+        verification_profiles: Mapping[str, Any] | None = None,
         safety_policy: Any | None = None,
         execution_mode: ExecutionMode | str = ExecutionMode.DRY_RUN,
         enable_hardware_execution: bool = False,
@@ -88,6 +89,7 @@ class RuntimeOrchestrator:
         self.gripper = gripper
         self.motion_profiles = motion_profiles
         self.force_profiles = force_profiles
+        self.verification_profiles = verification_profiles or {}
         self.safety_policy = safety_policy
         self.execution_mode = (
             execution_mode
@@ -348,6 +350,7 @@ class RuntimeOrchestrator:
             skill_uses_force=skill_uses_force,
             motion_profiles=self.motion_profiles,
             force_profiles=self.force_profiles,
+            verification_profiles=self.verification_profiles,
             safety_policy=self.safety_policy,
             robot_backend=self.robot_backend,
             enable_real_robot=self.enable_real_robot,
@@ -389,6 +392,7 @@ class RuntimeOrchestrator:
             bindings=bindings,
             motion_profiles=self.motion_profiles,
             force_profiles=self.force_profiles,
+            verification_profiles=self.verification_profiles,
             execution_mode=self.execution_mode,
             skill=skill,
             preflight_report=self.last_preflight,

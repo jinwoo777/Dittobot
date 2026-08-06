@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from robot_skill_system.skills.models import BindingSpec, SkillType
+
+CanonicalCatalogID = Annotated[
+    str, Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+]
+SemanticAlias = Annotated[str, Field(min_length=1, max_length=200)]
+RequiredRole = Annotated[
+    str, Field(pattern=r"^\$[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+]
 
 
 class APIModel(BaseModel):
@@ -77,6 +85,23 @@ class SkillInduceRequest(APIModel):
     demo_path: str
     name: str = "wipe_surface"
     variant: str = "default"
+    transcript_text: str | None = Field(default=None, min_length=1, max_length=2000)
+    transcript_artifact_uri: str | None = Field(default=None, min_length=1, max_length=500)
+    transcript_artifact_checksum_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+
+    @model_validator(mode="after")
+    def validate_training_semantic_source(self) -> SkillInduceRequest:
+        artifact_pair = (
+            self.transcript_artifact_uri,
+            self.transcript_artifact_checksum_sha256,
+        )
+        if (artifact_pair[0] is None) is not (artifact_pair[1] is None):
+            raise ValueError("transcript artifact URI and checksum must be provided together")
+        if self.transcript_text is not None and artifact_pair[0] is not None:
+            raise ValueError("provide exactly one training transcript source")
+        return self
 
 
 class RecordingSkillDraftRequest(APIModel):
@@ -258,9 +283,19 @@ class RuntimePreflightRequest(APIModel):
     mode: Literal["mock", "dry_run", "simulation", "hardware"] = "dry_run"
 
 
+class MockValidationOverrideRequest(APIModel):
+    """Per-run acknowledgement for overridable Mock-only quality gates."""
+
+    override_all_overridable: Literal[True]
+    operator_id: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=500)
+    acknowledge_mock_only: Literal[True]
+
+
 class RuntimeExecuteRequest(RuntimePreflightRequest):
     text: str | None = None
     run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+    mock_override: MockValidationOverrideRequest | None = None
 
 
 class RuntimeAbortRequest(APIModel):
@@ -269,3 +304,67 @@ class RuntimeAbortRequest(APIModel):
 
 
 JSONDict = dict[str, Any]
+
+
+class ObjectCatalogCreateRequest(APIModel):
+    object_class_id: CanonicalCatalogID
+    display_name: str = Field(min_length=1, max_length=200)
+    aliases: list[SemanticAlias] = Field(default_factory=list, max_length=128)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionCatalogCreateRequest(APIModel):
+    action_id: CanonicalCatalogID
+    display_name: str = Field(min_length=1, max_length=200)
+    aliases: list[SemanticAlias] = Field(default_factory=list, max_length=128)
+    required_roles: list[RequiredRole] = Field(default_factory=list, max_length=32)
+    input_contract: dict[str, Any] = Field(default_factory=dict)
+    output_contract: dict[str, Any] = Field(default_factory=dict)
+    anchor_policy: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class EndMotionCatalogCreateRequest(APIModel):
+    end_motion_id: CanonicalCatalogID
+    display_name: str = Field(min_length=1, max_length=200)
+    aliases: list[SemanticAlias] = Field(default_factory=list, max_length=128)
+    required_roles: list[RequiredRole] = Field(default_factory=list, max_length=32)
+    input_contract: dict[str, Any] = Field(default_factory=dict)
+    output_contract: dict[str, Any] = Field(default_factory=dict)
+    anchor_policy: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CatalogEntryUpdateRequest(APIModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=200)
+    aliases: list[SemanticAlias] | None = Field(default=None, max_length=128)
+    metadata: dict[str, Any] | None = None
+
+
+class CatalogStatusRequest(APIModel):
+    status: Literal["active", "retired"]
+
+
+class StageStateContractRequest(APIModel):
+    attachment: Literal["any", "holding", "released"]
+    force_mode: Literal["any", "disabled", "enabled"]
+
+
+class StageDefinitionCreateRequest(APIModel):
+    component_version: str = Field(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+(?:-candidate)?$")
+    skill_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+    skill_version: str = Field(min_length=1, max_length=64)
+    required_roles: list[RequiredRole] = Field(default_factory=list, max_length=32)
+    input_contract: StageStateContractRequest
+    output_contract: StageStateContractRequest
+    anchor_policy: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActionEndMappingCreateRequest(APIModel):
+    end_motion_id: CanonicalCatalogID
+    revision: int | None = Field(default=None, ge=1)
+
+
+class GripPointImportRequest(APIModel):
+    artifact_path: str = "data/test/grip_point/result.json"

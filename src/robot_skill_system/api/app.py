@@ -19,6 +19,7 @@ def create_app(service: Any | None = None) -> Any:
     from robot_skill_system.api.routes import (
         calibration,
         camera,
+        catalog,
         runtime,
         scenes,
         skills,
@@ -47,6 +48,7 @@ def create_app(service: Any | None = None) -> Any:
     app.include_router(scenes.router)
     app.include_router(skills.router)
     app.include_router(runtime.router)
+    app.include_router(catalog.router)
     app.include_router(camera.router)
     app.include_router(calibration.router)
     app.include_router(task_planes.router)
