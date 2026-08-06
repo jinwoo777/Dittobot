@@ -155,6 +155,31 @@
     .geometry-teaching p { margin: 6px 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
     .geometry-teaching label { display: grid; gap: 5px; margin: 10px 0; color: var(--muted); font-size: 12px; }
     .geometry-teaching input { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .skill-block {
+      background: #fff;
+      border: 1px solid #d9d9d9;
+      border-left: 6px solid #4f8ef7;
+      border-radius: 10px;
+      padding: 12px;
+      margin-bottom: 16px;
+      cursor: pointer;
+    }
+
+    .skill-block:hover {
+      background: #f8fbff;
+    }
+
+    .skill-block-title {
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+
+    .skill-block-item {
+      color: #666;
+      font-size: 14px;
+      margin: 3px 0;
+    }
+    
     .skill-node-block {
       border: 1px solid var(--border, #d9dee7);
       border-radius: 14px;
@@ -162,14 +187,29 @@
       margin-bottom: 16px;
       background: var(--surface, #ffffff);
     }
-
     .skill-node-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 18px;
+    }
+    .skill-node-arrow{
+      font-size:18px;
+      color:#888;
+    }
+    .skill-node-summary{
+      margin:12px 0;
+      padding:10px;
+      background:#f7f9fc;
+      border-radius:8px;
     }
 
+    .skill-node-summary-item{
+      display:flex;
+      justify-content:space-between;
+      padding:4px 0;
+      font-size:13px;
+      color:#555;
+    }
     .skill-node-header > div {
       display: flex;
       align-items: center;
@@ -768,6 +808,17 @@
         padding: 14px;
       }
     }
+    .blockly-panel {
+      margin-top: 20px;
+    }
+
+    #blocklyDiv {
+      width: 100%;
+      height: 700px;
+      border: 1px solid var(--border-color, #dcdcdc);
+      border-radius: 8px;
+      overflow: hidden;
+    }
   </style>
 </head>
 <body>
@@ -829,21 +880,25 @@
       </section>
 
       <section id="page-create" class="page" hidden>
-        <header><p class="eyebrow">02 · TEACHING REVIEW</p><h1>녹화로 스킬 초안 만들기</h1><p class="subtitle">저장된 RGB-D 시퀀스를 확인하고 시간 정렬된 대표 RGB + Depth 컬러맵 쌍을 GPT에 보내 의미 기반 스킬 초안을 만듭니다. API 키와 로컬 파일 경로는 브라우저에 노출되지 않습니다.</p></header>
+        <header>
+          <p class="eyebrow">02 · TEACHING REVIEW</p>
+          <h1>녹화로 스킬 초안 만들기</h1>
+          <p class="subtitle">
+            저장된 RGB-D 시퀀스를 확인하고 시간 정렬된 대표 RGB + Depth 컬러맵 쌍을 GPT에 보내 의미 기반 스킬 초안을 만듭니다.
+            API 키와 로컬 파일 경로는 브라우저에 노출되지 않습니다.
+          </p>
+        </header>
         <section class="panel manual-skill-panel">
           <div class="section-header">
             <div>
               <h2>스킬 직접 생성</h2>
               <p>
-                녹화 없이 동작을 직접 구성하여 새로운 스킬을 생성합니다.
+                Blockly를 이용하여 Primitive를 조합해 새로운 스킬을 생성합니다.
               </p>
             </div>
           </div>
-
           <form id="manual-skill-form">
-
             <div class="form-grid">
-
               <label>
                 스킬 ID
                 <input
@@ -853,7 +908,6 @@
                   required
                 >
               </label>
-
               <label>
                 스킬 이름
                 <input
@@ -863,9 +917,7 @@
                   required
                 >
               </label>
-
             </div>
-
             <label>
               설명
               <textarea
@@ -874,103 +926,23 @@
                 placeholder="로봇이 대상 물체를 잡는 동작"
               ></textarea>
             </label>
-
-            <div class="manual-node-builder">
-
-              <h3>동작 추가</h3>
-
-              <div class="form-grid">
-
-                <label>
-                  동작
-                  <select id="manual-operation">
-                    <option value="grasp">잡기</option>
-                    <option value="lift">들어올리기</option>
-                    <option value="move">이동</option>
-                    <option value="place">놓기</option>
-                    <option value="press">누르기</option>
-                    <option value="pull">당기기</option>
-                    <option value="push">밀기</option>
-                    <option value="rotate">회전</option>
-                  </select>
-                </label>
-
-                <label>
-                  대상
-                  <input
-                    id="manual-target"
-                    type="text"
-                    placeholder="object"
-                  >
-                </label>
-
-              </div>
-
-              <div class="form-grid">
-
-                <label>
-                  속도
-                  <input
-                    id="manual-speed"
-                    type="number"
-                    value="30"
-                    min="1"
-                    max="100"
-                  >
-                </label>
-
-                <label>
-                  동작 설명
-                  <input
-                    id="manual-node-description"
-                    type="text"
-                    placeholder="대상을 잡는다"
-                  >
-                </label>
-
-              </div>
-
-              <button
-                id="add-manual-node"
-                class="button"
-                type="button"
-              >
-                + 동작 추가
-              </button>
-
+            <div class="blockly-panel">
+              <div id="blocklyDiv"></div>
             </div>
-
-            <div class="manual-node-list-section">
-
-              <h3>등록할 동작</h3>
-
-              <div id="manual-node-list" class="manual-node-list">
-                <p class="muted">
-                  아직 추가된 동작이 없습니다.
-                </p>
-              </div>
-
-            </div>
-
             <div class="actions">
-
               <button
                 class="button primary"
-                type="submit"
-                id="create-manual-skill"
-              >
+                type="button"
+                id="create-manual-skill">
                 스킬 생성
               </button>
 
             </div>
-
           </form>
-
           <div
             id="manual-skill-status"
             class="status"
           ></div>
-
         </section>
         <div class="create-layout">
           <div class="panel">
@@ -1033,7 +1005,7 @@
           <header><p class="eyebrow">03 · SKILLGRAPH</p><h1 id="detail-title">스킬을 선택하세요</h1><p id="detail-subtitle" class="subtitle">스킬 관리 화면에서 버전을 선택해 주세요.</p></header>
           <button id="validate-skill" type="button" class="button primary">전체 Mock 검증</button>
         </div>
-        <div id="detail-nodes" class="nodes"></div>
+        <div id="detail-nodes" class="nodes" hidden></div>
         <div class="actions">
           <button id="activate-skill" type="button" class="button primary">검증 후 활성화</button>
           <button type="button" class="button" data-page="skills">목록으로</button>
@@ -1088,7 +1060,11 @@
       </section>
     </main>
   </div>
-  <script src="./api-client.js"></script>
-  <script src="./app.js"></script>
+  <script src="vendor/blockly/blockly.min.js"></script>
+  <!--script src="vendor/blockly/blocks_compressed.js"></script> -->
+  <script src="vendor/blockly/javascript_compressed.js"></script>
+
+  <script src="api-client.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>

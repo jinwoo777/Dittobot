@@ -463,15 +463,30 @@ class StorageRepository:
         """Delete a skill and all related registry data."""
 
         with self.database.session() as session:
+
+            # 1. UUID로 검색
             skill = session.get(SkillRecord, skill_id)
 
-            # skill_id가 DB UUID가 아니라 skill name으로 전달된 경우
+            # 2. name으로 검색
             if skill is None:
                 skill = session.scalar(
                     select(SkillRecord).where(
                         SkillRecord.name == skill_id
                     )
                 )
+
+            # 3. UI의 graph_json.skill_id로 검색
+            if skill is None:
+                versions = session.scalars(
+                    select(SkillVersionRecord)
+                )
+
+                for version in versions:
+                    graph = version.graph_json or {}
+
+                    if graph.get("skill_id") == skill_id:
+                        skill = version.skill
+                        break
 
             if skill is None:
                 raise KeyError(skill_id)

@@ -9,6 +9,7 @@
     drafts: [],
     selectedKey: null,
     selectedDraftId: null,
+    expandedNode: null,
     run: {
       skillKey: null,
       runId: null,
@@ -148,12 +149,6 @@
     manualSkillId: element("manual-skill-id"),
     manualSkillName: element("manual-skill-name"),
     manualSkillDescription: element("manual-skill-description"),
-    manualOperation: element("manual-operation"),
-    manualTarget: element("manual-target"),
-    manualSpeed: element("manual-speed"),
-    manualNodeDescription: element("manual-node-description"),
-    addManualNode: element("add-manual-node"),
-    manualNodeList: element("manual-node-list"),
     manualSkillStatus: element("manual-skill-status"),
   };
 
@@ -174,49 +169,49 @@
   }
 
   function normalizeSkill(row) {
-  const graph = row.skill_graph || {};
-  const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
+    const graph = row.skill_graph || {};
+    const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
 
-  const skillNames = {
-    pick_tool: "공구 잡기",
-    lift_tool: "공구 들어올리기",
-    move_tool: "공구 이동하기",
-    place_tool: "공구 내려놓기",
-    insert_tool: "공구 삽입하기",
-    hand_over_tool: "공구 전달하기",
-    pick_object: "물체 잡기",
-    lift_object: "물체 들어올리기",
-    place_object: "물체 내려놓기",
-  };
+    const skillNames = {
+      pick_tool: "공구 잡기",
+      lift_tool: "공구 들어올리기",
+      move_tool: "공구 이동하기",
+      place_tool: "공구 내려놓기",
+      insert_tool: "공구 삽입하기",
+      hand_over_tool: "공구 전달하기",
+      pick_object: "물체 잡기",
+      lift_object: "물체 들어올리기",
+      place_object: "물체 내려놓기",
+    };
 
-  const displayName =
-    skillNames[row.skill_id]
-    || skillNames[graph.skill_id]
-    || row.description
-    || graph.description
-    || row.skill_id;
+    const displayName =
+      skillNames[row.skill_id]
+      || skillNames[graph.skill_id]
+      || row.description
+      || graph.description
+      || row.skill_id;
 
-  let uiState = "candidate";
-  if (row.status === "active") uiState = "active";
-  else if (row.validation_status === "passed") uiState = "tested";
+    let uiState = "candidate";
+    if (row.status === "active") uiState = "active";
+    else if (row.validation_status === "passed") uiState = "tested";
 
-  return {
-    key: `${row.skill_id}@${row.version}`,
-    id: row.skill_id,
-    displayName,
-    version: row.version,
-    uiState,
-    validationStatus: row.validation_status,
-    status: row.status,
-    description: row.description || graph.description || "",
-    nodes: nodes.map((node) => ({
-      nodeId: node.node_id,
-      operation: node.operation || node.node_id || "unknown",
-      arguments: node.arguments || {},
-      status: "idle",
-    })),
-  };
-}
+    return {
+      key: `${row.skill_id}@${row.version}`,
+      id: row.skill_id,
+      displayName,
+      version: row.version,
+      uiState,
+      validationStatus: row.validation_status,
+      status: row.status,
+      description: row.description || graph.description || "",
+      nodes: nodes.map((node) => ({
+        nodeId: node.node_id,
+        operation: node.operation || node.node_id || "unknown",
+        arguments: node.arguments || {},
+        status: "idle",
+      })),
+    };
+  }
 
   function normalizeDraft(row) {
     const draft = row.draft || {};
@@ -243,28 +238,6 @@
       promotionEvidence: row.promotion_evidence || {},
       createdAtNs: Number(row.created_at_ns || 0),
     };
-  }
-
-  function addManualNode() {
-    const operation = dom.manualOperation.value;
-    const target = dom.manualTarget.value.trim();
-    const speed = Number(dom.manualSpeed.value);
-    const description = dom.manualNodeDescription.value.trim();
-
-    state.manualSkill.nodes.push({
-      node_id: `node_${state.manualSkill.nodes.length + 1}`,
-      operation,
-      arguments: {
-        target,
-        speed,
-        description,
-      },
-    });
-
-    dom.manualTarget.value = "";
-    dom.manualNodeDescription.value = "";
-
-    renderManualNodes();
   }
 
   function renderManualNodes() {
@@ -579,9 +552,7 @@
 
   function renderDetail() {
     const skill = selectedSkill();
-
     dom.detailNodes.replaceChildren();
-
     dom.validateSkill.disabled =
       !skill || state.apiStatus !== "connected";
 
@@ -607,7 +578,7 @@
       const block = create("div", {
         className: `skill-node-block ${skillNode.status}`.trim(),
       });
-
+      const expanded = state.expandedNode === skillNode.id;
       // =========================
       // 헤더
       // =========================
@@ -634,15 +605,58 @@
 
       header.append(titleArea);
 
+      const arrow = create("span", {
+        className: "skill-node-arrow",
+        text: expanded ? "▲" : "▼",
+      });
+      header.append(arrow);
+
+      const body = create("div", {
+        className: "skill-node-body",
+      });
+
+      body.hidden = !expanded;
+
+      header.style.cursor = "pointer";
+      header.addEventListener("click", () => {
+
+          if (state.expandedNode === skillNode.id) {
+              state.expandedNode = null;
+          } else {
+              state.expandedNode = skillNode.id;
+          }
+
+          renderDetail();
+      });
+
       // =========================
       // 파라미터 영역
       // =========================
-
       const parameters = create("div", {
         className: "skill-node-parameters",
       });
+      parameters.hidden = !expanded;
 
       const args = skillNode.arguments || {};
+      const summary = create("div", {
+        className: "skill-node-summary",
+      });  
+      Object.entries(args).forEach(([key, value]) => {
+        let text = value;
+        if (typeof value === "object" && value !== null) {
+          if (value.anchor_id) {
+            text = value.anchor_id;
+          } else {
+            text = JSON.stringify(value);
+          }
+        }
+        summary.append(
+          create("div", {
+            className: "skill-node-summary-item",
+            text: `${key} : ${text}`,
+          })
+        );
+      });
 
       const primitive = getPrimitiveMetadata(skillNode.operation);
 
@@ -767,6 +781,7 @@
       const actions = create("div", {
         className: "skill-node-actions",
       });
+      actions.hidden = !expanded;
 
       const saveButton = create("button", {
         className: "button primary",
@@ -798,10 +813,15 @@
       // 최종 블록
       // =========================
 
-      block.append(
-        header,
+      body.append(
+        summary,
         parameters,
         actions,
+      );
+
+      block.append(
+        header,
+        body,
       );
 
       dom.detailNodes.append(block);
@@ -1879,8 +1899,31 @@
     return wrapper;
   }
 
-  let saveTimer = null;
+  function createSkillBlock(node) {
+    const block = create("div", {
+      className: "skill-block",
+    });
 
+    block.append(
+      create("div", {
+        className: "skill-block-title",
+        text: node.operation,
+      })
+    );
+
+    Object.entries(node.parameters || {}).forEach(([key, value]) => {
+      block.append(
+        create("div", {
+          className: "skill-block-item",
+          text: `${key} : ${formatParameterValue(value)}`,
+        })
+      );
+    });
+
+    return block;
+  }
+
+  let saveTimer = null;
   function scheduleNodeSave(skill, skillNode, name, value) {
     skillNode.arguments[name] = value;
 
@@ -2583,10 +2626,6 @@
   dom.cancelGeometryTeaching.addEventListener("click", cancelGeometryTeaching);
   dom.recordingSkillForm.addEventListener("submit", createRecordingSkillDraft);
   window.addEventListener("resize", renderGeometryMarkers);
-  dom.addManualNode.addEventListener(
-    "click",
-    addManualNode,
-  );
 
   dom.manualSkillForm.addEventListener(
     "submit",
@@ -2596,10 +2635,13 @@
   Promise.all([
     loadPrimitiveCatalog(),
     loadRegistry(),
-  ]).then(() => Promise.all([
-    refreshCameraStatus(),
-    refreshHandeyeCalibrationStatus(),
-  ])).catch(() => undefined);
+  ]).then(() => {
+    initBlockly();
+    return Promise.all([
+      refreshCameraStatus(),
+      refreshHandeyeCalibrationStatus(),
+    ]);
+  }).catch(console.error);
   window.setInterval(() => {
     if (state.camera.state === "streaming" || state.camera.recordingId) {
       refreshCameraStatus();
@@ -2609,4 +2651,68 @@
       refreshHandeyeCalibrationStatus();
     }
   }, 1000);
+
+  function registerPrimitiveBlock(primitive) {
+    const blockType = primitive.operation_name.replace(/\./g, "_");
+    Blockly.Blocks[blockType] = {
+      init: function () {
+        this.appendDummyInput()
+          .appendField(
+            primitive.display_name || primitive.operation_name
+          );
+          
+        const schema =
+          primitive.typed_parameter_schema ||
+          primitive.parameter_schema ||
+          {};
+
+        const properties = schema.properties || {};
+        Object.entries(properties).forEach(([name, info]) => {
+          this.appendDummyInput()
+            .appendField(name)
+            .appendField(
+              new Blockly.FieldTextInput(""),
+              name,
+            );
+        });
+
+        this.setPreviousStatement(true);
+        this.setNextStatement(true);
+        this.setColour(210);
+        this.setTooltip(
+          primitive.description || ""
+        );
+      }
+    };
+  }
+
+  let workspace = null;
+
+  function initBlockly() {
+    const div = document.getElementById("blocklyDiv");
+    if (!div) return;
+
+    state.primitiveCatalog.forEach(registerPrimitiveBlock);
+    workspace = Blockly.inject(div, {
+        toolbox: buildBlocklyToolbox(),
+        media: "vendor/blockly/media/"
+    });
+  }
+
+  function buildBlocklyToolbox() {
+    return {
+      kind: "categoryToolbox",
+      contents: [
+        {
+          kind: "category",
+          name: "Primitive",
+          colour: "#4C97FF",
+          contents: state.primitiveCatalog.map((p) => ({
+            kind: "block",
+            type: p.operation_name.replace(/\./g, "_"),
+          })),
+        },
+      ],
+    };
+  }
 })();
