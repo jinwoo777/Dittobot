@@ -16,6 +16,7 @@ from .schemas import (
     RecordingSkillDraft,
     RuntimeIntent,
     SkillGraphProposal,
+    TaskIntent,
 )
 
 
@@ -101,6 +102,30 @@ def validate_runtime_intent(
     )
 
 
+def validate_task_intent(
+    intent: TaskIntent,
+    *,
+    object_catalog: Iterable[str],
+    action_catalog: Iterable[str],
+    entity_catalog: Iterable[str],
+    allowed_roles: Iterable[str],
+) -> None:
+    """Reject task-flow selections outside local catalogs and the current Scene."""
+
+    entity_ids = set(intent.role_bindings.values())
+    if intent.object_instance_id is not None:
+        entity_ids.add(intent.object_instance_id)
+    _raise_if_violations(
+        "TaskIntent",
+        {
+            "object_class_id": _unknown({intent.object_class_id}, object_catalog),
+            "action_id": _unknown({intent.action_id}, action_catalog),
+            "entity_ids": _unknown(entity_ids, entity_catalog),
+            "role_bindings": _unknown(intent.role_bindings, allowed_roles),
+        },
+    )
+
+
 def validate_skill_graph_proposal(
     proposal: SkillGraphProposal,
     *,
@@ -173,6 +198,10 @@ def validate_recording_skill_draft(
         draft.scene_observation.tool.representative_frame_index,
         draft.scene_observation.work_surface.representative_frame_index,
     }
+    if draft.scene_observation.target_object is not None:
+        scene_indices.add(
+            draft.scene_observation.target_object.representative_frame_index
+        )
     unknown_scene_indices = scene_indices - expected_indices
     if unknown_scene_indices:
         raise SemanticCatalogViolationError(

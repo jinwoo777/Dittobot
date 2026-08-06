@@ -41,6 +41,10 @@
       loading: false,
       loaded: false,
       draft: null,
+      fingerTrackingRecordingId: null,
+      fingerObservations: [],
+      fingerTrackingSettings: null,
+      surfaceHint: null,
     },
     geometryTeaching: {
       mode: null,
@@ -48,6 +52,15 @@
       points: [],
       samples: [],
       busy: false,
+    },
+    editor: {
+      createMode: "recording",
+      catalog: [],
+      blocks: [],
+      bindings: {},
+      loading: false,
+      parameterNodeId: null,
+      parameterArguments: null,
     },
   };
 
@@ -137,6 +150,27 @@
     analyzeRecording: element("analyze-recording"),
     draftStatus: element("draft-status"),
     draftResult: element("draft-result"),
+    createRecordingTab: element("create-recording-tab"),
+    createBlockTab: element("create-block-tab"),
+    recordingCreateMode: element("recording-create-mode"),
+    blockCreateMode: element("block-create-mode"),
+    blockSkillForm: element("block-skill-form"),
+    blockSkillId: element("block-skill-id"),
+    blockSkillName: element("block-skill-name"),
+    blockSkillDescription: element("block-skill-description"),
+    blockSkillType: element("block-skill-type"),
+    blockOperationSelect: element("block-operation-select"),
+    addSkillBlock: element("add-skill-block"),
+    previewSkillBlocks: element("preview-skill-blocks"),
+    createBlockCandidate: element("create-block-candidate"),
+    skillBlockList: element("skill-block-list"),
+    blockBindingList: element("block-binding-list"),
+    blockEditorResult: element("block-editor-result"),
+    parameterEditor: element("parameter-editor"),
+    parameterNodeSelect: element("parameter-node-select"),
+    parameterFields: element("parameter-fields"),
+    createParameterCandidate: element("create-parameter-candidate"),
+    parameterEditorResult: element("parameter-editor-result"),
     estopRun: element("estop-run"),
     abortRun: element("abort-run"),
   };
@@ -170,8 +204,11 @@
       uiState,
       validationStatus: row.validation_status,
       status: row.status,
+      checksum: row.graph_checksum_sha256 || "",
       description: row.description || graph.description || "",
+      graph,
       nodes: nodes.map((node) => ({
+        nodeId: node.node_id || "unknown",
         operation: node.operation || node.node_id || "unknown",
         arguments: node.arguments || {},
         status: "idle",
@@ -196,7 +233,7 @@
       primitiveSequence: Array.isArray(draft.primitive_sequence) ? draft.primitive_sequence : [],
       ambiguities: Array.isArray(draft.unresolved_ambiguities) ? draft.unresolved_ambiguities : [],
       keyframeCount: Number(row.keyframe_count || 0),
-      pairCount: Number(transport.keyframe_pair_count || 0),
+      traceFrameCount: Number(transport.trace_frame_count || 0),
       transport,
       tcp,
       sceneObservation,
@@ -258,8 +295,11 @@
     if (page === "detail") renderDetail();
     if (page === "monitor") renderMonitor();
     if (page === "create") {
-      renderRecordingReview();
-      if (!state.recordingReview.loaded) loadRecordings();
+      renderCreateMode();
+      if (state.editor.createMode === "recording") {
+        renderRecordingReview();
+        if (!state.recordingReview.loaded) loadRecordings();
+      }
     }
   }
 
@@ -284,9 +324,8 @@
       const summary = create("div");
       summary.append(create("h2", { text: draft.suggestedSkillId }));
       const meta = create("div", { className: "meta" });
-      const evidenceCount = draft.pairCount || draft.keyframeCount;
       meta.append(document.createTextNode(
-        `${evidenceCount}개 RGB-D 쌍 · 신뢰도 ${draft.confidence.toFixed(2)}`,
+        `첫 RGB 1장 + 손끝 trace ${draft.traceFrameCount}프레임 · 신뢰도 ${draft.confidence.toFixed(2)}`,
       ));
       meta.append(create("span", { className: "tag draft", text: tagText("draft") }));
       summary.append(meta);
@@ -344,14 +383,16 @@
     dom.draftEvidence.replaceChildren();
     const evidence = [
       {
-        label: draft.pairCount > 0 ? `RGB-D ${draft.pairCount}쌍` : "RGB-D 재분석 필요",
-        passed: draft.pairCount > 0,
+        label: draft.traceFrameCount > 0
+          ? `첫 RGB 1장 + 전체 손끝 trace ${draft.traceFrameCount}프레임`
+          : "전체 손끝 trace 재분석 필요",
+        passed: draft.traceFrameCount > 0,
       },
       {
-        label: draft.tcp?.trajectory_status
-          ? `GPT TCP ${draft.tcp.trajectory_status} · 유효 ${draft.tcp.valid_landmark_frame_count || 0}프레임`
-          : draft.tcp?.detected ? "두 손가락 TCP 프록시 관찰됨" : "TCP 재분석 필요",
-        passed: Boolean(draft.tcp?.usable_for_local_depth_path),
+        label: draft.tcp?.detected
+          ? "첫 RGB의 LLM fingertip 관찰됨 · 상태 판정은 로컬 MediaPipe 우선"
+          : "첫 RGB의 LLM fingertip은 advisory 미검출",
+        passed: Boolean(draft.tcp?.detected),
       },
       {
         label: draft.sceneObservation?.person_hand
@@ -369,7 +410,7 @@
         passed: Boolean(draft.sceneObservation?.work_surface?.detected),
       },
       { label: `semantic confidence ${draft.confidence.toFixed(2)}`, passed: true },
-      { label: "실행 좌표 없음", passed: false },
+      { label: "실행 geometry는 로컬 task-plane 기준", passed: true },
     ];
     evidence.forEach((item) => {
       dom.draftEvidence.append(create("span", {
@@ -404,7 +445,7 @@
       });
       item.append(create("span", {
         className: "readiness-mark",
-        text: check.passed ? "✓" : advisory ? "i" : "!",
+        text: check.passed ? "✓" : check.pending ? "…" : advisory ? "i" : "!",
       }));
       const description = create("div");
       description.append(create("strong", { text: check.label || check.id }));
@@ -415,22 +456,23 @@
     dom.draftNextAction.textContent = draft.readiness.next_action
       || "보정된 TF와 pose trajectory가 필요합니다.";
     const checkById = new Map(checks.map((check) => [check.id, check]));
-    const calibrationReady = Boolean(checkById.get("calibrated_transform")?.passed);
-    const trajectoryReady = Boolean(checkById.get("trusted_pose_trajectory")?.passed);
+    const calibrationReady = Boolean(checkById.get("operator_task_plane")?.passed);
+    const trajectoryReady = Boolean(checkById.get("metric_trajectory")?.passed)
+      && Boolean(checkById.get("anchor_geometry")?.passed);
     const candidateReady = Boolean(checkById.get("mock_validation")?.passed);
     dom.autoSurfaceCalibration.disabled = false;
     dom.autoSurfaceCalibration.textContent = calibrationReady
-      ? "Depth 평면 다시 추출" : "Depth 평면 자동 추출";
+      ? "Depth 평면 보조 힌트 다시 계산" : "Depth 평면 보조 힌트";
     dom.startSurfaceCalibration.disabled = false;
-    dom.startSurfaceCalibration.textContent = calibrationReady ? "표면 TF 다시 보정" : "표면 TF 보정";
+    dom.startSurfaceCalibration.textContent = calibrationReady ? "task-plane TF 다시 보정" : "수동 3점 task-plane TF";
     dom.startPathTeaching.disabled = !calibrationReady;
     dom.startPathTeaching.title = calibrationReady
       ? "녹화 프레임에서 두 fingertip을 직접 지정"
-      : "먼저 camera → surface TF를 보정하세요.";
+      : "먼저 수동 3점 camera → task-plane TF를 보정하세요.";
     dom.autoTcpPath.disabled = !calibrationReady;
     dom.autoTcpPath.title = calibrationReady
-      ? "GPT 정규화 fingertip 좌표를 로컬 aligned depth로 3D 복원"
-      : "먼저 camera → surface TF를 보정하세요.";
+      ? "MediaPipe landmark 4·8을 각자의 aligned depth로 3D 복원"
+      : "먼저 수동 3점 camera → task-plane TF를 보정하세요.";
     dom.registerDraftCandidate.disabled = !draft.readiness.can_register_candidate;
     dom.registerDraftCandidate.textContent = candidateReady
       ? "Candidate 등록 완료"
@@ -451,6 +493,485 @@
     }).join(" · ");
   }
 
+  function primitiveByOperation(operation) {
+    return state.editor.catalog.find((item) => item.operation_name === operation) || null;
+  }
+
+  function cloneValue(value) {
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  }
+
+  function collectBlockBindingHints() {
+    const hints = new Map();
+    const kindByAnchorType = {
+      object: "object",
+      tool: "tool",
+      surface: "surface",
+      fixture: "surface",
+      workspace_region: "workspace",
+    };
+    const kindByField = {
+      tool: "tool",
+      surface: "surface",
+      region: "workspace",
+    };
+    const mergeHint = (variable, kind = null) => {
+      if (!/^\$[A-Za-z][A-Za-z0-9_]*$/.test(variable)) return;
+      if (!hints.has(variable)) {
+        hints.set(variable, kind);
+        return;
+      }
+      const previous = hints.get(variable);
+      if (previous === "conflict") return;
+      if (previous && kind && previous !== kind) hints.set(variable, "conflict");
+      else if (!previous && kind) hints.set(variable, kind);
+    };
+    const visit = (value, fieldName = null) => {
+      if (Array.isArray(value)) {
+        value.forEach((item) => visit(item, fieldName));
+        return;
+      }
+      if (value && typeof value === "object") {
+        const anchorId = value.anchor_id;
+        if (typeof anchorId === "string") {
+          mergeHint(anchorId, kindByAnchorType[value.anchor_type] || null);
+        }
+        Object.entries(value).forEach(([key, child]) => visit(child, key));
+        return;
+      }
+      if (typeof value === "string") mergeHint(value, kindByField[fieldName] || null);
+    };
+    state.editor.blocks.forEach((block) => visit(block.arguments));
+    return [...hints.entries()].sort(([left], [right]) => left.localeCompare(right));
+  }
+
+  function blockBindingDraft(variable, hint) {
+    const conventionalKinds = {
+      $tool: "tool",
+      $surface: "surface",
+      $object: "object",
+      $workspace: "workspace",
+    };
+    const existing = state.editor.bindings[variable] || {};
+    const entityKind = existing.entity_kind
+      || (hint !== "conflict" ? hint : null)
+      || conventionalKinds[variable]
+      || "object";
+    const draft = {
+      variable,
+      entity_kind: entityKind,
+      instance_id: existing.instance_id || "",
+      class_name: existing.class_name || "",
+      role: existing.role || "",
+      minimum_confidence: Number(existing.minimum_confidence ?? 0.7),
+      minimum_visible_fraction: Number(existing.minimum_visible_fraction ?? 0.5),
+      must_be_attached: Object.hasOwn(existing, "must_be_attached")
+        ? existing.must_be_attached
+        : (entityKind === "tool" ? true : null),
+    };
+    state.editor.bindings[variable] = draft;
+    return draft;
+  }
+
+  function renderBlockBindings() {
+    const hints = collectBlockBindingHints();
+    dom.blockBindingList.replaceChildren();
+    if (!hints.length) {
+      dom.blockBindingList.append(create("p", {
+        className: "empty",
+        text: "현재 블록에는 $placeholder binding이 없습니다.",
+      }));
+      return;
+    }
+    hints.forEach(([variable, hint]) => {
+      const binding = blockBindingDraft(variable, hint);
+      const card = create("article", { className: "block-card" });
+      const head = create("div", { className: "block-card-head" });
+      head.append(create("strong", { text: variable }));
+      head.append(create("span", {
+        className: "tag",
+        text: hint === "conflict" ? "역할 충돌" : `추론 ${hint || "없음"}`,
+      }));
+      const grid = create("div", { className: "binding-grid" });
+
+      const kindLabel = create("label");
+      kindLabel.append(create("span", { text: "entity kind" }));
+      const kindSelect = create("select");
+      ["object", "tool", "surface", "workspace"].forEach((kind) => {
+        const option = create("option", { text: kind });
+        option.value = kind;
+        option.selected = binding.entity_kind === kind;
+        kindSelect.append(option);
+      });
+      kindSelect.addEventListener("change", () => {
+        binding.entity_kind = kindSelect.value;
+      });
+      kindLabel.append(kindSelect);
+      grid.append(kindLabel);
+
+      const attachedLabel = create("label");
+      attachedLabel.append(create("span", { text: "must be attached" }));
+      const attachedSelect = create("select");
+      [["", "지정 안 함"], ["true", "true"], ["false", "false"]]
+        .forEach(([value, label]) => {
+          const option = create("option", { text: label });
+          option.value = value;
+          option.selected = value === (
+            binding.must_be_attached === null ? "" : String(binding.must_be_attached)
+          );
+          attachedSelect.append(option);
+        });
+      attachedSelect.addEventListener("change", () => {
+        binding.must_be_attached = attachedSelect.value === ""
+          ? null
+          : attachedSelect.value === "true";
+      });
+      attachedLabel.append(attachedSelect);
+      grid.append(attachedLabel);
+
+      [["instance_id", "instance ID"], ["class_name", "class name"], ["role", "role"]]
+        .forEach(([key, label]) => {
+          const wrapper = create("label");
+          wrapper.append(create("span", { text: label }));
+          const input = create("input");
+          input.type = "text";
+          input.value = binding[key];
+          input.addEventListener("change", () => {
+            binding[key] = input.value.trim();
+          });
+          wrapper.append(input);
+          grid.append(wrapper);
+        });
+
+      [["minimum_confidence", "minimum confidence"], ["minimum_visible_fraction", "minimum visible fraction"]]
+        .forEach(([key, label]) => {
+          const wrapper = create("label");
+          wrapper.append(create("span", { text: label }));
+          const input = create("input");
+          input.type = "number";
+          input.min = "0";
+          input.max = "1";
+          input.step = "0.05";
+          input.value = String(binding[key]);
+          input.addEventListener("change", () => {
+            binding[key] = Number(input.value);
+          });
+          wrapper.append(input);
+          grid.append(wrapper);
+        });
+      card.append(head, grid);
+      dom.blockBindingList.append(card);
+    });
+  }
+
+  function serializedBlockBindings() {
+    const bindings = {};
+    collectBlockBindingHints().forEach(([variable, hint]) => {
+      if (hint === "conflict") {
+        throw new Error(`${variable}가 서로 다른 entity 역할로 사용되었습니다.`);
+      }
+      const draft = blockBindingDraft(variable, hint);
+      const binding = {
+        variable,
+        entity_kind: draft.entity_kind,
+        minimum_confidence: draft.minimum_confidence,
+        minimum_visible_fraction: draft.minimum_visible_fraction,
+      };
+      ["instance_id", "class_name", "role"].forEach((key) => {
+        if (draft[key]) binding[key] = draft[key];
+      });
+      if (draft.must_be_attached !== null) {
+        binding.must_be_attached = draft.must_be_attached;
+      }
+      bindings[variable] = binding;
+    });
+    return bindings;
+  }
+
+  function resolveEditorSchema(schema, rootSchema) {
+    if (schema?.$ref?.startsWith("#/$defs/")) {
+      return rootSchema?.$defs?.[schema.$ref.split("/").at(-1)] || schema;
+    }
+    if (Array.isArray(schema?.anyOf)) {
+      const nonNull = schema.anyOf.find((item) => item?.type !== "null");
+      return nonNull ? resolveEditorSchema(nonNull, rootSchema) : schema;
+    }
+    return schema || {};
+  }
+
+  function defaultEditorValue(schema, rootSchema, fieldName = "") {
+    const resolved = resolveEditorSchema(schema, rootSchema);
+    if (Object.hasOwn(resolved, "default")) return cloneValue(resolved.default);
+    if (Array.isArray(resolved.enum)) return resolved.enum[0];
+    if (resolved.type === "object" || resolved.properties) {
+      const result = {};
+      (resolved.required || []).forEach((key) => {
+        result[key] = defaultEditorValue(resolved.properties[key], rootSchema, key);
+      });
+      return result;
+    }
+    if (resolved.type === "array") {
+      return Array.from(
+        { length: Number(resolved.minItems || 0) },
+        () => defaultEditorValue(resolved.items || {}, rootSchema, fieldName),
+      );
+    }
+    if (resolved.type === "boolean") return false;
+    if (resolved.type === "integer") return Number(resolved.minimum || 1);
+    if (resolved.type === "number") {
+      if (fieldName === "w") return 1;
+      return Number(resolved.minimum || 0);
+    }
+    return "";
+  }
+
+  function editorEnumOptions(fieldName, schema, primitive) {
+    const resolved = resolveEditorSchema(schema, primitive.typed_parameter_schema);
+    if (Array.isArray(resolved.enum)) return resolved.enum;
+    const profileKey = {
+      motion_profile_id: "motion_profile_ids",
+      force_profile_id: "force_profile_ids",
+      recovery_profile_id: "recovery_profile_ids",
+    }[fieldName];
+    return profileKey ? primitive.approved_profile_ids?.[profileKey] || [] : [];
+  }
+
+  function renderEditorControl({ parent, schema, value, setValue, fieldName, primitive }) {
+    const rootSchema = primitive.typed_parameter_schema;
+    const resolved = resolveEditorSchema(schema, rootSchema);
+    const wrapper = create("label", { className: "schema-field" });
+    wrapper.append(create("span", { text: fieldName.replaceAll("_", " ") || "item" }));
+    const options = editorEnumOptions(fieldName, schema, primitive);
+    if (resolved.type === "object" || resolved.properties) {
+      const objectValue = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+      const objectContainer = create("div", { className: "schema-object" });
+      Object.entries(resolved.properties || {}).forEach(([childName, childSchema]) => {
+        renderEditorControl({
+          parent: objectContainer,
+          schema: childSchema,
+          value: objectValue[childName],
+          fieldName: childName,
+          primitive,
+          setValue: (childValue) => {
+            const next = { ...objectValue, [childName]: childValue };
+            setValue(next);
+          },
+        });
+      });
+      wrapper.append(objectContainer);
+    } else if (resolved.type === "array") {
+      const values = Array.isArray(value) ? value : [];
+      const arrayContainer = create("div", { className: "schema-array" });
+      values.forEach((item, index) => {
+        const itemContainer = create("div", { className: "schema-array-item" });
+        renderEditorControl({
+          parent: itemContainer,
+          schema: resolved.items || {},
+          value: item,
+          fieldName: `${fieldName} ${index + 1}`,
+          primitive,
+          setValue: (itemValue) => {
+            const next = values.slice();
+            next[index] = itemValue;
+            setValue(next);
+          },
+        });
+        const remove = create("button", { className: "button", text: "항목 삭제" });
+        remove.type = "button";
+        remove.disabled = values.length <= Number(resolved.minItems || 0);
+        remove.addEventListener("click", () => setValue(values.filter((_, itemIndex) => itemIndex !== index)));
+        itemContainer.append(remove);
+        arrayContainer.append(itemContainer);
+      });
+      const add = create("button", { className: "button", text: "항목 추가" });
+      add.type = "button";
+      add.disabled = values.length >= Number(resolved.maxItems || 128);
+      add.addEventListener("click", () => setValue([
+        ...values,
+        defaultEditorValue(resolved.items || {}, rootSchema, fieldName),
+      ]));
+      arrayContainer.append(add);
+      wrapper.append(arrayContainer);
+    } else if (options.length) {
+      const select = create("select");
+      options.forEach((optionValue) => {
+        const option = create("option", { text: String(optionValue) });
+        option.value = String(optionValue);
+        option.selected = optionValue === value;
+        select.append(option);
+      });
+      select.addEventListener("change", () => setValue(select.value));
+      wrapper.append(select);
+    } else if (resolved.type === "boolean") {
+      const input = create("input");
+      input.type = "checkbox";
+      input.checked = Boolean(value);
+      input.addEventListener("change", () => setValue(input.checked));
+      wrapper.append(input);
+    } else {
+      const input = create("input");
+      const numeric = ["number", "integer"].includes(resolved.type);
+      input.type = numeric ? "number" : "text";
+      if (numeric) {
+        if (resolved.minimum !== undefined) input.min = String(resolved.minimum);
+        if (resolved.maximum !== undefined) input.max = String(resolved.maximum);
+        input.step = resolved.type === "integer" ? "1" : "any";
+      }
+      input.value = value ?? "";
+      input.addEventListener("change", () => {
+        setValue(numeric ? Number(input.value) : input.value);
+      });
+      wrapper.append(input);
+    }
+    parent.append(wrapper);
+  }
+
+  function renderArgumentEditor(parent, primitive, argumentsValue, onChange) {
+    parent.replaceChildren();
+    const schema = primitive?.typed_parameter_schema;
+    if (!schema) {
+      parent.append(create("p", { className: "notice", text: "primitive schema를 찾을 수 없습니다." }));
+      return;
+    }
+    const values = argumentsValue || {};
+    Object.entries(schema.properties || {}).forEach(([fieldName, fieldSchema]) => {
+      renderEditorControl({
+        parent,
+        schema: fieldSchema,
+        value: values[fieldName],
+        fieldName,
+        primitive,
+        setValue: (fieldValue) => onChange({ ...values, [fieldName]: fieldValue }),
+      });
+    });
+  }
+
+  function renderCreateMode() {
+    const blockMode = state.editor.createMode === "block";
+    dom.recordingCreateMode.hidden = blockMode;
+    dom.blockCreateMode.hidden = !blockMode;
+    dom.createRecordingTab.setAttribute("aria-selected", String(!blockMode));
+    dom.createRecordingTab.setAttribute("aria-pressed", String(!blockMode));
+    dom.createBlockTab.setAttribute("aria-selected", String(blockMode));
+    dom.createBlockTab.setAttribute("aria-pressed", String(blockMode));
+    if (blockMode) renderSkillBlocks();
+  }
+
+  function renderPrimitiveOptions() {
+    const selected = dom.blockOperationSelect.value;
+    dom.blockOperationSelect.replaceChildren();
+    state.editor.catalog.forEach((primitive) => {
+      const option = create("option", {
+        text: `${primitive.operation_name} · ${primitive.description}`,
+      });
+      option.value = primitive.operation_name;
+      option.selected = primitive.operation_name === selected;
+      dom.blockOperationSelect.append(option);
+    });
+    dom.addSkillBlock.disabled = !state.editor.catalog.length;
+  }
+
+  function renderSkillBlocks() {
+    renderPrimitiveOptions();
+    dom.skillBlockList.replaceChildren();
+    if (!state.editor.blocks.length) {
+      dom.skillBlockList.append(create("p", { className: "empty", text: "primitive 블록을 추가해 주세요." }));
+    }
+    state.editor.blocks.forEach((block, index) => {
+      const primitive = primitiveByOperation(block.operation);
+      const card = create("article", { className: "block-card" });
+      const head = create("div", { className: "block-card-head" });
+      head.append(create("strong", { text: `${index + 1}. ${block.operation}` }));
+      const actions = create("div", { className: "actions" });
+      [["↑", -1], ["↓", 1]].forEach(([label, offset]) => {
+        const move = create("button", { className: "button", text: label });
+        move.type = "button";
+        move.disabled = index + offset < 0 || index + offset >= state.editor.blocks.length;
+        move.addEventListener("click", () => {
+          const next = state.editor.blocks.slice();
+          [next[index], next[index + offset]] = [next[index + offset], next[index]];
+          state.editor.blocks = next;
+          renderSkillBlocks();
+        });
+        actions.append(move);
+      });
+      const remove = create("button", { className: "button danger", text: "삭제" });
+      remove.type = "button";
+      remove.addEventListener("click", () => {
+        state.editor.blocks.splice(index, 1);
+        renderSkillBlocks();
+      });
+      actions.append(remove);
+      head.append(actions);
+      const fields = create("div", { className: "block-parameters" });
+      renderArgumentEditor(fields, primitive, block.arguments, (argumentsValue) => {
+        block.arguments = argumentsValue;
+        renderSkillBlocks();
+      });
+      card.append(head, fields);
+      dom.skillBlockList.append(card);
+    });
+    renderBlockBindings();
+    const hasBindingConflict = collectBlockBindingHints()
+      .some(([, hint]) => hint === "conflict");
+    const ready = state.apiStatus === "connected"
+      && state.editor.blocks.length > 0
+      && !state.editor.loading
+      && !hasBindingConflict;
+    dom.previewSkillBlocks.disabled = !ready;
+    dom.createBlockCandidate.disabled = !ready;
+  }
+
+  function blockEditorPayload() {
+    if (!dom.blockSkillForm.reportValidity()) return null;
+    let bindings;
+    try {
+      bindings = serializedBlockBindings();
+    } catch (error) {
+      setBanner(`Binding 검증 실패: ${errorText(error)}`, "danger");
+      return null;
+    }
+    return {
+      skill_id: dom.blockSkillId.value.trim(),
+      name: dom.blockSkillName.value.trim(),
+      description: dom.blockSkillDescription.value.trim(),
+      skill_type: dom.blockSkillType.value,
+      blocks: state.editor.blocks.map((block) => ({
+        operation: block.operation,
+        arguments: cloneValue(block.arguments),
+      })),
+      bindings,
+    };
+  }
+
+  function renderParameterEditor(skill) {
+    dom.parameterEditor.hidden = !skill || !state.editor.catalog.length;
+    if (!skill || !state.editor.catalog.length) return;
+    if (state.editor.parameterSkillKey !== skill.key) {
+      state.editor.parameterSkillKey = skill.key;
+      state.editor.parameterNodeId = skill.nodes[0]?.nodeId || null;
+      state.editor.parameterArguments = cloneValue(skill.nodes[0]?.arguments || {});
+    }
+    dom.parameterNodeSelect.replaceChildren();
+    skill.nodes.forEach((node) => {
+      const option = create("option", { text: `${node.nodeId} · ${node.operation}` });
+      option.value = node.nodeId;
+      option.selected = node.nodeId === state.editor.parameterNodeId;
+      dom.parameterNodeSelect.append(option);
+    });
+    const node = skill.nodes.find((item) => item.nodeId === state.editor.parameterNodeId);
+    renderArgumentEditor(
+      dom.parameterFields,
+      primitiveByOperation(node?.operation),
+      state.editor.parameterArguments,
+      (argumentsValue) => {
+        state.editor.parameterArguments = argumentsValue;
+        renderParameterEditor(skill);
+      },
+    );
+    dom.createParameterCandidate.disabled = !node || !skill.checksum || state.editor.loading;
+  }
+
   function renderDetail() {
     const skill = selectedSkill();
     dom.detailNodes.replaceChildren();
@@ -459,6 +980,7 @@
     if (!skill) {
       dom.detailTitle.textContent = "스킬을 선택하세요";
       dom.detailSubtitle.textContent = "스킬 관리 화면에서 버전을 선택해 주세요.";
+      dom.parameterEditor.hidden = true;
       return;
     }
 
@@ -473,6 +995,7 @@
       node.append(description, create("span", { className: "node-state", text: label }));
       dom.detailNodes.append(node);
     });
+    renderParameterEditor(skill);
   }
 
   function renderMonitor() {
@@ -653,17 +1176,70 @@
     };
   }
 
+  function fingerObservationForFrame(frameIndex) {
+    const review = state.recordingReview;
+    if (review.fingerTrackingRecordingId !== review.selectedId) return null;
+    return review.fingerObservations.find(
+      (item) => Number(item.frame_index) === Number(frameIndex),
+    ) || null;
+  }
+
   function renderGeometryMarkers() {
     dom.recordedPointOverlay.replaceChildren();
-    const teaching = state.geometryTeaching;
-    if (!teaching.mode || !dom.recordedRgbFrame.naturalWidth) return;
     const image = dom.recordedRgbFrame;
+    if (!image.naturalWidth) return;
     const scale = Math.min(
       image.clientWidth / image.naturalWidth,
       image.clientHeight / image.naturalHeight,
     );
     const offsetX = (image.clientWidth - image.naturalWidth * scale) / 2;
     const offsetY = (image.clientHeight - image.naturalHeight * scale) / 2;
+    const observation = fingerObservationForFrame(state.recordingReview.frameIndex);
+    if (observation) {
+      [
+        {
+          kind: "thumb",
+          label: "T",
+          pixel: observation.thumb_pixel_xy,
+          depthM: observation.thumb_depth_m,
+        },
+        {
+          kind: "index",
+          label: "I",
+          pixel: observation.index_pixel_xy,
+          depthM: observation.index_depth_m,
+        },
+      ].forEach((tip) => {
+        if (!Array.isArray(tip.pixel) || tip.pixel.length !== 2) return;
+        const depthLabel = Number.isFinite(Number(tip.depthM))
+          ? `${Number(tip.depthM).toFixed(3)}m`
+          : "depth ?";
+        const marker = create("span", {
+          className: `finger-marker ${tip.kind}`,
+          text: `${tip.label} (${Number(tip.pixel[0])},${Number(tip.pixel[1])}) · ${depthLabel}`,
+        });
+        marker.style.left = `${offsetX + Number(tip.pixel[0]) * scale}px`;
+        marker.style.top = `${offsetY + Number(tip.pixel[1]) * scale}px`;
+        dom.recordedPointOverlay.append(marker);
+      });
+      const distanceCm = Number.isFinite(Number(observation.distance_m))
+        ? `${(Number(observation.distance_m) * 100).toFixed(2)} cm`
+        : "거리 불확실";
+      const candidate = observation.candidate_state || "uncertain";
+      const progress = Number(observation.stabilization_progress_frames || 0);
+      const required = Number(observation.required_stable_frames || 3);
+      const confirmed = observation.stable_state || "미확정";
+      const readout = create("span", {
+        className: `finger-readout${observation.status === "uncertain" ? " uncertain" : ""}`,
+        text: observation.status === "uncertain"
+          ? `distance ${distanceCm} · candidate uncertain · stable ${progress}/${required} · confirmed ${confirmed} · ${observation.invalid_reason || "RGB-D fingertip unavailable"}`
+          : `distance ${distanceCm} · candidate ${candidate} · stable ${progress}/${required} · confirmed ${confirmed}`,
+      });
+      dom.recordedPointOverlay.append(readout);
+    }
+
+    const teaching = state.geometryTeaching;
+    if (!teaching.mode) return;
     const labels = teaching.mode === "surface_calibration" ? ["O", "X", "Y"] : ["A", "B"];
     teaching.points.forEach((point, index) => {
       const marker = create("span", { className: "point-marker", text: labels[index] || String(index + 1) });
@@ -680,26 +1256,25 @@
     dom.geometryTeaching.hidden = !teaching.mode;
     dom.recordedRgbFrame.classList.toggle("teaching-image", Boolean(teaching.mode));
     if (!teaching.mode) {
-      dom.recordedPointOverlay.replaceChildren();
       return;
     }
     dom.geometryTeachingTitle.textContent = calibrationMode
-      ? "camera → surface TF 보정"
+      ? "camera → task-plane TF 보정"
       : "두 fingertip TCP 경로 티칭";
     dom.geometryTeachingInstruction.textContent = calibrationMode
       ? "한 프레임의 같은 평면에서 원점(O), +X 방향점(X), +Y 방향점(Y)을 순서대로 클릭하세요. 세 점은 각각 3 cm 이상 떨어뜨리세요."
-      : "현재 프레임에서 집게로 사용할 두 fingertip 끝 A와 B를 클릭하고 ‘현재 프레임 샘플 추가’를 누르세요. 서로 다른 프레임에서 최소 4개를 저장합니다.";
+      : "현재 프레임에서 집게로 사용할 두 fingertip 끝 A와 B를 클릭하고 ‘현재 프레임 샘플 추가’를 누르세요. 서로 다른 프레임에서 최소 2개를 저장합니다.";
     dom.surfaceAnchorLabel.hidden = !calibrationMode;
     dom.addPathSample.hidden = !pathMode;
     dom.addPathSample.disabled = teaching.busy || teaching.points.length !== 2;
     dom.saveGeometryEvidence.disabled = teaching.busy || (
-      calibrationMode ? teaching.points.length !== 3 : teaching.samples.length < 4
+      calibrationMode ? teaching.points.length !== 3 : teaching.samples.length < 2
     );
     dom.resetGeometryPoints.disabled = teaching.busy || teaching.points.length === 0;
     dom.cancelGeometryTeaching.disabled = teaching.busy;
     dom.geometryPointSummary.textContent = calibrationMode
       ? `선택한 점 ${teaching.points.length}/3 · 기준 프레임 ${state.recordingReview.frameIndex}`
-      : `현재 fingertip ${teaching.points.length}/2 · 저장된 경로 샘플 ${teaching.samples.length}/4 이상`;
+      : `현재 fingertip ${teaching.points.length}/2 · 저장된 경로 샘플 ${teaching.samples.length}/2 이상`;
     renderGeometryMarkers();
   }
 
@@ -747,15 +1322,12 @@
     const ready = !live || capabilities.api_key_configured;
     dom.openaiCapability.textContent = live
       ? ready
-        ? `GPT LIVE 준비됨 · ${capabilities.model} · RGB-D 최대 ${capabilities.maximum_keyframes}쌍 · 두 손가락 TCP 프록시 · 실패 시 PDF 재전송/ZIP 보관`
+        ? `GPT LIVE 준비됨 · ${capabilities.model} · 첫 RGB 1장 + 전체 엄지/검지 trace · Depth/거리/상태는 로컬 유지`
         : "OPENAI_MODE=live이지만 서버에 OPENAI_API_KEY가 없습니다."
       : `현재 MOCK 분석 모드 · 실제 GPT 전송은 OPENAI_MODE=live에서만 수행됩니다. · ${capabilities.model}`;
     dom.openaiCapability.style.color = ready ? "" : "var(--danger)";
-    const configuredMaximum = Number(capabilities.maximum_keyframes || 300);
-    dom.draftKeyframeCount.max = String(Math.min(300, configuredMaximum));
-    if (Number(dom.draftKeyframeCount.value) > configuredMaximum) {
-      dom.draftKeyframeCount.value = String(configuredMaximum);
-    }
+    dom.draftKeyframeCount.max = "1";
+    dom.draftKeyframeCount.value = "1";
   }
 
   function renderRecordingReview() {
@@ -771,7 +1343,7 @@
       || !recording
       || !liveReady;
     if (review.loading) {
-      dom.draftStatus.textContent = "대표 RGB-D 쌍과 두 손가락 TCP 프록시 프롬프트를 준비하는 중…";
+      dom.draftStatus.textContent = "첫 RGB 1장과 전체 녹화 엄지/검지 trace를 준비하는 중…";
     } else if (!recording) {
       dom.draftStatus.textContent = "녹화를 선택해 주세요.";
     }
@@ -886,9 +1458,9 @@
       dom.draftStatus.style.color = "var(--ok)";
       dom.draftStatus.textContent = result.openai?.mode === "live"
         ? result.transport?.fallback_used
-          ? "GPT 분석 완료 · 직접 RGB-D 입력이 거부되어 PDF로 재전송됨 · ZIP 원본 보관 완료"
-          : `GPT 분석 완료 · ${result.openai.model} · RGB-D ${result.transport?.keyframe_pair_count || result.keyframe_indices.length}쌍 전송됨`
-        : "Mock 분석 완료 · OPENAI_MODE=live에서 같은 버튼을 누르면 GPT에 전송됩니다.";
+          ? "GPT 분석 완료 · 첫 RGB 파일 1장 + 전체 엄지/검지 trace 전송 · Depth는 로컬 유지"
+          : `GPT 분석 완료 · ${result.openai.model} · 첫 RGB 1장 + 전체 ${result.transport?.trace_frame_count || 0}프레임 손끝 trace 전송`
+        : "Mock 분석 완료 · 실제 모드에서도 첫 RGB 1장과 전체 손끝 trace만 전송되고 Depth는 로컬에 남습니다.";
     } catch (error) {
       dom.draftStatus.textContent = `스킬 초안 생성 실패: ${errorText(error)}`;
       dom.draftStatus.style.color = "var(--danger)";
@@ -898,12 +1470,124 @@
     renderRecordingReview();
   }
 
+  function setCreateMode(mode) {
+    state.editor.createMode = mode;
+    if (mode === "recording" && !state.recordingReview.loaded) loadRecordings();
+    renderCreateMode();
+  }
+
+  function addSelectedSkillBlock() {
+    const primitive = primitiveByOperation(dom.blockOperationSelect.value);
+    if (!primitive) return;
+    state.editor.blocks.push({
+      operation: primitive.operation_name,
+      arguments: cloneValue(primitive.default_arguments || {}),
+    });
+    dom.blockEditorResult.hidden = true;
+    renderSkillBlocks();
+  }
+
+  async function previewSkillBlocks() {
+    const payload = blockEditorPayload();
+    if (!payload || !state.editor.blocks.length) return;
+    state.editor.loading = true;
+    renderSkillBlocks();
+    setBanner("순차 블록 schema·profile·anchor·compiler 검증 중…");
+    try {
+      const result = await api.previewSkillBlocks(payload);
+      dom.blockEditorResult.hidden = false;
+      dom.blockEditorResult.textContent = JSON.stringify(result, null, 2);
+      setBanner(
+        result.valid ? "블록 미리보기 검증 통과 · 아직 저장되지 않았습니다." : `블록 검증 실패: ${(result.errors || []).join("; ")}`,
+        result.valid ? "ok" : "danger",
+      );
+    } catch (error) {
+      setBanner(`블록 미리보기 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.editor.loading = false;
+      renderSkillBlocks();
+    }
+  }
+
+  async function createBlockCandidate() {
+    const payload = blockEditorPayload();
+    if (!payload || !state.editor.blocks.length) return;
+    if (!window.confirm("부모/시연 없이 Mock-only 비활성 Candidate를 생성하고 전체 Mock 회귀 검증을 실행할까요?")) return;
+    state.editor.loading = true;
+    renderSkillBlocks();
+    setBanner("순차 블록 Candidate 컴파일 및 Mock 회귀 검증 중…");
+    try {
+      const result = await api.createSkillBlockCandidate(payload);
+      dom.blockEditorResult.hidden = false;
+      dom.blockEditorResult.textContent = JSON.stringify(result, null, 2);
+      await loadRegistry(
+        result.mock_validation_passed
+          ? `${payload.skill_id} Candidate Mock 검증 통과`
+          : `${payload.skill_id} Candidate 저장됨 · Mock 검증 경고를 확인하세요.`,
+      );
+      state.selectedKey = `${result.candidate.skill_id}@${result.candidate.version}`;
+      showPage("detail");
+    } catch (error) {
+      setBanner(`블록 Candidate 생성 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.editor.loading = false;
+      renderSkillBlocks();
+    }
+  }
+
+  function selectParameterNode() {
+    const skill = selectedSkill();
+    if (!skill) return;
+    state.editor.parameterNodeId = dom.parameterNodeSelect.value;
+    const node = skill.nodes.find((item) => item.nodeId === state.editor.parameterNodeId);
+    state.editor.parameterArguments = cloneValue(node?.arguments || {});
+    dom.parameterEditorResult.hidden = true;
+    renderParameterEditor(skill);
+  }
+
+  async function createParameterCandidate() {
+    const skill = selectedSkill();
+    const node = skill?.nodes.find((item) => item.nodeId === state.editor.parameterNodeId);
+    if (!skill || !node || !skill.checksum) return;
+    if (!window.confirm("현재 버전은 그대로 두고, 이 인수로 새 child Candidate를 만들까요?")) return;
+    state.editor.loading = true;
+    renderParameterEditor(skill);
+    setBanner(`${skill.id}@${skill.version} checksum 확인 및 child Candidate 생성 중…`);
+    try {
+      const result = await api.createSkillParameterCandidate(skill.id, skill.version, {
+        expected_parent_checksum_sha256: skill.checksum,
+        edits: [{
+          node_id: node.nodeId,
+          arguments: cloneValue(state.editor.parameterArguments),
+        }],
+      });
+      dom.parameterEditorResult.hidden = false;
+      dom.parameterEditorResult.textContent = JSON.stringify(result, null, 2);
+      await loadRegistry(
+        result.parent_unchanged
+          ? `${skill.id} 부모 checksum 보존 · ${result.candidate.version} 생성 완료`
+          : `${skill.id} parent 불변 검증 실패`,
+      );
+      state.selectedKey = `${result.candidate.skill_id}@${result.candidate.version}`;
+      state.editor.parameterSkillKey = null;
+      showPage("detail");
+    } catch (error) {
+      setBanner(`Parameter Candidate 생성 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.editor.loading = false;
+      renderDetail();
+    }
+  }
+
   function renderAll() {
     renderConnection();
     renderRegistry();
     if (state.page === "detail") renderDetail();
     if (state.page === "monitor") renderMonitor();
-    if (state.page === "create") renderRecordingReview();
+    if (state.page === "create") {
+      renderCreateMode();
+      if (state.editor.createMode === "recording") renderRecordingReview();
+    }
     renderCamera();
   }
 
@@ -1099,13 +1783,17 @@
     renderConnection();
     setBanner("FastAPI 연결 확인 중…");
     try {
-      const [, registry, draftCatalog] = await Promise.all([
+      const [, registry, draftCatalog, editorCatalog] = await Promise.all([
         api.health(),
         api.listSkills(),
         api.listSkillDrafts(),
+        api.skillEditorCatalog(),
       ]);
       state.skills = (registry.skills || []).map(normalizeSkill);
       state.drafts = (draftCatalog.drafts || []).map(normalizeDraft);
+      state.editor.catalog = Array.isArray(editorCatalog.primitives)
+        ? editorCatalog.primitives
+        : [];
       state.selectedKey = state.skills.some((skill) => skill.key === state.selectedKey)
         ? state.selectedKey
         : state.skills[0]?.key || null;
@@ -1137,22 +1825,32 @@
   function beginDraftGeometryTeaching(mode) {
     const draft = selectedDraft();
     if (!draft?.sourceRecordingId) return;
+    const surfaceHint = state.recordingReview.surfaceHint;
+    const useSurfaceHint = mode === "surface_calibration"
+      && surfaceHint?.draftId === draft.draftId
+      && surfaceHint?.recordingId === draft.sourceRecordingId
+      && Array.isArray(surfaceHint.points)
+      && surfaceHint.points.length === 3;
     state.geometryTeaching = {
       mode,
       draftId: draft.draftId,
-      points: [],
+      points: useSurfaceHint
+        ? surfaceHint.points.map((point) => ({ ...point }))
+        : [],
       samples: [],
       busy: false,
     };
     state.recordingReview.selectedId = draft.sourceRecordingId;
     state.recordingReview.loaded = false;
-    state.recordingReview.frameIndex = 0;
+    state.recordingReview.frameIndex = useSurfaceHint ? surfaceHint.frameIndex : 0;
     state.recordingReview.draft = null;
     stopRecordingPlayback();
     showPage("create");
     setBanner(
       mode === "surface_calibration"
-        ? "녹화 RGB에서 표면 원점, +X, +Y를 지정하세요."
+        ? useSurfaceHint
+          ? "RANSAC 보조점 O·X·Y를 확인한 뒤 필요하면 조정하고 직접 확정하세요."
+          : "녹화 RGB에서 표면 원점, +X, +Y를 지정하세요."
         : "서로 다른 프레임에서 두 fingertip을 지정해 TCP 경로를 만드세요.",
     );
     renderRecordingReview();
@@ -1211,7 +1909,7 @@
     if (!teaching.mode || !teaching.draftId || teaching.busy) return;
     if (teaching.mode === "surface_calibration"
       && (!dom.surfaceAnchorId.reportValidity() || teaching.points.length !== 3)) return;
-    if (teaching.mode === "manual_tcp_path" && teaching.samples.length < 4) return;
+    if (teaching.mode === "manual_tcp_path" && teaching.samples.length < 2) return;
     teaching.busy = true;
     renderGeometryTeaching();
     try {
@@ -1225,7 +1923,7 @@
           operator_confirmed: true,
         });
         cancelGeometryTeaching();
-        await loadRegistry("camera → surface TF 보정 완료 · 실제 로봇 TF는 별도 검증 필요");
+        await loadRegistry("수동 3점 camera → task-plane TF 보정 완료 · 실제 로봇 TF는 별도 검증 필요");
       } else {
         await api.createDraftTcpTrajectory(teaching.draftId, {
           method: "manual_two_fingertip",
@@ -1247,10 +1945,10 @@
     const draft = selectedDraft();
     if (!draft) return;
     const confirmed = window.confirm(
-      "GPT의 작업대 영역은 힌트로만 사용하고, 원본 aligned Depth와 카메라 내부 파라미터로 평면을 계산합니다. 결과는 Candidate/Mock 전용이며 화면에서 평면이 맞는지 확인해야 합니다. 계속할까요?",
+      "GPT의 작업대 영역은 힌트로만 사용하고 원본 aligned Depth로 보조 평면을 계산합니다. 이 결과는 최종 TF가 아니며, 이후 원점·+X·+Y를 직접 지정해야 합니다. 계속할까요?",
     );
     if (!confirmed) return;
-    setBanner("원본 Depth에서 작업대 평면과 camera → surface TF 계산 중…");
+    setBanner("원본 Depth에서 수동 3점 선택을 보조할 작업대 평면 힌트 계산 중…");
     dom.autoSurfaceCalibration.disabled = true;
     try {
       const result = await api.autoCalibrateDraftSurface(draft.draftId, {
@@ -1258,9 +1956,29 @@
         surface_anchor_id: "teaching_surface",
         operator_confirmed: true,
       });
+      const assist = result.manual_click_assist || {};
+      const suggestedPoints = [
+        assist.origin_px,
+        assist.positive_x_px,
+        assist.positive_y_px,
+      ];
+      const validSuggestedPoints = suggestedPoints.every((point) => point
+        && Number.isFinite(Number(point.x_px))
+        && Number.isFinite(Number(point.y_px)));
+      state.recordingReview.surfaceHint = validSuggestedPoints
+        ? {
+          draftId: draft.draftId,
+          recordingId: draft.sourceRecordingId,
+          frameIndex: Number(result.frame_index || 0),
+          points: suggestedPoints.map((point) => ({
+            x_px: Number(point.x_px),
+            y_px: Number(point.y_px),
+          })),
+        }
+        : null;
       const inlier = Number(result.diagnostics?.inlier_ratio || 0);
       await loadRegistry(
-        `Depth 평면 TF 생성 완료 · inlier ${(inlier * 100).toFixed(1)}% · 실제 로봇 TF 검증은 별도 필요`,
+        `Depth 평면 보조 힌트 생성 · inlier ${(inlier * 100).toFixed(1)}% · 수동 3점에서 제안점을 확인·조정하세요`,
       );
     } catch (error) {
       setBanner(`Depth 평면 자동 추출 실패: ${errorText(error)} · 3점 표면 TF 보정을 사용하세요.`, "danger");
@@ -1272,20 +1990,32 @@
     const draft = selectedDraft();
     if (!draft) return;
     const confirmed = window.confirm(
-      "GPT가 모든 대표 프레임에 표시한 두 fingertip 좌표를 원본 aligned Depth로 3D 복원합니다. 결과는 Candidate/Mock 전용이며 실제 로봇 궤적으로 승인되지 않습니다. 계속할까요?",
+      "MediaPipe가 전체 녹화 RGB에서 검출한 엄지(4)·검지(8)를 각자의 aligned Depth로 3D 복원합니다. 3 cm 임계값과 3-frame 안정화는 로컬 설정만 사용합니다. 결과는 Candidate/Mock 전용입니다. 계속할까요?",
     );
     if (!confirmed) return;
-    setBanner("GPT fingertip audit + 로컬 aligned Depth로 TCP 경로 복원 중…");
+    setBanner("MediaPipe 전체 프레임 + 로컬 aligned Depth로 TCP 경로 복원 중…");
     dom.autoTcpPath.disabled = true;
     try {
       const result = await api.createDraftTcpTrajectory(draft.draftId, {
-        method: "openai_rgbd",
+        method: "mediapipe_rgbd",
         annotations: [],
         operator_confirmed: true,
       });
-      await loadRegistry(`자동 TCP 경로 ${result.quality?.sample_count || 0}개 생성 완료`);
+      const review = state.recordingReview;
+      review.fingerTrackingRecordingId = result.recording_id || draft.sourceRecordingId;
+      review.fingerObservations = Array.isArray(result.finger_observations)
+        ? result.finger_observations
+        : [];
+      review.fingerTrackingSettings = result.finger_tracking_settings || null;
+      review.selectedId = draft.sourceRecordingId;
+      review.frameIndex = 0;
+      await loadRegistry(
+        `MediaPipe TCP 경로 ${result.quality?.sample_count || 0}개 · overlay ${review.fingerObservations.length}프레임`,
+      );
+      showPage("create");
+      renderRecordingReview();
     } catch (error) {
-      setBanner(`GPT TCP 경로 적용 실패: ${errorText(error)} · 녹화를 다시 분석하거나 수동 경로 티칭을 사용하세요.`, "danger");
+      setBanner(`MediaPipe RGB-D 경로 적용 실패: ${errorText(error)} · optional dependency 또는 depth 정렬 상태를 확인하세요.`, "danger");
       renderDraftInspector();
     }
   }
@@ -1473,6 +2203,13 @@
   dom.saveGeometryEvidence.addEventListener("click", saveGeometryEvidence);
   dom.cancelGeometryTeaching.addEventListener("click", cancelGeometryTeaching);
   dom.recordingSkillForm.addEventListener("submit", createRecordingSkillDraft);
+  dom.createRecordingTab.addEventListener("click", () => setCreateMode("recording"));
+  dom.createBlockTab.addEventListener("click", () => setCreateMode("block"));
+  dom.addSkillBlock.addEventListener("click", addSelectedSkillBlock);
+  dom.previewSkillBlocks.addEventListener("click", previewSkillBlocks);
+  dom.createBlockCandidate.addEventListener("click", createBlockCandidate);
+  dom.parameterNodeSelect.addEventListener("change", selectParameterNode);
+  dom.createParameterCandidate.addEventListener("click", createParameterCandidate);
   window.addEventListener("resize", renderGeometryMarkers);
 
   renderAll();

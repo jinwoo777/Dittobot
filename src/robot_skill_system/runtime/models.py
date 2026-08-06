@@ -128,6 +128,8 @@ class RuntimeContext:
     motion_profiles: Mapping[str, Any]
     force_profiles: Mapping[str, Any]
     execution_mode: ExecutionMode
+    verification_profiles: Mapping[str, Any] = field(default_factory=dict)
+    attachment_states: dict[str, str] = field(default_factory=dict)
     skill: Any = None
     preflight_report: PreflightReport | None = None
     safety_policy: Any = None

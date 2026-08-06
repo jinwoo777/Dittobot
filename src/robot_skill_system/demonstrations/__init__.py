@@ -15,6 +15,12 @@ from .models import (
     TrajectorySample,
     TrajectorySegment,
 )
+from .path_simplification import (
+    DEFAULT_PATH_SIMPLIFICATION_TOLERANCE_M,
+    PathSimplificationProvenance,
+    SimplifiedAnchorRelativePath,
+    simplify_anchor_relative_path,
+)
 from .preprocessing import (
     PreprocessingConfig,
     TrajectoryPreprocessingError,
@@ -22,11 +28,13 @@ from .preprocessing import (
     preprocess_trajectory,
 )
 from .primitive_fitter import (
+    PeriodicPrimitiveGeometry,
     PrimitiveFitterConfig,
     PrimitiveFittingError,
     fit_arc,
     fit_line,
     fit_periodic,
+    fit_periodic_primitive_geometry,
     recommend_primitive,
 )
 from .quality import (
@@ -37,6 +45,17 @@ from .quality import (
     validate_repeat_consistency,
 )
 from .recorder import DemonstrationRecorder, load_demonstration, load_pose_samples
+from .rgbd_dataset import (
+    MediaPipeDatasetDiagnostic,
+    RGBDDataset,
+    RGBDDatasetManifest,
+    RGBDDatasetSegmentation,
+    RGBDDatasetValidationError,
+    RGBDFrameArtifact,
+    load_rgbd_dataset,
+    mediapipe_dataset_diagnostic,
+    segment_rgbd_dataset,
+)
 from .segmentation import SegmentationConfig, segment_trajectory
 from .synthetic import (
     generate_arc_trajectory,
@@ -50,8 +69,11 @@ from .synthetic import (
 __all__ = [
     "DemonstrationRecorder",
     "DemonstrationTrajectory",
+    "DEFAULT_PATH_SIMPLIFICATION_TOLERANCE_M",
     "FitResiduals",
     "PoseSample",
+    "PathSimplificationProvenance",
+    "PeriodicPrimitiveGeometry",
     "PreprocessingConfig",
     "PreprocessingReport",
     "PrimitiveFit",
@@ -62,10 +84,17 @@ __all__ = [
     "QualityAssessment",
     "QualityConfig",
     "RepeatConsistencyResult",
+    "MediaPipeDatasetDiagnostic",
+    "RGBDDataset",
+    "RGBDDatasetManifest",
+    "RGBDDatasetSegmentation",
+    "RGBDDatasetValidationError",
+    "RGBDFrameArtifact",
     "SegmentationConfig",
     "SegmentationResult",
     "SegmentationState",
     "SegmentState",
+    "SimplifiedAnchorRelativePath",
     "TimeInterval",
     "TrajectorySegment",
     "TrajectoryPreprocessingError",
@@ -74,6 +103,7 @@ __all__ = [
     "fit_arc",
     "fit_line",
     "fit_periodic",
+    "fit_periodic_primitive_geometry",
     "generate_arc_trajectory",
     "generate_expert_wipe_trajectory",
     "generate_line_trajectory",
@@ -82,9 +112,13 @@ __all__ = [
     "generate_wipe_trajectory",
     "load_demonstration",
     "load_pose_samples",
+    "load_rgbd_dataset",
+    "mediapipe_dataset_diagnostic",
     "preprocess_pose_samples",
     "preprocess_trajectory",
     "recommend_primitive",
     "segment_trajectory",
+    "segment_rgbd_dataset",
+    "simplify_anchor_relative_path",
     "validate_repeat_consistency",
 ]

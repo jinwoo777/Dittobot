@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -73,6 +74,7 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/calibration/hand-eye/start",
         "/calibration/hand-eye/abort",
         "/calibration/hand-eye/import-legacy-npy",
+        "/calibration/task-planes",
         "/teaching/sessions",
         "/teaching/sessions/{session_id}/capture",
         "/teaching/sessions/{session_id}/frames",
@@ -90,7 +92,11 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/skills/drafts/{draft_id}/surface-calibration/auto",
         "/skills/drafts/{draft_id}/tcp-trajectory",
         "/skills/drafts/{draft_id}/candidate",
+        "/skills/editor/catalog",
+        "/skills/editor/preview",
+        "/skills/editor/candidates",
         "/skills/search",
+        "/skills/{skill_id}/versions/{version}/parameter-candidates",
         "/skills/{skill_id}/validate",
         "/skills/{skill_id}/versions/{version}/promote",
         "/runtime/resolve",
@@ -191,11 +197,13 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
 
         capabilities = client.get("/skills/draft-from-recording/capabilities").json()
         assert capabilities["openai_mode"] == "mock"
-        assert capabilities["maximum_keyframes"] == 300
-        assert capabilities["uploads_rgb_and_aligned_depth_pairs"] is True
+        assert capabilities["maximum_keyframes"] == 1
+        assert capabilities["uploads_rgb_and_aligned_depth_pairs"] is False
+        assert capabilities["uploaded_rgb_frame_count"] == 1
+        assert capabilities["depth_stays_local"] is True
         assert capabilities["provider_video_input_supported"] is False
-        assert capabilities["fallback_analysis_transport"] == "pdf_contact_sheet"
-        assert capabilities["creates_zip_archive_on_fallback"] is True
+        assert capabilities["fallback_analysis_transport"] == "first_rgb_input_file"
+        assert capabilities["creates_zip_archive_on_fallback"] is False
         assert capabilities["creates_executable_skill"] is False
         draft_response = client.post(
             "/skills/draft-from-recording",
@@ -213,10 +221,11 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
         assert draft["openai"]["mode"] == "mock"
         assert draft["draft"]["suggested_skill_id"] == "table_wipe_recorded"
         assert draft["draft"]["tcp_proxy_observation"]["detected"] is True
-        assert draft["transport"]["keyframe_pair_count"] >= 1
-        assert draft["transport"]["image_count"] == (
-            draft["transport"]["keyframe_pair_count"] * 2
-        )
+        assert draft["transport"]["mode"] == "first_rgb_plus_compact_fingertip_trace"
+        assert draft["transport"]["image_count"] == 1
+        assert draft["transport"]["depth_image_count"] == 0
+        assert draft["transport"]["trace_frame_count"] == stopped.json()["frame_count"]
+        assert draft["local_fingertip_tracking"]["valid_frame_count"] == 0
         assert draft["executable"] is False
         assert draft["requires_pose_trajectory"] is True
         assert application.store.path_for(draft["artifact_uri"]).is_file()
@@ -234,7 +243,7 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
         application.close()
 
 
-def test_auto_depth_plane_and_gpt_tcp_path_register_candidate_without_valid_npy(
+def test_manual_task_plane_and_metric_tcp_path_register_candidate_without_valid_npy(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
@@ -271,27 +280,42 @@ def test_auto_depth_plane_and_gpt_tcp_path_register_candidate_without_valid_npy(
         ).json()
 
         calibration = client.post(
-            f"/skills/drafts/{draft['draft_id']}/surface-calibration/auto",
+            f"/skills/drafts/{draft['draft_id']}/surface-calibration",
             json={
-                "frame_index": None,
+                "frame_index": 0,
                 "surface_anchor_id": "teaching_surface",
+                "origin_px": {"x_px": 10, "y_px": 10},
+                "positive_x_px": {"x_px": 20, "y_px": 10},
+                "positive_y_px": {"x_px": 10, "y_px": 20},
                 "operator_confirmed": True,
             },
         )
         assert calibration.status_code == 200, calibration.text
-        assert calibration.json()["transform_convention"] == "T_camera_surface"
-        assert calibration.json()["method"] == "local_depth_ransac_plane"
+        assert calibration.json()["transform_convention"] == "T_camera_task_plane"
+        assert calibration.json()["method"] == "operator_three_point_aligned_depth"
+        last_frame_index = finished["frame_count"] - 1
         trajectory = client.post(
             f"/skills/drafts/{draft['draft_id']}/tcp-trajectory",
             json={
-                "method": "openai_rgbd",
-                "annotations": [],
+                "method": "manual_two_fingertip",
+                "annotations": [
+                    {
+                        "frame_index": 0,
+                        "jaw_tip_a_px": {"x_px": 20, "y_px": 20},
+                        "jaw_tip_b_px": {"x_px": 25, "y_px": 20},
+                    },
+                    {
+                        "frame_index": last_frame_index,
+                        "jaw_tip_a_px": {"x_px": 30, "y_px": 20},
+                        "jaw_tip_b_px": {"x_px": 35, "y_px": 20},
+                    },
+                ],
                 "operator_confirmed": True,
             },
         )
         assert trajectory.status_code == 200, trajectory.text
-        assert trajectory.json()["quality"]["sample_count"] >= 4
-        assert trajectory.json()["method"] == "openai_rgbd"
+        assert trajectory.json()["quality"]["sample_count"] == 2
+        assert trajectory.json()["method"] == "manual_two_fingertip"
         legacy_result = application.store.put_json(
             "calibrations/legacy_import_integration/result.json",
             {
@@ -350,7 +374,7 @@ def test_auto_depth_plane_and_gpt_tcp_path_register_candidate_without_valid_npy(
         application.close()
 
 
-def test_recording_draft_falls_back_to_pdf_and_preserves_zip(
+def test_recording_draft_falls_back_to_first_rgb_input_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,17 +393,19 @@ def test_recording_draft_falls_back_to_pdf_and_preserves_zip(
         def __init__(self, _settings: Settings) -> None:
             self.mock = MockOpenAIClient()
 
-        def analyze(self, *_args: object, **_kwargs: object) -> object:
-            raise ImageInputRejectedError("forced image rejection")
-
-        def analyze_pdf(
+        def analyze_first_frame_trace(
             self,
             request: RecordingSkillDraftInput,
             *,
-            contact_sheet_path: Path,
+            first_rgb_path: Path,
+            as_file_fallback: bool = False,
         ) -> object:
-            assert contact_sheet_path.read_bytes().startswith(b"%PDF")
-            return self.mock.analyze_recording_skill_draft(request, "trace-pdf-fallback")
+            assert first_rgb_path.read_bytes().startswith(b"\xff\xd8")
+            if not as_file_fallback:
+                raise ImageInputRejectedError("forced image rejection")
+            return self.mock.analyze_recording_skill_draft(
+                request, "trace-first-rgb-file-fallback"
+            )
 
     monkeypatch.setattr(
         application_module,
@@ -391,7 +417,7 @@ def test_recording_draft_falls_back_to_pdf_and_preserves_zip(
         application.start_camera_preview()
         recording = application.start_camera_recording({"maximum_duration_s": 1.0})
         time.sleep(0.12)
-        application.stop_camera_recording(str(recording["recording_id"]))
+        stopped = application.stop_camera_recording(str(recording["recording_id"]))
         result = application.create_recording_skill_draft(
             {
                 "recording_id": recording["recording_id"],
@@ -401,13 +427,24 @@ def test_recording_draft_falls_back_to_pdf_and_preserves_zip(
             }
         )
 
-        assert result["transport"]["mode"] == "pdf_contact_sheet"
+        assert result["transport"]["mode"] == (
+            "first_rgb_input_file_plus_compact_fingertip_trace"
+        )
         assert result["transport"]["fallback_used"] is True
-        assert result["transport"]["image_count"] >= 1
-        zip_path = application.store.path_for(result["transport"]["zip_archive"]["uri"])
-        pdf_path = application.store.path_for(result["transport"]["analysis_pdf"]["uri"])
-        assert zip_path.read_bytes().startswith(b"PK")
-        assert pdf_path.read_bytes().startswith(b"%PDF")
+        assert result["transport"]["image_count"] == 1
+        assert result["transport"]["depth_image_count"] == 0
+        assert result["transport"]["trace_frame_count"] == stopped["frame_count"]
+        assert result["local_fingertip_tracking"]["valid_frame_count"] == 0
+        assert "zip_archive" not in result["transport"]
+        assert "analysis_pdf" not in result["transport"]
+        tracking_path = application.store.path_for(
+            result["local_fingertip_tracking"]["artifact_uri"]
+        )
+        tracking = json.loads(tracking_path.read_text(encoding="utf-8"))
+        assert tracking["processed_frame_count"] == stopped["frame_count"]
+        assert len(tracking["finger_observations"]) == stopped["frame_count"]
+        assert len(tracking["compact_fingertip_trace"]) == stopped["frame_count"]
+        assert len(tracking["invalid_frames"]) == stopped["frame_count"]
     finally:
         application.close()
 

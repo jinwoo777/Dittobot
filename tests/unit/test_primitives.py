@@ -9,6 +9,7 @@ import pytest
 from robot_skill_system.exceptions import PrimitiveValidationError, UnknownPrimitiveError
 from robot_skill_system.primitives.profiles import (
     load_force_profiles,
+    load_grasp_verification_profiles,
     load_motion_profiles,
     load_safety_policies,
 )
@@ -80,9 +81,13 @@ def test_relative_motion_arguments_are_typed_and_normalized() -> None:
 def test_approved_profile_files_validate() -> None:
     motion = load_motion_profiles(ROOT / "configs/motion_profiles/default.json")
     force = load_force_profiles(ROOT / "configs/force_profiles/default.json")
+    grasp = load_grasp_verification_profiles(
+        ROOT / "configs/grasp_verification_profiles/default.json"
+    )
     safety = load_safety_policies(ROOT / "configs/safety_policies/default.json")
 
     assert set(motion) >= {"joint_safe", "linear_normal", "periodic_safe"}
     assert set(force) >= {"wipe_light", "wipe_standard", "contact_search_soft"}
+    assert grasp["grasp_default"].minimum_released_width_m == pytest.approx(0.05)
     assert safety["global_default"].unknown_space_is_occupied
     assert all(len(profile.force_control_axes) in {3, 6} for profile in force.values())

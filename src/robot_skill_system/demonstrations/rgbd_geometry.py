@@ -16,6 +16,10 @@ from numpy.typing import NDArray
 
 from robot_skill_system.capture.interfaces import CameraIntrinsics, SynchronizedRGBDFrame
 from robot_skill_system.perception._geometry import rotation_matrix_to_quaternion_xyzw
+from robot_skill_system.perception.deprojection import (
+    deproject_color_pixel,
+    deproject_color_pixels,
+)
 from robot_skill_system.scene.models import Quaternion, Vector3
 from robot_skill_system.scene.transforms import (
     RigidTransform,
@@ -77,14 +81,7 @@ def deproject_pixel(
     if valid.size < minimum_valid:
         raise ValueError("selected point has insufficient valid aligned depth")
     depth_m = float(np.median(valid))
-    return np.asarray(
-        (
-            (point.x_px - intrinsics.cx_px) / intrinsics.fx_px * depth_m,
-            (point.y_px - intrinsics.cy_px) / intrinsics.fy_px * depth_m,
-            depth_m,
-        ),
-        dtype=np.float64,
-    )
+    return deproject_color_pixel(intrinsics, point.x_px, point.y_px, depth_m)
 
 
 def calibrate_surface_from_three_points(
@@ -203,12 +200,12 @@ def segment_dominant_depth_plane(
     valid_x = valid_x[::stride] + lower_x
     valid_y = valid_y[::stride] + lower_y
     z = depth[valid_y, valid_x].astype(np.float64)
-    points = np.column_stack(
-        (
-            (valid_x.astype(np.float64) - intrinsics.cx_px) / intrinsics.fx_px * z,
-            (valid_y.astype(np.float64) - intrinsics.cy_px) / intrinsics.fy_px * z,
-            z,
-        )
+    points = deproject_color_pixels(
+        intrinsics,
+        np.column_stack(
+            (valid_x.astype(np.float64), valid_y.astype(np.float64))
+        ),
+        z,
     )
     if len(points) < 100:
         raise ValueError("surface ROI has insufficient sampled depth points")
@@ -320,8 +317,8 @@ def manual_two_finger_sample(
     )
     midpoint_camera = (tip_a_camera + tip_b_camera) / 2.0
     gripper_width_m = float(np.linalg.norm(tip_b_camera - tip_a_camera))
-    if not 0.005 <= gripper_width_m <= 0.20:
-        raise ValueError("two fingertip distance must be between 5 mm and 20 cm")
+    if not 0.0005 <= gripper_width_m <= 0.20:
+        raise ValueError("two fingertip distance must be between 0.5 mm and 20 cm")
 
     surface_to_camera = invert_transform(camera_to_surface)
     tip_a_surface = compose_transforms(
@@ -358,9 +355,15 @@ def manual_two_finger_sample(
     # into the surface plane to remove noisy per-tip depth differences.
     jaw_axis[2] = 0.0
     jaw_axis_norm = float(np.linalg.norm(jaw_axis))
-    if jaw_axis_norm < 0.003:
-        raise ValueError("fingertip jaw direction is ambiguous in the surface plane")
-    x_axis = jaw_axis / jaw_axis_norm
+    # Very small separations are a valid closed-gripper demonstration.  In that
+    # state the tip-to-tip axis is ill-conditioned, so use the task-plane +X as
+    # the deterministic manual fallback.  MediaPipe replay prefers its last
+    # valid palm orientation before reaching this fallback.
+    x_axis = (
+        np.asarray((1.0, 0.0, 0.0), dtype=np.float64)
+        if jaw_axis_norm < 0.003
+        else jaw_axis / jaw_axis_norm
+    )
     z_axis = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
     y_axis = np.cross(z_axis, x_axis)
     y_axis /= np.linalg.norm(y_axis)
@@ -392,8 +395,8 @@ def validate_surface_relative_path(
 ) -> dict[str, float | int]:
     """Fail closed on sparse, static, discontinuous, or cell-scale paths."""
 
-    if not 4 <= len(samples) <= 256:
-        raise ValueError("TCP trajectory requires 4 to 256 valid samples")
+    if not 2 <= len(samples) <= 6000:
+        raise ValueError("TCP trajectory requires 2 to 6000 valid samples")
     if any(
         current.frame_index <= previous.frame_index
         for previous, current in zip(samples, samples[1:], strict=False)

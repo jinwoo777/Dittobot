@@ -35,6 +35,8 @@ _SUPPORTED_OPERATIONS = frozenset(
         "gripper.close",
         "gripper.move_width",
         "gripper.verify_state",
+        "grasp.verify_holding",
+        "grasp.verify_released",
         "contact.search_surface",
         "contact.enable_force",
         "contact.follow_path",
@@ -382,13 +384,15 @@ class RuntimeExecutor:
         elif operation == "gripper.move_width":
             self._require_gripper().move_width(float(_get(arguments, "width_m")))
         elif operation == "gripper.verify_state":
-            expected = str(_get(arguments, "expected_state", "state"))
+            expected = _text(_get(arguments, "expected_state", "state"))
             state = self._require_gripper().get_state()
             actual = "closed" if state.width_m < 0.01 else "open"
             if expected not in {actual, "holding" if state.is_holding else actual}:
                 raise RuntimeSafetyError(
                     f"gripper state mismatch: expected={expected}, actual={actual}"
                 )
+        elif operation in {"grasp.verify_holding", "grasp.verify_released"}:
+            self._verify_grasp(operation, arguments)
         elif operation == "contact.search_surface":
             self._search_surface(arguments)
         elif operation == "contact.enable_force":
@@ -578,6 +582,70 @@ class RuntimeExecutor:
         safe_retract(
             direction_xyz=tuple(component / norm for component in normal), distance_m=distance_m
         )
+
+    def _verify_grasp(self, operation: str, arguments: Mapping[str, Any]) -> None:
+        """Interpret gripper evidence through an approved local profile.
+
+        Binding replaces ``$object``/``$gripper`` before this method runs, but
+        :meth:`_bound_entity` deliberately accepts either placeholders or exact
+        bound IDs.  No geometry or thresholds come from the primitive arguments.
+        """
+
+        if self.force_supervisor.force_active:
+            raise ForceSafetyError("grasp verification requires force mode to be disabled")
+        profile_id = str(_get(arguments, "verification_profile_id"))
+        profile = self.context.verification_profiles.get(profile_id)
+        if profile is None:
+            raise ProfileNotApprovedError(
+                f"grasp verification profile {profile_id!r} is not approved"
+            )
+        configured_profile_id = _get(profile, "profile_id")
+        if configured_profile_id is not None and str(configured_profile_id) != profile_id:
+            raise ProfileNotApprovedError(
+                "grasp verification profile registry key does not match profile_id"
+            )
+        object_binding = self._bound_entity(
+            _get(arguments, "object", "object_id", default="$object"), EntityKind.OBJECT
+        )
+        tool_binding = self._bound_entity(
+            _get(arguments, "tool", "tool_id", default="$gripper"), EntityKind.TOOL
+        )
+        state = self._require_gripper().get_state()
+        if not bool(_get(state, "connected", default=False)):
+            raise RuntimeSafetyError("grasp verification requires a connected gripper")
+
+        details = {
+            "object_id": object_binding.entity_id,
+            "tool_id": tool_binding.entity_id,
+            "verification_profile_id": profile_id,
+        }
+        recorded_tool_id = self.context.attachment_states.get(object_binding.entity_id)
+        if recorded_tool_id is not None and recorded_tool_id != tool_binding.entity_id:
+            raise RuntimeSafetyError(
+                f"object {object_binding.entity_id!r} is tracked by a different tool"
+            )
+        if operation == "grasp.verify_holding":
+            if not bool(_get(profile, "require_holding_signal", default=True)):
+                raise ProfileNotApprovedError(
+                    "current runtime supports only profiles requiring a holding signal"
+                )
+            if not bool(_get(state, "is_holding", default=False)):
+                raise RuntimeSafetyError(
+                    f"grasp holding verification failed for {object_binding.entity_id!r}"
+                )
+            self.context.attachment_states[object_binding.entity_id] = tool_binding.entity_id
+            self.event_sink.record("grasp_holding_verified", details)
+            return
+
+        minimum_width_m = self._profile_number(profile, "minimum_released_width_m")
+        observed_width_m = float(_get(state, "width_m"))
+        if observed_width_m < minimum_width_m:
+            raise RuntimeSafetyError(
+                "grasp release verification failed: observed gripper width is below "
+                "the approved profile threshold"
+            )
+        self.context.attachment_states.pop(object_binding.entity_id, None)
+        self.event_sink.record("grasp_release_verified", details)
 
     def _bound_entity(self, reference: Any, kind: EntityKind) -> EntityBinding:
         if isinstance(reference, str) and reference in self.context.bindings:

@@ -105,6 +105,28 @@
     .run-steps .current { color: var(--accent); font-weight: 700; }
     .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
     .create-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 18px; margin-top: 26px; }
+    .create-tabs { display: flex; gap: 8px; margin-top: 22px; }
+    .create-mode[hidden] { display: none; }
+    .block-layout { display: grid; grid-template-columns: minmax(250px, .7fr) minmax(0, 1.3fr); gap: 18px; margin-top: 18px; }
+    .block-palette { display: grid; gap: 8px; }
+    .block-palette select { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
+    .block-list { display: grid; gap: 10px; }
+    .block-card { padding: 14px; border: 1px solid #cbbbea; border-left: 4px solid var(--accent); border-radius: 11px; background: var(--accent-soft); }
+    .block-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+    .block-card-head strong { font: 650 13px ui-monospace, monospace; }
+    .block-parameters { display: grid; gap: 9px; }
+    .binding-editor { display: grid; gap: 9px; padding-top: 10px; border-top: 1px solid var(--border); }
+    .binding-list { display: grid; gap: 9px; }
+    .binding-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .binding-grid .wide { grid-column: 1 / -1; }
+    .schema-field { display: grid; gap: 5px; padding-left: 10px; border-left: 2px solid var(--border); color: var(--muted); font-size: 12px; }
+    .schema-field > input, .schema-field > select { width: 100%; padding: 8px 9px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .schema-object { display: grid; gap: 8px; }
+    .schema-array { display: grid; gap: 8px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; }
+    .schema-array-item { padding: 8px; border-radius: 8px; background: #ffffff70; }
+    .editor-result { max-height: 260px; overflow: auto; white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; }
+    .parameter-editor { margin-top: 24px; }
+    .parameter-editor[hidden] { display: none; }
     .form-grid { display: grid; gap: 12px; }
     .form-grid label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
     .form-grid input, .form-grid select, .form-grid textarea { width: 100%; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; color: var(--text); background: var(--bg); font: inherit; }
@@ -139,6 +161,11 @@
     .teaching-image { cursor: crosshair; }
     .point-overlay { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
     .point-marker { position: absolute; width: 22px; height: 22px; display: grid; place-items: center; transform: translate(-50%, -50%); border: 2px solid white; border-radius: 50%; color: white; background: var(--accent); box-shadow: 0 1px 6px #0009; font: 800 10px ui-monospace, monospace; }
+    .finger-marker { position: absolute; min-width: 112px; padding: 4px 7px; transform: translate(-50%, -50%); border: 2px solid white; border-radius: 999px; color: white; box-shadow: 0 1px 7px #000b; font: 800 10px ui-monospace, monospace; white-space: nowrap; }
+    .finger-marker.thumb { background: #d65a88e8; }
+    .finger-marker.index { background: #2783bce8; }
+    .finger-readout { position: absolute; left: 10px; right: 10px; bottom: 10px; padding: 7px 9px; border-radius: 8px; color: white; background: #17131fe8; font: 700 10px/1.45 ui-monospace, monospace; text-align: left; }
+    .finger-readout.uncertain { color: #ffd58f; }
     .geometry-teaching { margin-top: 14px; padding: 16px; border: 1px solid #cbbbea; border-radius: 13px; background: var(--accent-soft); }
     .geometry-teaching[hidden] { display: none; }
     .geometry-teaching h3 { margin: 0 0 7px; font-size: 16px; }
@@ -155,6 +182,7 @@
       main { padding: 32px 18px 56px; }
       .monitor-grid { grid-template-columns: 1fr; }
       .create-layout { grid-template-columns: 1fr; }
+      .block-layout { grid-template-columns: 1fr; }
       .camera-grid { grid-template-columns: 1fr; }
       .draft-semantic-grid { grid-template-columns: 1fr; }
     }
@@ -208,18 +236,22 @@
           <p id="draft-next-action" class="draft-next-action"></p>
           <div class="actions">
             <button id="review-draft-recording" type="button" class="button">녹화 다시 보기</button>
-            <button id="auto-surface-calibration" type="button" class="button">Depth 평면 자동 추출</button>
-            <button id="start-surface-calibration" type="button" class="button">표면 TF 보정</button>
+            <button id="auto-surface-calibration" type="button" class="button">Depth 평면 보조 힌트</button>
+            <button id="start-surface-calibration" type="button" class="button">수동 3점 task-plane TF</button>
             <button id="start-path-teaching" type="button" class="button">경로 티칭 시작</button>
-            <button id="auto-tcp-path" type="button" class="button">GPT TCP 경로 적용</button>
+            <button id="auto-tcp-path" type="button" class="button">MediaPipe RGB-D 경로 적용</button>
             <button id="register-draft-candidate" type="button" class="button primary" disabled>Candidate로 등록</button>
           </div>
         </section>
       </section>
 
       <section id="page-create" class="page" hidden>
-        <header><p class="eyebrow">02 · TEACHING REVIEW</p><h1>녹화로 스킬 초안 만들기</h1><p class="subtitle">저장된 RGB-D 시퀀스를 확인하고 시간 정렬된 대표 RGB + Depth 컬러맵 쌍을 GPT에 보내 의미 기반 스킬 초안을 만듭니다. API 키와 로컬 파일 경로는 브라우저에 노출되지 않습니다.</p></header>
-        <div class="create-layout">
+        <header><p class="eyebrow">02 · SKILL AUTHORING</p><h1>스킬 만들기</h1><p class="subtitle">RGB-D 녹화를 분석하거나, 승인된 primitive를 순서대로 조립해 Mock-only Candidate를 만듭니다.</p></header>
+        <div class="create-tabs" role="tablist" aria-label="스킬 생성 방식">
+          <button id="create-recording-tab" type="button" class="chip" role="tab" aria-selected="true">RGB-D 녹화</button>
+          <button id="create-block-tab" type="button" class="chip" role="tab" aria-selected="false">순차 블록</button>
+        </div>
+        <div id="recording-create-mode" class="create-mode create-layout">
           <div class="panel">
             <p class="eyebrow">RECORDED RGB-D</p>
             <div class="recording-picker">
@@ -250,7 +282,7 @@
                 <button id="save-geometry-evidence" type="button" class="button primary" disabled>증거 저장</button>
                 <button id="cancel-geometry-teaching" type="button" class="button">취소</button>
               </div>
-              <p class="notice">이 보정과 경로는 surface-relative Candidate/Mock 검증용입니다. 실제 로봇 실행에는 ROS TF의 robot_base → surface와 별도 hand-eye 검증이 필요합니다.</p>
+              <p class="notice">이 보정과 경로는 task-plane-relative Candidate/Mock 검증용입니다. 실제 로봇 실행에는 검증된 base → flange → camera → task-plane chain과 별도 하드웨어 검증이 필요합니다.</p>
             </section>
           </div>
           <form id="recording-skill-form" class="panel form-grid">
@@ -262,17 +294,59 @@
             <label>작업 설명
               <textarea id="draft-instruction" maxlength="2000" required placeholder="예: 걸레로 테이블 표면을 왼쪽에서 오른쪽으로 닦는 동작"></textarea>
             </label>
-            <label>GPT에 보낼 대표 RGB-D 프레임 쌍 수
-              <input id="draft-keyframe-count" type="number" min="1" max="300" step="1" value="100" required>
+            <label>GPT에 보낼 RGB 이미지 수 (고정)
+              <input id="draft-keyframe-count" type="number" min="1" max="1" step="1" value="1" readonly required>
             </label>
             <button id="analyze-recording" type="submit" class="button primary" disabled>GPT로 분석해 스킬 초안 만들기</button>
-            <p class="notice">현재 모델은 video input을 지원하지 않아 최대 300쌍의 RGB → 정렬 Depth 컬러맵 이미지를 시간순으로 보냅니다. 이미지 입력이 거부되면 RGB-D ZIP을 로컬에 보관하고 PDF 콘택트시트로 자동 재전송합니다.</p>
-            <p class="notice">TCP 티칭: 엄지와 검지 등 두 손가락을 집게 jaw처럼 의도적으로 펴고, 두 fingertip이 함께 보이도록 움직여 주세요. 분석은 두 끝점의 중점을 정성적 TCP 프록시로 추적하지만 로봇 좌표로 사용하지 않습니다.</p>
+            <p class="notice">LLM에는 첫 RGB 한 장과 전체 녹화의 엄지(4)·검지(8) image-space trace만 보냅니다. aligned Depth, 3D 거리, open/closed 상태와 실행 좌표는 로컬에만 남습니다.</p>
+            <p class="notice">두 손가락 TCP 티칭: 엄지와 검지를 집게 jaw처럼 의도적으로 펴고 두 fingertip이 함께 보이도록 움직여 주세요. 로컬 MediaPipe+Depth가 각 끝점을 별도로 3D 복원하고 중점을 TCP 경로로 사용합니다.</p>
             <p class="notice">이 단계의 결과는 실행 불가 semantic draft입니다. 실제 스킬 승격에는 로컬 robot/tool pose, TF 및 안전 검증이 추가로 필요합니다.</p>
             <p id="draft-status" class="recording-status" role="status" aria-live="polite">녹화를 선택해 주세요.</p>
             <pre id="draft-result" class="draft-result" hidden></pre>
           </form>
         </div>
+        <section id="block-create-mode" class="create-mode block-layout" hidden>
+          <form id="block-skill-form" class="panel form-grid">
+            <p class="eyebrow">SEQUENTIAL BLOCK SKILL</p>
+            <label>스킬 ID
+              <input id="block-skill-id" type="text" value="block_skill" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}" maxlength="64" required autocomplete="off">
+            </label>
+            <label>표시 이름
+              <input id="block-skill-name" type="text" value="순차 블록 스킬" maxlength="120" required>
+            </label>
+            <label>설명
+              <textarea id="block-skill-description" maxlength="2000" required>승인된 primitive를 순서대로 실행하는 스킬</textarea>
+            </label>
+            <label>스킬 유형
+              <select id="block-skill-type">
+                <option value="composite">composite</option>
+                <option value="motion">motion</option>
+                <option value="manipulation">manipulation</option>
+                <option value="contact">contact</option>
+                <option value="inspection">inspection</option>
+                <option value="recovery">recovery</option>
+              </select>
+            </label>
+            <div class="block-palette">
+              <label for="block-operation-select">승인 primitive 추가</label>
+              <select id="block-operation-select"><option value="">catalog 로딩 중…</option></select>
+              <button id="add-skill-block" type="button" class="button">블록 추가</button>
+            </div>
+            <section class="binding-editor" aria-labelledby="block-binding-title">
+              <div><p id="block-binding-title" class="eyebrow">TYPED BINDINGS</p><p class="notice">블록 인수의 $placeholder를 자동 수집합니다. 각 placeholder의 Scene entity 종류와 선택 제약을 지정하세요.</p></div>
+              <div id="block-binding-list" class="binding-list"><p class="empty">블록을 추가하면 binding 항목이 표시됩니다.</p></div>
+            </section>
+            <p class="notice">loop·분기·임의 함수·Python·JSON 코드 입력은 지원하지 않습니다. 속도·가속도·힘은 숫자가 아니라 로컬 승인 profile ID만 선택합니다.</p>
+          </form>
+          <div class="panel">
+            <div class="detail-head">
+              <div><p class="eyebrow">ORDERED BLOCKS</p><p class="subtitle">위에서 아래 순서로만 실행됩니다.</p></div>
+              <div class="actions"><button id="preview-skill-blocks" type="button" class="button">검증 미리보기</button><button id="create-block-candidate" type="button" class="button primary">Candidate 생성</button></div>
+            </div>
+            <div id="skill-block-list" class="block-list"><p class="empty">primitive 블록을 추가해 주세요.</p></div>
+            <pre id="block-editor-result" class="draft-result editor-result" hidden></pre>
+          </div>
+        </section>
       </section>
 
       <section id="page-detail" class="page" hidden>
@@ -281,6 +355,16 @@
           <button id="validate-skill" type="button" class="button primary">전체 Mock 검증</button>
         </div>
         <div id="detail-nodes" class="nodes"></div>
+        <section id="parameter-editor" class="panel parameter-editor" hidden>
+          <p class="eyebrow">IMMUTABLE PARAMETER CANDIDATE</p>
+          <p class="notice">활성/부모 버전은 수정하지 않습니다. 선택한 노드의 typed 인수를 검증한 뒤 새 child Candidate를 만듭니다.</p>
+          <label class="form-grid">편집할 노드
+            <select id="parameter-node-select"></select>
+          </label>
+          <div id="parameter-fields" class="block-parameters"></div>
+          <div class="actions"><button id="create-parameter-candidate" type="button" class="button primary">새 Parameter Candidate 생성</button></div>
+          <pre id="parameter-editor-result" class="draft-result editor-result" hidden></pre>
+        </section>
         <div class="actions">
           <button id="activate-skill" type="button" class="button primary">검증 후 활성화</button>
           <button type="button" class="button" data-page="skills">목록으로</button>

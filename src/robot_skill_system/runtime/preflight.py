@@ -272,6 +272,7 @@ class PreflightValidator:
         skill_uses_force: bool = False,
         motion_profiles: Mapping[str, Any] | None = None,
         force_profiles: Mapping[str, Any] | None = None,
+        verification_profiles: Mapping[str, Any] | None = None,
         safety_policy: Any | None = None,
         robot_backend: str = "doosan",
         enable_real_robot: bool = True,
@@ -412,6 +413,7 @@ class PreflightValidator:
                 bindings,
                 motion_profiles or {},
                 force_profiles or {},
+                verification_profiles or {},
                 skill_uses_force=skill_uses_force,
             )
         )
@@ -504,25 +506,31 @@ class PreflightValidator:
         bindings: Mapping[str, EntityBinding],
         motion_profiles: Mapping[str, Any],
         force_profiles: Mapping[str, Any],
+        verification_profiles: Mapping[str, Any],
         *,
         skill_uses_force: bool,
     ) -> list[ValidationCheck]:
         checks: list[ValidationCheck] = []
         required_motion = set(_get(skill, "motion_profiles", default=()) or ())
         required_force = set(_get(skill, "force_profiles", default=()) or ())
+        required_verification: set[str] = set()
         for node in _get(skill, "nodes", default=()) or ():
             operation = str(_get(node, "operation", default=""))
             arguments = _get(node, "arguments", "parameters", default={})
             motion_id = _get(arguments, "motion_profile_id", "profile_id")
             force_id = _get(arguments, "force_profile_id")
+            verification_id = _get(arguments, "verification_profile_id")
             if (
                 operation.startswith("motion.") or operation == "contact.follow_path"
             ) and isinstance(motion_id, str):
                 required_motion.add(motion_id)
             if operation.startswith("contact.") and isinstance(force_id, str):
                 required_force.add(force_id)
+            if operation.startswith("grasp.") and isinstance(verification_id, str):
+                required_verification.add(verification_id)
         missing_motion = sorted(required_motion - set(motion_profiles))
         missing_force = sorted(required_force - set(force_profiles))
+        missing_verification = sorted(required_verification - set(verification_profiles))
         checks.append(
             ValidationCheck(
                 "motion_profiles_loaded",
@@ -543,6 +551,16 @@ class PreflightValidator:
                     if skill_uses_force and not required_force
                     else "all required profiles loaded"
                 ),
+            )
+        )
+        checks.append(
+            ValidationCheck(
+                "grasp_verification_profiles_loaded",
+                not missing_verification,
+                "approved_configuration",
+                f"missing={missing_verification}"
+                if missing_verification
+                else "all required profiles loaded",
             )
         )
         if not skill_uses_force:

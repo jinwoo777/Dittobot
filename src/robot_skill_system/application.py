@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
 import re
 import threading
 import time
@@ -18,29 +20,49 @@ from sqlalchemy import select
 from robot_skill_system.adapters.mock_robot import MockGripperAdapter, MockRobotAdapter
 from robot_skill_system.calibration.controller import HandEyeCalibrationController
 from robot_skill_system.calibration.robot import DoosanHandEyeCalibrationRobot
+from robot_skill_system.calibration.task_plane import (
+    camera_stationarity_diagnostics,
+    compose_base_task_plane,
+    rigid_transform_from_matrix,
+    task_plane_normal_hint_diagnostics,
+)
 from robot_skill_system.capture.realsense_capture import (
     RealSenseCapture,
     RealSenseCaptureConfig,
 )
-from robot_skill_system.capture.rgb_frame_transport import (
-    build_rgbd_contact_sheet_pdf,
-    build_rgbd_keyframe_zip,
-)
 from robot_skill_system.capture.rgbd_recording import RGBDCameraController
 from robot_skill_system.demonstrations.models import (
     DemonstrationTrajectory,
+    PoseSample,
     ProcessedTrajectory,
 )
 from robot_skill_system.demonstrations.models import (
     PrimitiveRecommendation as LocalPrimitiveRecommendation,
 )
-from robot_skill_system.demonstrations.preprocessing import preprocess_trajectory
-from robot_skill_system.demonstrations.primitive_fitter import recommend_primitive
+from robot_skill_system.demonstrations.path_simplification import (
+    DEFAULT_PATH_SIMPLIFICATION_TOLERANCE_M,
+    simplify_anchor_relative_path,
+)
+from robot_skill_system.demonstrations.preprocessing import (
+    PreprocessingConfig,
+    TrajectoryPreprocessingError,
+    preprocess_trajectory,
+)
+from robot_skill_system.demonstrations.primitive_fitter import (
+    PrimitiveFittingError,
+    fit_periodic_primitive_geometry,
+    recommend_primitive,
+)
 from robot_skill_system.demonstrations.quality import (
     QualityAssessment,
     assess_trajectory_quality,
 )
 from robot_skill_system.demonstrations.recorder import load_demonstration
+from robot_skill_system.demonstrations.rgbd_dataset import (
+    RGBDDatasetSegmentation,
+    load_rgbd_dataset,
+    segment_rgbd_dataset,
+)
 from robot_skill_system.demonstrations.rgbd_geometry import (
     ManualTCPPathSample,
     PixelPoint,
@@ -51,6 +73,10 @@ from robot_skill_system.demonstrations.rgbd_geometry import (
     validate_surface_relative_path,
 )
 from robot_skill_system.demonstrations.segmentation import segment_trajectory
+from robot_skill_system.demonstrations.stage_segmentation import (
+    GripActionEndSegmentationConfig,
+    GripActionEndSegmentationError,
+)
 from robot_skill_system.demonstrations.synthetic import (
     generate_expert_wipe_trajectory,
     generate_novice_wipe_trajectory,
@@ -60,6 +86,7 @@ from robot_skill_system.demonstrations.trajectory import (
     TrajectorySummary,
     summarize_trajectory,
 )
+from robot_skill_system.exceptions import NotConfiguredError, RobotSkillError
 from robot_skill_system.openai_integration.demonstration_analyzer import DemonstrationAnalyzer
 from robot_skill_system.openai_integration.embeddings import (
     SkillEmbeddingService,
@@ -78,19 +105,32 @@ from robot_skill_system.openai_integration.recording_skill_analyzer import (
     RecordingSkillDraftAnalyzer,
 )
 from robot_skill_system.openai_integration.schemas import (
+    MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES,
     DemonstrationAnalysisInput,
     RecordingSkillDraftInput,
 )
-from robot_skill_system.perception.hand_pose import MediaPipeHandPoseEstimator
+from robot_skill_system.openai_integration.task_intent_resolver import TaskIntentResolver
+from robot_skill_system.openai_integration.training_semantics import (
+    TrainingSemanticResolver,
+    TrainingTaskSemantics,
+)
+from robot_skill_system.perception.hand_pose import (
+    FingerObservation,
+    MediaPipeHandPoseEstimator,
+)
+from robot_skill_system.perception.semantic_anchor import (
+    reconstruct_semantic_roi_anchor,
+)
 from robot_skill_system.primitives.models import SafetyPolicy
 from robot_skill_system.primitives.profiles import (
     load_force_profiles,
+    load_grasp_verification_profiles,
     load_motion_profiles,
     load_safety_policies,
 )
 from robot_skill_system.primitives.registry import get_default_registry
 from robot_skill_system.runtime.binder import EntityBinder
-from robot_skill_system.runtime.errors import ExecutionAbortedError
+from robot_skill_system.runtime.errors import ExecutionAbortedError, RuntimeErrorBase
 from robot_skill_system.runtime.event_log import InMemoryEventSink
 from robot_skill_system.runtime.executor import RuntimeExecutor
 from robot_skill_system.runtime.force_supervisor import GlobalForceSupervisor
@@ -98,9 +138,19 @@ from robot_skill_system.runtime.integrity import verify_skill_checksum
 from robot_skill_system.runtime.models import ExecutionMode, RuntimeContext
 from robot_skill_system.runtime.preflight import PreflightValidator
 from robot_skill_system.runtime.safety_supervisor import GlobalSafetySupervisor
+from robot_skill_system.runtime.task_flow_materializer import (
+    TaskFlowMaterializer,
+)
 from robot_skill_system.runtime.workspace_monitor import GlobalWorkspaceSupervisor
-from robot_skill_system.scene.models import SceneSnapshot
-from robot_skill_system.scene.transforms import RigidTransform
+from robot_skill_system.scene.models import (
+    Pose,
+    Quaternion,
+    SceneSnapshot,
+    SurfaceInstance,
+    SurfaceRole,
+    Vector3,
+)
+from robot_skill_system.scene.transforms import RigidTransform, rotate_vector
 from robot_skill_system.settings import ExecutionMode as SettingsExecutionMode
 from robot_skill_system.settings import Settings
 from robot_skill_system.skills.compiler import SkillCompiler
@@ -117,20 +167,27 @@ from robot_skill_system.skills.models import (
     ValidationReport,
     ValidationStatus,
 )
+from robot_skill_system.skills.promotion import PromotionPolicy
 from robot_skill_system.skills.retrieval import (
     SkillCandidate,
     SkillSearchQuery,
     rank_skills,
 )
 from robot_skill_system.skills.updater import SkillUpdater, UpdateEvidence
-from robot_skill_system.skills.versioning import stable_version
+from robot_skill_system.skills.versioning import SemanticVersion, stable_version
 from robot_skill_system.storage.artifact_store import LocalArtifactStore
 from robot_skill_system.storage.database import Database, StorageRepository
+from robot_skill_system.storage.grip_point_importer import GripPointResultImporter
 from robot_skill_system.storage.orm import (
+    ActionEndMappingRecord,
     ExecutionRunRecord,
+    GripProfileVersionRecord,
     SceneRecord,
+    SemanticCatalogRecord,
     SkillRecord,
     SkillVersionRecord,
+    StageDefinitionRecord,
+    TeachingSessionRecord,
 )
 from robot_skill_system.vertical_slice import build_wipe_skill_graph, capture_mock_scene
 
@@ -147,6 +204,7 @@ class DemonstrationEvidence:
     quality: QualityAssessment
     summary: TrajectorySummary
     recommendation: LocalPrimitiveRecommendation
+    promotion_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +235,7 @@ class MVPApplication:
         self._scenes: dict[str, SceneSnapshot] = {}
         self._active_executions: dict[str, ActiveExecution] = {}
         self._active_execution_lock = threading.RLock()
+        self._recording_flange_starts: dict[str, dict[str, Any]] = {}
         real_sense_config = RealSenseCaptureConfig(
             width_px=settings.realsense_width_px,
             height_px=settings.realsense_height_px,
@@ -347,6 +406,41 @@ class MVPApplication:
     def get_handeye_calibration_status(self) -> dict[str, Any]:
         return self.calibration_controller.status()
 
+    def list_task_planes(self) -> dict[str, Any]:
+        """List operator-confirmed task-plane revisions and their base-chain status."""
+
+        root = self.store.root / "demonstrations"
+        task_planes: list[dict[str, Any]] = []
+        if root.is_dir():
+            for path in root.glob(
+                "rgbd_*/skill_drafts/draft_*_evidence/surface_calibration_*.json"
+            ):
+                try:
+                    evidence = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if (
+                    not isinstance(evidence, dict)
+                    or evidence.get("transform_convention")
+                    != "T_camera_task_plane"
+                    or evidence.get("operator_confirmed") is not True
+                ):
+                    continue
+                task_planes.append(
+                    {
+                        **evidence,
+                        "artifact_uri": path.relative_to(self.store.root).as_posix(),
+                    }
+                )
+        task_planes.sort(
+            key=lambda item: int(item.get("created_at_ns") or 0), reverse=True
+        )
+        return {
+            "task_planes": task_planes,
+            "count": len(task_planes),
+            "ros_tf_published": False,
+        }
+
     def start_handeye_calibration(self, request: dict[str, Any]) -> dict[str, Any]:
         required = ("operator_confirmed", "board_secured", "workspace_cleared", "estop_ready")
         if not all(request.get(key) is True for key in required):
@@ -381,12 +475,103 @@ class MVPApplication:
         return self.camera_controller.iter_mjpeg(kind)
 
     def start_camera_recording(self, request: dict[str, Any]) -> dict[str, Any]:
-        return self.camera_controller.start_recording(
-            maximum_duration_s=float(request.get("maximum_duration_s", 30.0))
+        maximum_duration_s = float(request.get("maximum_duration_s", 30.0))
+        maximum_trace_frames = math.ceil(
+            maximum_duration_s
+            * self.settings.realsense_recording_frames_per_second
         )
+        if maximum_trace_frames > MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES:
+            raise ValueError(
+                "recording would exceed the full-frame fingertip trace limit: "
+                f"{maximum_trace_frames} > "
+                f"{MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES}; reduce duration or "
+                "REALSENSE_RECORDING_FRAMES_PER_SECOND"
+            )
+        summary = self.camera_controller.start_recording(
+            maximum_duration_s=maximum_duration_s
+        )
+        recording_id = str(summary["recording_id"])
+        start_snapshot = self._teaching_flange_snapshot()
+        self._recording_flange_starts[recording_id] = start_snapshot
+        return {**summary, "teaching_camera_pose_start": start_snapshot}
 
     def stop_camera_recording(self, recording_id: str) -> dict[str, Any]:
-        return self.camera_controller.stop_recording(recording_id)
+        summary = self.camera_controller.stop_recording(recording_id)
+        start_snapshot = self._recording_flange_starts.pop(
+            recording_id,
+            {
+                "available": False,
+                "reason": "recording_start_pose_unavailable_after_restart",
+            },
+        )
+        end_snapshot = self._teaching_flange_snapshot()
+        diagnostics: dict[str, Any] = {
+            "available": False,
+            "passed": False,
+            "reason": "base_to_flange_chain_unavailable",
+        }
+        if start_snapshot.get("available") is True and end_snapshot.get("available") is True:
+            diagnostics = {
+                "available": True,
+                **camera_stationarity_diagnostics(
+                    start_snapshot["base_to_flange"],
+                    end_snapshot["base_to_flange"],
+                ),
+                "active_tcp_matches": (
+                    start_snapshot.get("active_tcp_name")
+                    == end_snapshot.get("active_tcp_name")
+                ),
+            }
+            diagnostics["passed"] = bool(
+                diagnostics["passed"] and diagnostics["active_tcp_matches"]
+            )
+        evidence = {
+            "schema_version": "1.0",
+            "evidence_type": "teaching_camera_stationarity",
+            "recording_id": recording_id,
+            "start": start_snapshot,
+            "end": end_snapshot,
+            "diagnostics": diagnostics,
+            "created_at_ns": time.time_ns(),
+        }
+        artifact = self.store.put_json(
+            f"demonstrations/{recording_id}/camera_stationarity.json",
+            evidence,
+        )
+        return {
+            **summary,
+            "camera_stationarity": {
+                **evidence,
+                "artifact_uri": artifact.uri,
+                "artifact_checksum_sha256": artifact.checksum_sha256,
+            },
+        }
+
+    def _teaching_flange_snapshot(self) -> dict[str, Any]:
+        snapshot = getattr(
+            self.calibration_controller,
+            "capture_base_to_flange_snapshot",
+            None,
+        )
+        if not callable(snapshot):
+            return {
+                "available": False,
+                "reason": "robot_pose_provider_not_configured",
+                "captured_at_ns": time.time_ns(),
+            }
+        try:
+            value = snapshot()
+            return dict(value) if isinstance(value, dict) else {
+                "available": False,
+                "reason": "robot_pose_provider_returned_invalid_data",
+                "captured_at_ns": time.time_ns(),
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "reason": f"{type(exc).__name__}: robot pose snapshot failed",
+                "captured_at_ns": time.time_ns(),
+            }
 
     def get_camera_recording(self, recording_id: str) -> dict[str, Any]:
         return self.camera_controller.get_recording(recording_id)
@@ -409,18 +594,25 @@ class MVPApplication:
             "openai_mode": self.settings.openai_mode.value,
             "api_key_configured": self.settings.openai_api_key is not None,
             "model": self.settings.openai_reasoning_model,
-            "maximum_keyframes": self.settings.openai_max_keyframes,
+            "maximum_keyframes": 1,
+            "legacy_configured_maximum_keyframes": self.settings.openai_max_keyframes,
             "image_detail": self.settings.openai_image_detail,
-            "uploads_rgb_keyframes_only": False,
-            "uploads_rgb_and_aligned_depth_pairs": True,
-            "image_pair_order": "rgb_then_aligned_depth_per_keyframe",
-            "tcp_proxy_mode": "two_finger_gripper_midpoint_semantic_only",
+            "uploads_rgb_keyframes_only": True,
+            "uploads_rgb_and_aligned_depth_pairs": False,
+            "uploaded_rgb_frame_count": 1,
+            "maximum_compact_trace_frames": MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES,
+            "uploaded_frame_policy": "first_manifest_rgb_only",
+            "request_keyframe_count_is_deprecated_and_ignored": True,
+            "depth_stays_local": True,
+            "tcp_proxy_mode": "full_recording_local_thumb_index_trace",
             "provider_video_input_supported": False,
             "direct_image_transport": True,
-            "fallback_analysis_transport": "pdf_contact_sheet",
-            "creates_zip_archive_on_fallback": True,
-            "zip_is_not_used_as_vision_input": True,
+            "fallback_analysis_transport": "first_rgb_input_file",
+            "creates_zip_archive_on_fallback": False,
             "returns_frame_complete_tcp_audit": True,
+            "llm_receives_metric_finger_distance": False,
+            "local_finger_state_authoritative": True,
+            "first_frame_semantic_anchor_local_depth_verified": True,
             "returns_semantic_scene_regions": True,
             "automatic_surface_plane_backend": "local_numpy_ransac_raw_depth",
             "npy_validation_blocks_mock_candidate": False,
@@ -429,19 +621,30 @@ class MVPApplication:
         }
 
     def create_recording_skill_draft(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Create a non-executable semantic draft from bounded RGB-D frame pairs."""
+        """Analyze one first RGB frame plus all-frame local fingertip coordinates."""
 
         recording_id = str(request["recording_id"])
-        maximum_keyframes = min(
-            int(request.get("keyframe_count", 100)),
-            self.settings.openai_max_keyframes,
-        )
-        selected = self.camera_controller.select_recording_rgbd_keyframes(
-            recording_id, maximum_keyframes
-        )
         manifest = self.camera_controller.get_recording_manifest(
-            recording_id, include_frames=False
+            recording_id, include_frames=True
         )
+        manifest_frames = manifest.get("frames") or []
+        if not isinstance(manifest_frames, list) or not manifest_frames:
+            raise ValueError("RGB-D recording contains no manifest frames")
+        if len(manifest_frames) > MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES:
+            raise ValueError(
+                "skill drafting supports at most "
+                f"{MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES} full-recording trace frames"
+            )
+        if manifest.get("depth_aligned_to_color") is not True:
+            raise ValueError("full-recording fingertip tracking requires aligned depth")
+        tracking = self._track_recording_fingertips(recording_id, manifest)
+        first_frame_index = int(manifest_frames[0].get("index", 0))
+        # Loading the frame verifies both stored RGB/depth checksums.  Only the
+        # original first RGB JPEG path is supplied to the semantic model.
+        self.camera_controller.load_recording_rgbd_frame(
+            recording_id, first_frame_index
+        )
+        first_rgb_path = self.store.path_for(str(manifest_frames[0]["rgb_uri"]))
         primitive_catalog = list(get_default_registry().operation_names())
         entity_role_catalog = [
             "tool",
@@ -450,7 +653,6 @@ class MVPApplication:
             "fixture",
             "workspace_region",
         ]
-        keyframe_indices = [index for index, _rgb_path, _depth_path in selected]
         analysis_input = RecordingSkillDraftInput(
             recording_id=recording_id,
             name_hint=str(request.get("name_hint", "recorded_skill")),
@@ -464,80 +666,98 @@ class MVPApplication:
             },
             primitive_catalog=primitive_catalog,
             entity_role_catalog=entity_role_catalog,
-            keyframe_indices=keyframe_indices,
+            keyframe_indices=[first_frame_index],
+            first_frame_index=first_frame_index,
+            fingertip_trace=tracking["compact_fingertip_trace"],
+            visual_input_policy="first_rgb_plus_local_fingertip_trace",
             limitations=[
-                "RGB-D keyframes contain no trusted robot-base pose trajectory or TF chain.",
-                "Depth NPZ artifacts remain local and are not uploaded to OpenAI.",
-                "Aligned depth is uploaded only as a qualitative TURBO color visualization.",
-                "The midpoint of two visible fingertips is a semantic TCP proxy, not a pose.",
+                "Only the first RGB frame and compact thumb/index trace reach OpenAI.",
+                "Depth, metric fingertip distance, and local gripper state remain local.",
+                "The recording contains no trusted robot-base trajectory unless a separate "
+                "stationarity/base-chain artifact passes validation.",
                 "Normalized OpenAI regions are hints; local raw depth and intrinsics "
                 "own metric geometry.",
-                "A missing TCP landmark trajectory must be reported with an explicit reason.",
+                "Local geometry fitting owns MoveL, verified MoveC, and spline selection.",
                 "Force, velocity, acceleration, and execution permission remain local-only.",
             ],
         )
         draft_id = f"draft_{uuid.uuid4().hex}"
         analyzer = RecordingSkillDraftAnalyzer(self.settings)
         transport: dict[str, Any] = {
-            "mode": "direct_rgbd_images",
-            "keyframe_pair_count": len(selected),
-            "image_count": len(selected) * 2,
-            "pair_order": "rgb_then_aligned_depth_per_keyframe",
+            "mode": "first_rgb_plus_compact_fingertip_trace",
+            "first_frame_index": first_frame_index,
+            "image_count": 1,
+            "depth_image_count": 0,
+            "trace_frame_count": len(tracking["compact_fingertip_trace"]),
+            "requested_keyframe_count_ignored": request.get("keyframe_count"),
             "fallback_used": False,
         }
         try:
-            draft, metadata = analyzer.analyze(
+            draft, metadata = analyzer.analyze_first_frame_trace(
                 analysis_input,
-                rgb_paths=[rgb_path for _index, rgb_path, _depth_path in selected],
-                depth_paths=[depth_path for _index, _rgb_path, depth_path in selected],
+                first_rgb_path=first_rgb_path,
             )
         except ImageInputRejectedError:
-            transport_root = (
-                f"demonstrations/{recording_id}/skill_drafts/{draft_id}_transport"
-            )
-            zip_artifact = self.store.put_bytes(
-                f"{transport_root}/rgbd_keyframes.zip",
-                build_rgbd_keyframe_zip(recording_id, selected),
-                media_type="application/zip",
-            )
-            pdf_artifact = self.store.put_bytes(
-                f"{transport_root}/rgbd_contact_sheet.pdf",
-                build_rgbd_contact_sheet_pdf(selected),
-                media_type="application/pdf",
-            )
-            draft, metadata = analyzer.analyze_pdf(
+            draft, metadata = analyzer.analyze_first_frame_trace(
                 analysis_input,
-                contact_sheet_path=self.store.path_for(pdf_artifact.uri),
+                first_rgb_path=first_rgb_path,
+                as_file_fallback=True,
             )
             transport = {
-                "mode": "pdf_contact_sheet",
-                "keyframe_pair_count": len(selected),
-                "image_count": len(selected) * 2,
-                "pair_order": "rgb_then_aligned_depth_per_keyframe",
+                "mode": "first_rgb_input_file_plus_compact_fingertip_trace",
+                "first_frame_index": first_frame_index,
+                "image_count": 1,
+                "depth_image_count": 0,
+                "trace_frame_count": len(tracking["compact_fingertip_trace"]),
+                "requested_keyframe_count_ignored": request.get("keyframe_count"),
                 "fallback_used": True,
                 "reason": "direct_image_input_rejected",
-                "zip_archive": {
-                    "uri": zip_artifact.uri,
-                    "checksum_sha256": zip_artifact.checksum_sha256,
-                    "size_bytes": zip_artifact.size_bytes,
-                },
-                "analysis_pdf": {
-                    "uri": pdf_artifact.uri,
-                    "checksum_sha256": pdf_artifact.checksum_sha256,
-                    "size_bytes": pdf_artifact.size_bytes,
-                },
             }
+        tracking["semantic_conflicts"] = self._finger_semantic_conflicts(
+            tracking, draft.model_dump(mode="json")
+        )
+        tracking["draft_id"] = draft_id
+        evidence_root = (
+            f"demonstrations/{recording_id}/skill_drafts/{draft_id}_evidence"
+        )
+        tracking_artifact = self.store.put_json(
+            f"{evidence_root}/finger_tracking_{tracking['tracking_id']}.json",
+            tracking,
+        )
+        initial_anchors = self._reconstruct_initial_scene_anchors(
+            recording_id=recording_id,
+            frame_index=first_frame_index,
+            semantic_draft=draft.model_dump(mode="json"),
+            manifest=manifest,
+        )
+        initial_anchors["draft_id"] = draft_id
+        anchor_artifact = self.store.put_json(
+            f"{evidence_root}/initial_scene_anchors.json", initial_anchors
+        )
         artifact_payload = {
             "schema_version": "1.0",
             "draft_id": draft_id,
             "status": "semantic_draft",
             "created_at_ns": time.time_ns(),
             "source_recording_id": recording_id,
-            "keyframe_indices": keyframe_indices,
+            "keyframe_indices": [first_frame_index],
+            "full_recording_frame_count": len(manifest_frames),
             "openai_mode": self.settings.openai_mode.value,
             "openai_model": self.settings.openai_reasoning_model,
             "openai_trace_id": metadata.trace_id,
             "transport": transport,
+            "local_fingertip_tracking": {
+                "tracking_id": tracking["tracking_id"],
+                "artifact_uri": tracking_artifact.uri,
+                "artifact_checksum_sha256": tracking_artifact.checksum_sha256,
+                "valid_frame_count": tracking["valid_frame_count"],
+                "transition_count": len(tracking["state_transitions"]),
+            },
+            "initial_scene_anchors": {
+                "artifact_uri": anchor_artifact.uri,
+                "artifact_checksum_sha256": anchor_artifact.checksum_sha256,
+                "anchor_count": len(initial_anchors["anchors"]),
+            },
             "draft": draft.model_dump(mode="json"),
         }
         artifact = self.store.put_json(
@@ -560,6 +780,304 @@ class MVPApplication:
             },
             "executable": False,
             "requires_pose_trajectory": True,
+        }
+
+    def _track_recording_fingertips(
+        self,
+        recording_id: str,
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run one persistent tracker over every chronological manifest frame."""
+
+        frames = manifest.get("frames") or []
+        if not isinstance(frames, list) or not frames:
+            raise ValueError("RGB-D manifest contains no frames")
+        if manifest.get("depth_aligned_to_color") is not True:
+            raise ValueError("full-recording fingertip tracking requires aligned depth")
+        if not all(isinstance(entry, dict) for entry in frames):
+            raise ValueError("RGB-D manifest frame entries must be objects")
+        frame_indices = [
+            int(entry.get("index", sequence_index))
+            for sequence_index, entry in enumerate(frames)
+        ]
+        if len(set(frame_indices)) != len(frame_indices) or frame_indices != sorted(
+            frame_indices
+        ):
+            raise ValueError("RGB-D manifest frames must have unique chronological indices")
+        tracker = MediaPipeHandPoseEstimator(
+            minimum_detection_confidence=(
+                self.settings.mediapipe_minimum_detection_confidence
+            ),
+            minimum_tracking_confidence=(
+                self.settings.mediapipe_minimum_tracking_confidence
+            ),
+            close_threshold_m=self.settings.finger_close_threshold_m,
+            stable_frames=self.settings.finger_state_stable_frames,
+            maximum_timestamp_skew_ns=int(
+                self.settings.rgbd_max_timestamp_delta_ms * 1_000_000
+            ),
+        )
+        observations: list[dict[str, Any]] = []
+        compact_trace: list[dict[str, Any]] = []
+        transitions: list[dict[str, Any]] = []
+        invalid_frames: list[dict[str, Any]] = []
+        optional_error: str | None = None
+        try:
+            for sequence_index, entry in enumerate(frames):
+                frame_index = int(entry.get("index", sequence_index))
+                result = None
+                observation = None
+                frame_error: str | None = None
+                frame = None
+                try:
+                    frame = self.camera_controller.load_recording_rgbd_frame(
+                        recording_id, frame_index
+                    )
+                except (KeyError, OSError, TypeError, ValueError) as exc:
+                    frame_error = f"{type(exc).__name__}: {exc}"
+                if frame is not None and optional_error is None:
+                    try:
+                        result = tracker.track(frame)
+                        observation = result.observation
+                    except NotConfiguredError as exc:
+                        optional_error = str(exc)
+                        frame_error = "mediapipe_not_configured"
+                elif frame is not None and optional_error is not None:
+                    frame_error = "mediapipe_not_configured"
+
+                if observation is None:
+                    if frame is not None:
+                        timestamp_ns = frame.timestamp_ns
+                        frame_number = frame.frame_number
+                        reference_frame = frame.reference_frame
+                    else:
+                        color_timestamp_ns = int(entry.get("color_timestamp_ns") or 0)
+                        depth_timestamp_ns = int(entry.get("depth_timestamp_ns") or 0)
+                        timestamp_ns = (color_timestamp_ns + depth_timestamp_ns) // 2
+                        raw_frame_number = entry.get("frame_number")
+                        frame_number = (
+                            int(raw_frame_number)
+                            if raw_frame_number is not None
+                            else frame_index
+                        )
+                        reference_frame = str(
+                            entry.get("reference_frame")
+                            or "camera_color_optical_frame"
+                        )
+                    decision = tracker.state_stabilizer.update(
+                        None,
+                        frame_number=frame_number,
+                        timestamp_ns=timestamp_ns,
+                    )
+                    observation = FingerObservation(
+                        frame_number=frame_number,
+                        timestamp_ns=timestamp_ns,
+                        reference_frame=reference_frame,
+                        status="uncertain",
+                        stabilization_progress_frames=0,
+                        required_stable_frames=(
+                            self.settings.finger_state_stable_frames
+                        ),
+                        invalid_reason=(
+                            frame_error
+                            or (
+                                "mediapipe_not_configured"
+                                if optional_error is not None
+                                else "frame_geometry_unavailable"
+                            )
+                        ),
+                        stable_state=decision.stable_state,
+                        confidence=0.0,
+                    )
+                observation_payload = observation.model_dump(mode="json")
+                observation_payload["frame_index"] = frame_index
+                observation_payload["hand_pose"] = (
+                    result.hand_pose.model_dump(mode="json")
+                    if result is not None and result.hand_pose is not None
+                    else None
+                )
+                observations.append(observation_payload)
+                trace_item = observation.to_compact_landmark_trace()
+                trace_item["frame_index"] = frame_index
+                compact_trace.append(trace_item)
+                if observation.status == "uncertain":
+                    invalid_frames.append(
+                        {
+                            "frame_index": frame_index,
+                            "timestamp_ns": observation.timestamp_ns,
+                            "reason": observation.invalid_reason,
+                        }
+                    )
+                if result is not None and result.transition is not None:
+                    transition = result.transition.model_dump(mode="json")
+                    transition["frame_index"] = frame_index
+                    transitions.append(transition)
+        finally:
+            tracker.close()
+        return {
+            "schema_version": "1.0",
+            "evidence_type": "mediapipe_rgbd_full_recording_fingertip_tracking",
+            "tracking_id": f"finger_{uuid.uuid4().hex}",
+            "recording_id": recording_id,
+            "processed_frame_count": len(frames),
+            "valid_frame_count": sum(
+                item.get("status") == "valid" for item in observations
+            ),
+            "finger_observations": observations,
+            "compact_fingertip_trace": compact_trace,
+            "state_transitions": transitions,
+            "invalid_frames": invalid_frames,
+            "optional_dependency_error": optional_error,
+            "semantic_conflicts": [],
+            "settings": {
+                "thumb_tip_landmark_index": 4,
+                "index_tip_landmark_index": 8,
+                "depth_patch_size_px": 5,
+                "close_threshold_m": self.settings.finger_close_threshold_m,
+                "closed_comparison": "distance_m <= close_threshold_m",
+                "open_comparison": "distance_m > close_threshold_m",
+                "stable_frames": self.settings.finger_state_stable_frames,
+                "minimum_detection_confidence": (
+                    self.settings.mediapipe_minimum_detection_confidence
+                ),
+                "minimum_tracking_confidence": (
+                    self.settings.mediapipe_minimum_tracking_confidence
+                ),
+                "static_image_mode": False,
+                "max_num_hands": 1,
+            },
+            "metric_state_authority": "local_mediapipe_landmarks_plus_aligned_depth",
+            "llm_trace_excludes_depth_distance_and_state": True,
+            "created_at_ns": time.time_ns(),
+        }
+
+    @staticmethod
+    def _finger_semantic_conflicts(
+        tracking: dict[str, Any], semantic_draft: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        observations = {
+            int(item["frame_index"]): item
+            for item in tracking.get("finger_observations") or []
+            if isinstance(item, dict) and item.get("frame_index") is not None
+        }
+        tcp = semantic_draft.get("tcp_proxy_observation") or {}
+        conflicts: list[dict[str, Any]] = []
+        for state in tcp.get("observed_states") or []:
+            if not isinstance(state, dict):
+                continue
+            frame_index = int(state.get("frame_index") or 0)
+            local = observations.get(frame_index)
+            semantic_state = state.get("gripper_state")
+            local_state = local.get("candidate_state") if local else None
+            if (
+                semantic_state in {"open", "closed"}
+                and local_state in {"open", "closed"}
+                and semantic_state != local_state
+            ):
+                conflicts.append(
+                    {
+                        "frame_index": frame_index,
+                        "semantic_state": semantic_state,
+                        "local_metric_state": local_state,
+                        "resolution": "local_metric_state_wins",
+                    }
+                )
+        return conflicts
+
+    def _reconstruct_initial_scene_anchors(
+        self,
+        *,
+        recording_id: str,
+        frame_index: int,
+        semantic_draft: dict[str, Any],
+        manifest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Turn first-frame semantic ROIs into local, unconfirmed metric evidence."""
+
+        frame = self.camera_controller.load_recording_rgbd_frame(
+            recording_id, frame_index
+        )
+        manifest_frames = manifest.get("frames") or []
+        frame_entry = next(
+            (
+                item
+                for sequence_index, item in enumerate(manifest_frames)
+                if int(item.get("index", sequence_index)) == frame_index
+            ),
+            None,
+        )
+        if not isinstance(frame_entry, dict):
+            raise ValueError("first semantic frame is outside the recording manifest")
+        scene = semantic_draft.get("scene_observation") or {}
+        anchors: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for role, field in (
+            ("tool", "tool"),
+            ("target_object", "target_object"),
+            ("target_surface", "work_surface"),
+        ):
+            observation = scene.get(field)
+            if not isinstance(observation, dict) or observation.get("detected") is not True:
+                continue
+            region = observation.get("region_normalized")
+            if not isinstance(region, dict):
+                warnings.append(f"{role}: semantic ROI missing")
+                continue
+            bounds = (
+                float(region["x_min"]),
+                float(region["y_min"]),
+                float(region["x_max"]),
+                float(region["y_max"]),
+            )
+            try:
+                metric = reconstruct_semantic_roi_anchor(frame, bounds)
+            except (KeyError, TypeError, ValueError) as exc:
+                warnings.append(f"{role}: {exc}")
+                continue
+            anchors.append(
+                {
+                    "anchor_id": f"initial_{role}",
+                    "entity_role": role,
+                    "semantic_class": observation.get("class_name")
+                    or observation.get("shape"),
+                    "semantic_confidence": observation.get("confidence"),
+                    "semantic_region_normalized": region,
+                    **metric.as_dict(),
+                    "frame_id": frame.reference_frame,
+                    "timestamp_ns": frame.timestamp_ns,
+                    "operator_confirmed": False,
+                    "usable_for_skill_binding": False,
+                }
+            )
+        return {
+            "schema_version": "1.0",
+            "evidence_type": "first_frame_semantic_anchor_candidates",
+            "recording_id": recording_id,
+            "frame_index": frame_index,
+            "frame_id": frame.reference_frame,
+            "timestamp_ns": frame.timestamp_ns,
+            "rgb_uri": frame_entry.get("rgb_uri"),
+            "rgb_checksum_sha256": frame_entry.get("rgb_checksum_sha256"),
+            "depth_uri": frame_entry.get("depth_uri"),
+            "depth_checksum_sha256": frame_entry.get("depth_checksum_sha256"),
+            "intrinsics": {
+                "width_px": frame.color_intrinsics.width_px,
+                "height_px": frame.color_intrinsics.height_px,
+                "fx_px": frame.color_intrinsics.fx_px,
+                "fy_px": frame.color_intrinsics.fy_px,
+                "cx_px": frame.color_intrinsics.cx_px,
+                "cy_px": frame.color_intrinsics.cy_px,
+                "distortion_model": frame.color_intrinsics.distortion_model,
+                "distortion_coefficients": list(
+                    frame.color_intrinsics.distortion_coefficients
+                ),
+            },
+            "anchors": anchors,
+            "warnings": warnings,
+            "coordinate_policy": (
+                "semantic_roi_hint_then_local_depth; operator_confirmation_required"
+            ),
+            "created_at_ns": time.time_ns(),
         }
 
     def list_recording_skill_drafts(self) -> dict[str, Any]:
@@ -616,6 +1134,7 @@ class MVPApplication:
             value = request[name]
             return PixelPoint(x_px=float(value["x_px"]), y_px=float(value["y_px"]))
 
+        diagnostics: dict[str, Any]
         transform, diagnostics = calibrate_surface_from_three_points(
             frame,
             origin_px=pixel("origin_px"),
@@ -623,6 +1142,62 @@ class MVPApplication:
             positive_y_px=pixel("positive_y_px"),
         )
         calibration_id = f"cal_{uuid.uuid4().hex}"
+        manifest = self.camera_controller.get_recording_manifest(
+            recording_id, include_frames=True
+        )
+        manifest_frames = manifest.get("frames") or []
+        frame_evidence = next(
+            (
+                item
+                for sequence_index, item in enumerate(manifest_frames)
+                if isinstance(item, dict)
+                and int(item.get("index", sequence_index)) == frame_index
+            ),
+            None,
+        )
+        if frame_evidence is None:
+            raise ValueError("surface calibration frame is outside the recording manifest")
+        selected_pixels = {
+            name: {
+                "x_px": float(request[name]["x_px"]),
+                "y_px": float(request[name]["y_px"]),
+            }
+            for name in ("origin_px", "positive_x_px", "positive_y_px")
+        }
+        surface_hint = self._latest_draft_evidence(
+            draft_payload, "surface_hint_*.json"
+        )
+        hint_validation: dict[str, Any] = {
+            "available": False,
+            "passed": False,
+            "reason": "no same-frame RANSAC plane hint was available",
+        }
+        if (
+            isinstance(surface_hint, dict)
+            and surface_hint.get("frame_index") == frame_index
+            and surface_hint.get("source_frame") == frame.reference_frame
+            and isinstance(surface_hint.get("camera_to_task_plane_hint"), dict)
+        ):
+            hint_validation = {
+                "available": True,
+                **task_plane_normal_hint_diagnostics(
+                    transform,
+                    RigidTransform.model_validate(
+                        surface_hint["camera_to_task_plane_hint"]
+                    ),
+                ),
+                "hint_artifact_uri": surface_hint.get("artifact_uri"),
+                "advisory_only": True,
+            }
+            if hint_validation["passed"] is not True:
+                hint_validation["warning"] = (
+                    "manual task-plane normal differs from the advisory RANSAC plane"
+                )
+        diagnostics = {
+            **diagnostics,
+            "ransac_normal_validation": hint_validation,
+        }
+        base_chain = self._task_plane_base_chain(recording_id, transform)
         evidence = {
             "schema_version": "1.0",
             "evidence_type": "surface_frame_calibration",
@@ -631,11 +1206,40 @@ class MVPApplication:
             "recording_id": recording_id,
             "frame_index": frame_index,
             "source_frame": frame.reference_frame,
+            "parent_frame_id": frame.reference_frame,
+            "child_frame_id": str(request["surface_anchor_id"]),
+            "measurement_timestamp_ns": frame.timestamp_ns,
             "surface_anchor_id": str(request["surface_anchor_id"]),
             "method": "operator_three_point_aligned_depth",
-            "transform_convention": "T_camera_surface",
+            "transform_convention": "T_camera_task_plane",
+            "task_plane_revision": calibration_id,
+            "camera_to_task_plane": transform.model_dump(mode="json"),
             "camera_to_surface": transform.model_dump(mode="json"),
+            "selected_pixels": selected_pixels,
+            "source_artifacts": {
+                "rgb_uri": frame_evidence.get("rgb_uri"),
+                "rgb_checksum_sha256": frame_evidence.get("rgb_checksum_sha256"),
+                "depth_uri": frame_evidence.get("depth_uri"),
+                "depth_checksum_sha256": frame_evidence.get("depth_checksum_sha256"),
+                "manifest_uri": manifest.get("manifest_uri"),
+                "manifest_checksum_sha256": manifest.get(
+                    "manifest_checksum_sha256"
+                ),
+            },
+            "color_intrinsics": {
+                "width_px": frame.color_intrinsics.width_px,
+                "height_px": frame.color_intrinsics.height_px,
+                "fx_px": frame.color_intrinsics.fx_px,
+                "fy_px": frame.color_intrinsics.fy_px,
+                "cx_px": frame.color_intrinsics.cx_px,
+                "cy_px": frame.color_intrinsics.cy_px,
+                "distortion_model": frame.color_intrinsics.distortion_model,
+                "distortion_coefficients": list(
+                    frame.color_intrinsics.distortion_coefficients
+                ),
+            },
             "diagnostics": diagnostics,
+            "base_chain": base_chain,
             "operator_confirmed": True,
             "hardware_validated": False,
             "created_at_ns": time.time_ns(),
@@ -697,6 +1301,31 @@ class MVPApplication:
         transform, diagnostics = segment_dominant_depth_plane(
             frame, region_normalized=region
         )
+        effective_region = region or (0.05, 0.15, 0.95, 0.95)
+        x_min, y_min, x_max, y_max = effective_region
+        center_x = (x_min + x_max) / 2.0
+        center_y = (y_min + y_max) / 2.0
+        axis_fraction = 0.20
+        width_scale = frame.color_intrinsics.width_px - 1
+        height_scale = frame.color_intrinsics.height_px - 1
+        suggested_pixels = {
+            "origin_px": {
+                "x_px": center_x * width_scale,
+                "y_px": center_y * height_scale,
+            },
+            "positive_x_px": {
+                "x_px": min(x_max, center_x + axis_fraction * (x_max - x_min))
+                * width_scale,
+                "y_px": center_y * height_scale,
+            },
+            "positive_y_px": {
+                "x_px": center_x * width_scale,
+                "y_px": max(y_min, center_y - axis_fraction * (y_max - y_min))
+                * height_scale,
+            },
+            "advisory_only": True,
+            "operator_must_confirm_or_adjust": True,
+        }
         calibration_id = f"cal_{uuid.uuid4().hex}"
         evidence = {
             "schema_version": "1.0",
@@ -707,18 +1336,20 @@ class MVPApplication:
             "frame_index": frame_index,
             "source_frame": frame.reference_frame,
             "surface_anchor_id": str(request["surface_anchor_id"]),
-            "method": "local_depth_ransac_plane",
+            "method": "local_depth_ransac_plane_hint",
             "semantic_surface_hint": surface or None,
-            "transform_convention": "T_camera_surface",
+            "transform_convention": "T_camera_task_plane_hint",
+            "camera_to_task_plane_hint": transform.model_dump(mode="json"),
             "camera_to_surface": transform.model_dump(mode="json"),
             "diagnostics": diagnostics,
+            "manual_click_assist": suggested_pixels,
             "operator_confirmed": True,
             "hardware_validated": False,
             "created_at_ns": time.time_ns(),
         }
         artifact = self.store.put_json(
             f"{self._draft_evidence_root(draft_payload)}/"
-            f"surface_calibration_{calibration_id}.json",
+            f"surface_hint_{calibration_id}.json",
             evidence,
         )
         return {
@@ -743,11 +1374,13 @@ class MVPApplication:
         if calibration is None:
             raise ValueError("create a camera-to-surface calibration first")
         camera_to_surface = RigidTransform.model_validate(
-            calibration["camera_to_surface"]
+            calibration.get("camera_to_task_plane")
+            or calibration["camera_to_surface"]
         )
         source_frame = str(calibration["source_frame"])
         method = str(request["method"])
         samples: list[ManualTCPPathSample] = []
+        tracking: dict[str, Any] | None = None
         attempted_count = 0
         extraction_failures: list[str] = []
         if method == "manual_two_fingertip":
@@ -840,54 +1473,85 @@ class MVPApplication:
                         confidence=min(sample.confidence, float(state["confidence"])),
                     )
                 )
-            if len(samples) < 4:
+            if len(samples) < 2:
                 detail = "; ".join(extraction_failures[:4]) or "no valid local depth"
                 raise ValueError(
                     "GPT returned a TCP landmark trajectory, but local aligned depth "
                     f"reconstructed only {len(samples)} valid samples: {detail}"
                 )
         elif method == "mediapipe_rgbd":
-            keyframe_indices = [
-                int(index) for index in draft_payload.get("keyframe_indices") or []
-            ]
-            attempted_count = len(keyframe_indices)
-            estimator = MediaPipeHandPoseEstimator()
-            for frame_index in keyframe_indices:
-                frame = self.camera_controller.load_recording_rgbd_frame(
-                    recording_id, frame_index
+            tracking = self._latest_draft_evidence(
+                draft_payload, "finger_tracking_*.json"
+            )
+            if tracking is None:
+                manifest = self.camera_controller.get_recording_manifest(
+                    recording_id, include_frames=True
                 )
-                if frame.reference_frame != source_frame:
-                    raise ValueError("recording frame does not match calibration source frame")
-                estimate = estimator.estimate(frame)
-                if estimate is None:
+                tracking = self._track_recording_fingertips(recording_id, manifest)
+            observations = tracking.get("finger_observations") or []
+            attempted_count = len(observations)
+            last_orientation_surface_xyzw: tuple[float, float, float, float] | None = None
+            for observation in observations:
+                if not isinstance(observation, dict) or observation.get("status") != "valid":
                     continue
+                frame_index = int(observation["frame_index"])
+                if str(observation.get("reference_frame")) != source_frame:
+                    extraction_failures.append(
+                        f"frame {frame_index}: recording frame differs from task plane frame"
+                    )
+                    continue
+                midpoint = observation.get("midpoint_camera_m")
+                if not isinstance(midpoint, dict):
+                    extraction_failures.append(
+                        f"frame {frame_index}: fingertip midpoint unavailable"
+                    )
+                    continue
+                hand_pose = observation.get("hand_pose")
+                pose_payload = (
+                    hand_pose.get("pose") if isinstance(hand_pose, dict) else None
+                )
+                if isinstance(pose_payload, dict):
+                    camera_orientation = Quaternion.model_validate(
+                        pose_payload["orientation_xyzw"]
+                    )
+                elif last_orientation_surface_xyzw is None:
+                    # Make T_surface_tcp orientation identity for the first
+                    # closed/partially occluded frame with no palm orientation.
+                    camera_orientation = camera_to_surface.rotation_xyzw
+                else:
+                    camera_orientation = camera_to_surface.rotation_xyzw
                 surface_to_tcp = transform_camera_pose_to_surface(
                     camera_to_surface,
                     RigidTransform(
-                        translation_m=estimate.pose.position_m,
-                        rotation_xyzw=estimate.pose.orientation_xyzw,
+                        translation_m=Vector3.model_validate(midpoint),
+                        rotation_xyzw=camera_orientation,
                     ),
                 )
+                orientation_surface_xyzw = (
+                    surface_to_tcp.rotation_xyzw.as_tuple()
+                    if isinstance(pose_payload, dict)
+                    or last_orientation_surface_xyzw is None
+                    else last_orientation_surface_xyzw
+                )
+                if isinstance(pose_payload, dict):
+                    last_orientation_surface_xyzw = orientation_surface_xyzw
                 samples.append(
                     ManualTCPPathSample(
                         frame_index=frame_index,
-                        timestamp_ns=frame.timestamp_ns,
+                        timestamp_ns=int(observation["timestamp_ns"]),
                         position_surface_m=surface_to_tcp.translation_m.as_tuple(),
-                        orientation_surface_xyzw=(
-                            surface_to_tcp.rotation_xyzw.as_tuple()
-                        ),
-                        gripper_width_m=estimate.gripper_width_m,
-                        confidence=estimate.confidence,
+                        orientation_surface_xyzw=orientation_surface_xyzw,
+                        gripper_width_m=float(observation["distance_m"]),
+                        confidence=float(observation.get("confidence") or 0.0),
                     )
                 )
         else:
             raise ValueError("unsupported TCP trajectory extraction method")
         quality = validate_surface_relative_path(samples)
         coverage_ratio = len(samples) / max(1, attempted_count)
-        if method == "mediapipe_rgbd" and coverage_ratio < 0.5:
-            raise ValueError(
-                "MediaPipe detected a valid two-finger pose in fewer than 50% of frames"
-            )
+        tracking_evidence = (
+            tracking if method == "mediapipe_rgbd" else None
+        )
         trajectory_id = f"trajectory_{uuid.uuid4().hex}"
         evidence = {
             "schema_version": "1.0",
@@ -901,7 +1565,7 @@ class MVPApplication:
             "method": method,
             "tcp_definition": "midpoint_between_two_fingertips",
             "orientation_definition": (
-                "mediapipe_palm_orientation"
+                "mediapipe_palm_then_last_valid_then_task_plane"
                 if method == "mediapipe_rgbd"
                 else "jaw_axis_x_surface_normal_z"
             ),
@@ -911,6 +1575,31 @@ class MVPApplication:
                 else None
             ),
             "extraction_failures": extraction_failures,
+            "finger_observations": (
+                tracking_evidence.get("finger_observations", [])
+                if isinstance(tracking_evidence, dict)
+                else []
+            ),
+            "state_transitions": (
+                tracking_evidence.get("state_transitions", [])
+                if isinstance(tracking_evidence, dict)
+                else []
+            ),
+            "invalid_frames": (
+                tracking_evidence.get("invalid_frames", [])
+                if isinstance(tracking_evidence, dict)
+                else []
+            ),
+            "semantic_conflicts": (
+                tracking_evidence.get("semantic_conflicts", [])
+                if isinstance(tracking_evidence, dict)
+                else []
+            ),
+            "finger_tracking_settings": (
+                tracking_evidence.get("settings")
+                if isinstance(tracking_evidence, dict)
+                else None
+            ),
             "samples": [
                 {
                     "frame_index": sample.frame_index,
@@ -965,11 +1654,46 @@ class MVPApplication:
             and latest_handeye_transform.get("passed") is True
             else None
         )
+        tcp_observation = (draft_payload.get("draft") or {}).get(
+            "tcp_proxy_observation"
+        )
+        promotion = PromotionPolicy().evaluate_recording(
+            calibration=calibration,
+            trajectory=trajectory,
+            has_rgbd_evidence=self._recording_has_complete_rgbd_evidence(
+                draft_payload
+            ),
+            has_semantic_schema=isinstance(draft_payload.get("draft"), dict),
+            gpt_fingertips_detected=bool(
+                isinstance(tcp_observation, dict)
+                and tcp_observation.get("detected") is True
+            ),
+            handeye_verified=handeye_transform is not None,
+            semantic_confidence=(
+                float((draft_payload.get("draft") or {})["confidence"])
+                if isinstance((draft_payload.get("draft") or {}).get("confidence"), (int, float))
+                else None
+            ),
+        )
+        if not promotion.eligible:
+            raise ValueError(
+                "candidate promotion blocked: " + "; ".join(promotion.blockers)
+            )
         graph = self._recording_candidate_graph(
             draft_payload,
             calibration=calibration,
             trajectory=trajectory,
             handeye_transform=handeye_transform,
+        )
+        graph = graph.model_copy(
+            update={
+                "uncertainty": {
+                    **graph.uncertainty,
+                    "promotion_policy": promotion.as_dict(),
+                    "promotion_warnings": list(promotion.warnings),
+                }
+            },
+            deep=True,
         )
         row = self._persist_graph(
             graph,
@@ -990,6 +1714,8 @@ class MVPApplication:
             "version": row.semantic_version,
             "status": "validated" if validation["passed"] else "rejected",
             "mock_validation_passed": bool(validation["passed"]),
+            "promotion_policy": promotion.as_dict(),
+            "warnings": list(promotion.warnings),
             "handeye_transform_candidate": (
                 {
                     key: latest_handeye_transform[key]
@@ -1038,6 +1764,23 @@ class MVPApplication:
             f"{payload['draft_id']}_evidence"
         )
 
+    @staticmethod
+    def _recording_has_complete_rgbd_evidence(payload: dict[str, Any]) -> bool:
+        """Return the single readiness/registration definition of RGB-D coverage."""
+
+        transport = payload.get("transport") or {}
+        full_frame_count = int(payload.get("full_recording_frame_count") or 0)
+        trace_frame_count = (
+            int(transport.get("trace_frame_count") or 0)
+            if isinstance(transport, dict)
+            else 0
+        )
+        return bool(
+            full_frame_count > 0
+            and trace_frame_count == full_frame_count
+            and isinstance(payload.get("local_fingertip_tracking"), dict)
+        )
+
     def _latest_draft_evidence(
         self, payload: dict[str, Any], pattern: str
     ) -> dict[str, Any] | None:
@@ -1075,6 +1818,163 @@ class MVPApplication:
             "artifact_uri": path.relative_to(self.store.root).as_posix(),
         }
 
+    def _initial_scene_anchor_inputs(
+        self,
+        draft_payload: dict[str, Any],
+        calibration: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Express first-frame local semantic anchors in the final task plane.
+
+        The LLM contributes only normalized ROIs.  The source artifact contains
+        locally deprojected camera-frame points and is checksum verified here;
+        these advisory inputs never become runtime bindings without a separate
+        operator confirmation workflow.
+        """
+
+        metadata = draft_payload.get("initial_scene_anchors")
+        if not isinstance(metadata, dict):
+            return []
+        artifact_uri = metadata.get("artifact_uri")
+        checksum = metadata.get("artifact_checksum_sha256")
+        if not isinstance(artifact_uri, str) or not isinstance(checksum, str):
+            return []
+        raw = json.loads(
+            self.store.read_bytes(
+                artifact_uri,
+                expected_checksum_sha256=checksum,
+            ).decode("utf-8")
+        )
+        if not isinstance(raw, dict) or raw.get("draft_id") != draft_payload.get(
+            "draft_id"
+        ):
+            raise ValueError("initial scene-anchor evidence does not match its draft")
+        if raw.get("recording_id") != draft_payload.get("source_recording_id"):
+            raise ValueError("initial scene-anchor evidence recording lineage mismatch")
+        if raw.get("frame_id") != calibration.get("source_frame"):
+            raise ValueError("initial scene-anchor evidence frame lineage mismatch")
+        keyframe_indices = draft_payload.get("keyframe_indices") or []
+        if keyframe_indices and raw.get("frame_index") != keyframe_indices[0]:
+            raise ValueError("initial scene-anchor evidence first-frame lineage mismatch")
+        camera_to_task_plane = RigidTransform.model_validate(
+            calibration.get("camera_to_task_plane")
+            or calibration.get("camera_to_surface")
+        )
+        inputs: list[dict[str, Any]] = []
+        for anchor in raw.get("anchors") or []:
+            if not isinstance(anchor, dict):
+                continue
+            position = anchor.get("position_camera_m")
+            if not isinstance(position, list) or len(position) != 3:
+                continue
+            task_plane_pose = transform_camera_pose_to_surface(
+                camera_to_task_plane,
+                RigidTransform(
+                    translation_m=Vector3(
+                        x=float(position[0]),
+                        y=float(position[1]),
+                        z=float(position[2]),
+                    ),
+                    rotation_xyzw=Quaternion(x=0.0, y=0.0, z=0.0, w=1.0),
+                ),
+            )
+            inputs.append(
+                {
+                    "anchor_id": anchor.get("anchor_id"),
+                    "entity_role": anchor.get("entity_role"),
+                    "semantic_class": anchor.get("semantic_class"),
+                    "task_plane_anchor_id": calibration["surface_anchor_id"],
+                    "position_task_plane_m": (
+                        task_plane_pose.translation_m.model_dump(mode="json")
+                    ),
+                    "semantic_confidence": anchor.get("semantic_confidence"),
+                    "metric_depth_confidence": anchor.get("valid_depth_fraction"),
+                    "source_artifact_uri": artifact_uri,
+                    "source_artifact_checksum_sha256": checksum,
+                    "operator_confirmed": False,
+                    "usable_for_runtime_binding": False,
+                }
+            )
+        return inputs
+
+    def _recording_stationarity_evidence(
+        self, recording_id: str
+    ) -> dict[str, Any] | None:
+        path = self.store.path_for(
+            f"demonstrations/{recording_id}/camera_stationarity.json"
+        )
+        if not path.is_file():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+
+    def _task_plane_base_chain(
+        self,
+        recording_id: str,
+        camera_to_task_plane: RigidTransform,
+    ) -> dict[str, Any]:
+        """Compose a base task plane only from verified, stationary evidence."""
+
+        stationarity = self._recording_stationarity_evidence(recording_id)
+        handeye = self._latest_legacy_handeye_transform()
+        if not stationarity or (
+            stationarity.get("diagnostics") or {}
+        ).get("passed") is not True:
+            return {
+                "available": False,
+                "verified": False,
+                "hardware_compatible": False,
+                "reason": "camera stationarity evidence is unavailable or failed",
+            }
+        if not handeye or handeye.get("passed") is not True:
+            return {
+                "available": False,
+                "verified": False,
+                "hardware_compatible": False,
+                "reason": "validated T_flange_camera evidence is unavailable",
+            }
+        start = stationarity.get("start") or {}
+        if start.get("active_tcp_name") != handeye.get("active_tcp_name"):
+            return {
+                "available": False,
+                "verified": False,
+                "hardware_compatible": False,
+                "reason": "teaching active TCP does not match hand-eye calibration",
+            }
+        try:
+            base_to_flange = rigid_transform_from_matrix(
+                start["base_to_flange"], label="T_base_flange"
+            )
+            flange_to_camera = rigid_transform_from_matrix(
+                handeye["flange_to_camera"], label="T_flange_camera"
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return {
+                "available": False,
+                "verified": False,
+                "hardware_compatible": False,
+                "reason": f"invalid base/camera chain evidence: {exc}",
+            }
+        base_to_task_plane = compose_base_task_plane(
+            base_to_flange=base_to_flange,
+            flange_to_camera=flange_to_camera,
+            camera_to_task_plane=camera_to_task_plane,
+        )
+        return {
+            "available": True,
+            "verified": True,
+            "hardware_compatible": False,
+            "parent_frame_id": "base",
+            "child_frame_id": "task_plane",
+            "transform_convention": "T_base_task_plane",
+            "base_to_task_plane": base_to_task_plane.model_dump(mode="json"),
+            "handeye_calibration_revision": handeye.get("import_id"),
+            "camera_stationarity_artifact_uri": (
+                f"demonstrations/{recording_id}/camera_stationarity.json"
+            ),
+            "active_tcp_name": start.get("active_tcp_name"),
+            "hardware_validation_pending": True,
+        }
+
     def _recording_candidate_graph(
         self,
         draft_payload: dict[str, Any],
@@ -1086,6 +1986,9 @@ class MVPApplication:
         """Materialize only locally measured, surface-relative geometry."""
 
         semantic = draft_payload["draft"]
+        initial_scene_anchor_inputs = self._initial_scene_anchor_inputs(
+            draft_payload, calibration
+        )
         skill_id = str(semantic["suggested_skill_id"])
         primitive_operations = {
             str(item.get("operation"))
@@ -1112,22 +2015,25 @@ class MVPApplication:
         # locally approved force-profile tool class. Unknown tools keep only the
         # measured motion route and retain the deferred contact uncertainty.
         has_contact = requested_contact and contact_tool_class is not None
-        has_close = "gripper.close" in primitive_operations
-        has_open = "gripper.open" in primitive_operations
         samples = trajectory.get("samples") or []
-        if not isinstance(samples, list) or len(samples) < 4:
+        if not isinstance(samples, list) or len(samples) < 2:
             raise ValueError("TCP trajectory has insufficient materialization samples")
-        maximum_points = 256 if has_contact else 128
-        if len(samples) > maximum_points:
-            selected_indices = sorted(
-                {
-                    round(position * (len(samples) - 1) / (maximum_points - 1))
-                    for position in range(maximum_points)
-                }
-            )
-            samples = [samples[index] for index in selected_indices]
-        path = [
-            {
+        samples = sorted(
+            samples,
+            key=lambda item: (
+                int(item["frame_index"]),
+                int(item["timestamp_ns"]),
+            ),
+        )
+        sample_index_by_frame: dict[int, int] = {}
+        for sample_index, sample in enumerate(samples):
+            frame_index = int(sample["frame_index"])
+            if frame_index in sample_index_by_frame:
+                raise ValueError("TCP trajectory contains duplicate frame indices")
+            sample_index_by_frame[frame_index] = sample_index
+
+        def relative_pose(sample: dict[str, Any]) -> dict[str, Any]:
+            return {
                 "anchor_id": "$surface",
                 "anchor_type": "surface",
                 "position_m": {
@@ -1142,50 +2048,344 @@ class MVPApplication:
                     "w": float(sample["orientation_surface_xyzw"][3]),
                 },
             }
-            for sample in samples
-        ]
-        node_specs: list[tuple[str, str, dict[str, Any]]] = [
-            ("validate_path", "workspace.validate_path", {"path": path})
-        ]
-        if has_close:
-            node_specs.append(("gripper_close", "gripper.close", {"tool": "$tool"}))
-        if has_contact:
-            node_specs.extend(
-                [
-                    (
-                        "contact_search",
-                        "contact.search_surface",
-                        {
-                            "surface": "$surface",
-                            "force_profile_id": "contact_search_soft",
-                        },
-                    ),
-                    (
-                        "force_enable",
-                        "contact.enable_force",
-                        {
-                            "surface": "$surface",
-                            "force_profile_id": "contact_search_soft",
-                        },
-                    ),
-                    (
-                        "follow_path",
-                        "contact.follow_path",
-                        {"path": path, "motion_profile_id": "linear_slow"},
-                    ),
-                    ("force_disable", "contact.disable_force", {}),
-                ]
-            )
-        else:
+
+        path = [relative_pose(sample) for sample in samples]
+        node_specs: list[tuple[str, str, dict[str, Any]]] = []
+        for chunk_index, path_chunk in enumerate(
+            self._bounded_path_chunks(path, 256, overlap=True)
+        ):
             node_specs.append(
                 (
-                    "follow_path",
-                    "motion.move_spline",
-                    {"waypoints": path, "motion_profile_id": "linear_slow"},
+                    f"validate_path_{chunk_index:03d}",
+                    "workspace.validate_path",
+                    {"path": path_chunk},
                 )
             )
-        if has_open:
-            node_specs.append(("gripper_open", "gripper.open", {"tool": "$tool"}))
+
+        transitions = sorted(
+            (
+                item
+                for item in trajectory.get("state_transitions") or []
+                if isinstance(item, dict) and item.get("state") in {"open", "closed"}
+            ),
+            key=lambda item: (int(item["frame_index"]), int(item["timestamp_ns"])),
+        )
+        gripper_events: list[tuple[int, dict[str, Any]]] = []
+        previous_state: str | None = None
+        for transition in transitions:
+            state = str(transition["state"])
+            if state == previous_state:
+                continue
+            previous_state = state
+            transition_frame_index = int(transition["frame_index"])
+            boundary = sample_index_by_frame.get(transition_frame_index)
+            if boundary is None:
+                raise ValueError(
+                    "gripper state transition has no metric pose at frame "
+                    f"{transition_frame_index}"
+                )
+            if int(samples[boundary]["timestamp_ns"]) != int(
+                transition["timestamp_ns"]
+            ):
+                raise ValueError(
+                    "gripper state transition timestamp does not match its metric pose"
+                )
+            gripper_events.append((boundary, transition))
+
+        simplification_provenance: list[dict[str, Any]] = []
+
+        def append_motion_segment(
+            segment_samples: list[dict[str, Any]], segment_index: int
+        ) -> None:
+            if len(segment_samples) < 2:
+                return
+            segment_positions = [
+                tuple(float(value) for value in sample["position_surface_m"])
+                for sample in segment_samples
+            ]
+            path_length_m = sum(
+                math.dist(start, end)
+                for start, end in zip(
+                    segment_positions, segment_positions[1:], strict=False
+                )
+            )
+            if path_length_m <= 1.0e-12:
+                simplification_provenance.append(
+                    {
+                        "segment_index": segment_index,
+                        "start_frame_index": int(segment_samples[0]["frame_index"]),
+                        "end_frame_index": int(segment_samples[-1]["frame_index"]),
+                        "start_timestamp_ns": int(segment_samples[0]["timestamp_ns"]),
+                        "end_timestamp_ns": int(segment_samples[-1]["timestamp_ns"]),
+                        "original_sample_count": len(segment_samples),
+                        "simplified_sample_count": 0,
+                        "maximum_error_m": 0.0,
+                        "tolerance_m": DEFAULT_PATH_SIMPLIFICATION_TOLERANCE_M,
+                        "chosen_primitive_id": "none",
+                        "emitted_operation": None,
+                        "skipped_reason": "stationary_segment",
+                    }
+                )
+                return
+            simplified = simplify_anchor_relative_path(segment_positions)
+            selected_samples = [
+                segment_samples[index]
+                for index in simplified.retained_sample_indices
+            ]
+            provenance: dict[str, Any] = {
+                "segment_index": segment_index,
+                "start_frame_index": int(segment_samples[0]["frame_index"]),
+                "end_frame_index": int(segment_samples[-1]["frame_index"]),
+                "start_timestamp_ns": int(segment_samples[0]["timestamp_ns"]),
+                "end_timestamp_ns": int(segment_samples[-1]["timestamp_ns"]),
+                **simplified.provenance.as_dict(),
+            }
+            verified_arc = None
+            verified_periodic = None
+            if (
+                simplified.provenance.chosen_primitive_id
+                == "motion.move_spline"
+                and len(segment_samples) >= 3
+            ):
+                local_pose_samples = tuple(
+                    PoseSample(
+                        timestamp_ns=int(sample["timestamp_ns"]),
+                        position_m=(
+                            float(sample["position_surface_m"][0]),
+                            float(sample["position_surface_m"][1]),
+                            float(sample["position_surface_m"][2]),
+                        ),
+                        orientation_xyzw=(
+                            float(sample["orientation_surface_xyzw"][0]),
+                            float(sample["orientation_surface_xyzw"][1]),
+                            float(sample["orientation_surface_xyzw"][2]),
+                            float(sample["orientation_surface_xyzw"][3]),
+                        ),
+                        frame_id=str(calibration["surface_anchor_id"]),
+                        source="mediapipe_rgbd_task_plane",
+                        confidence=float(sample.get("confidence") or 0.0),
+                    )
+                    for sample in segment_samples
+                )
+                try:
+                    recommendation = recommend_primitive(local_pose_samples)
+                except (PrimitiveFittingError, ValueError):
+                    recommendation = None
+                if (
+                    recommendation is not None
+                    and recommendation.recommended_primitive_id
+                    == "motion.move_periodic"
+                ):
+                    try:
+                        verified_periodic = fit_periodic_primitive_geometry(
+                            local_pose_samples,
+                            recommendation.selected_fit,
+                            maximum_error_m=(
+                                DEFAULT_PATH_SIMPLIFICATION_TOLERANCE_M
+                            ),
+                        )
+                    except PrimitiveFittingError as exc:
+                        provenance["periodic_fallback_reason"] = str(exc)
+                    else:
+                        provenance.update(
+                            {
+                                "chosen_primitive_id": "motion.move_periodic",
+                                "simplified_sample_count": 1,
+                                "maximum_error_m": (
+                                    verified_periodic.residuals.maximum_m
+                                ),
+                                "periodic_fit_rms_m": (
+                                    verified_periodic.residuals.root_mean_square_m
+                                ),
+                                "periodic_fit_maximum_error_m": (
+                                    verified_periodic.residuals.maximum_m
+                                ),
+                                "periodic_observed_period_s": (
+                                    verified_periodic.observed_period_s
+                                ),
+                                "periodic_observed_cycle_count": (
+                                    verified_periodic.observed_cycle_count
+                                ),
+                                "periodic_repetitions": (
+                                    verified_periodic.repetitions
+                                ),
+                                "periodic_amplitude_vector_m": (
+                                    verified_periodic.amplitude_vector_m
+                                ),
+                                "periodic_timing_policy": (
+                                    "execution speed remains profile-owned"
+                                ),
+                            }
+                        )
+                elif (
+                    recommendation is not None
+                    and recommendation.recommended_primitive_id == "motion.move_c"
+                ):
+                    arc_fit = (
+                        recommendation.selected_fit
+                    )
+                    if (
+                        arc_fit.residuals.root_mean_square_m
+                        <= DEFAULT_PATH_SIMPLIFICATION_TOLERANCE_M
+                        and arc_fit.residuals.maximum_m
+                        <= DEFAULT_PATH_SIMPLIFICATION_TOLERANCE_M
+                        and arc_fit.confidence >= 0.5
+                        and arc_fit.via_m is not None
+                        and arc_fit.radius_m is not None
+                    ):
+                        verified_arc = arc_fit
+                        provenance.update(
+                            {
+                                "chosen_primitive_id": "motion.move_c",
+                                "simplified_sample_count": 3,
+                                "maximum_error_m": arc_fit.residuals.maximum_m,
+                                "arc_fit_rms_m": arc_fit.residuals.root_mean_square_m,
+                                "arc_fit_maximum_error_m": arc_fit.residuals.maximum_m,
+                                "arc_fit_confidence": arc_fit.confidence,
+                                "arc_radius_m": arc_fit.radius_m,
+                            }
+                        )
+            simplified_path = [relative_pose(sample) for sample in selected_samples]
+            periodic_node_spec: tuple[str, str, dict[str, Any]] | None = None
+            if verified_periodic is not None:
+                center_sample = dict(segment_samples[len(segment_samples) // 2])
+                center_sample["position_surface_m"] = verified_periodic.center_m
+                amplitude_x, amplitude_y, amplitude_z = (
+                    verified_periodic.amplitude_vector_m
+                )
+                periodic_node_spec = (
+                    f"move_periodic_{segment_index:03d}",
+                    "motion.move_periodic",
+                    {
+                        "center": relative_pose(center_sample),
+                        "amplitude_m": {
+                            "x": amplitude_x,
+                            "y": amplitude_y,
+                            "z": amplitude_z,
+                        },
+                        "repetitions": verified_periodic.repetitions,
+                        "motion_profile_id": "periodic_safe",
+                    },
+                )
+                provenance["emitted_operation"] = "motion.move_periodic"
+            arc_node_spec: tuple[str, str, dict[str, Any]] | None = None
+            if verified_arc is not None:
+                via_sample = dict(segment_samples[len(segment_samples) // 2])
+                target_sample = dict(segment_samples[-1])
+                via_sample["position_surface_m"] = verified_arc.via_m
+                target_sample["position_surface_m"] = verified_arc.end_m
+                arc_node_spec = (
+                    f"move_c_{segment_index:03d}",
+                    "motion.move_c",
+                    {
+                        "via": relative_pose(via_sample),
+                        "target": relative_pose(target_sample),
+                        "motion_profile_id": "circular_normal",
+                    },
+                )
+                provenance["emitted_operation"] = "motion.move_c"
+            if has_contact:
+                node_specs.extend(
+                    [
+                        (
+                            f"contact_search_{segment_index:03d}",
+                            "contact.search_surface",
+                            {
+                                "surface": "$surface",
+                                "force_profile_id": "contact_search_soft",
+                            },
+                        ),
+                        (
+                            f"force_enable_{segment_index:03d}",
+                            "contact.enable_force",
+                            {
+                                "surface": "$surface",
+                                "force_profile_id": "contact_search_soft",
+                            },
+                        ),
+                    ]
+                )
+                if periodic_node_spec is not None:
+                    node_specs.append(periodic_node_spec)
+                elif arc_node_spec is not None:
+                    node_specs.append(arc_node_spec)
+                else:
+                    provenance["emitted_operation"] = "contact.follow_path"
+                    for chunk_index, path_chunk in enumerate(
+                        self._bounded_path_chunks(
+                            simplified_path, 256, overlap=True
+                        )
+                    ):
+                        node_specs.append(
+                            (
+                                f"follow_path_{segment_index:03d}_{chunk_index:03d}",
+                                "contact.follow_path",
+                                {
+                                    "path": path_chunk,
+                                    "motion_profile_id": "linear_slow",
+                                },
+                            )
+                        )
+                node_specs.append(
+                    (
+                        f"force_disable_{segment_index:03d}",
+                        "contact.disable_force",
+                        {},
+                    )
+                )
+            elif periodic_node_spec is not None:
+                node_specs.append(periodic_node_spec)
+            elif arc_node_spec is not None:
+                node_specs.append(arc_node_spec)
+            elif simplified.provenance.chosen_primitive_id == "motion.move_l":
+                provenance["emitted_operation"] = "motion.move_l"
+                node_specs.append(
+                    (
+                        f"move_l_{segment_index:03d}",
+                        "motion.move_l",
+                        {
+                            "target": simplified_path[-1],
+                            "motion_profile_id": "linear_slow",
+                        },
+                    )
+                )
+            else:
+                provenance["emitted_operation"] = "motion.move_spline"
+                for chunk_index, path_chunk in enumerate(
+                    self._bounded_path_chunks(simplified_path, 128, overlap=True)
+                ):
+                    node_specs.append(
+                        (
+                            f"move_spline_{segment_index:03d}_{chunk_index:03d}",
+                            "motion.move_spline",
+                            {
+                                "waypoints": path_chunk,
+                                "motion_profile_id": "linear_slow",
+                            },
+                        )
+                    )
+            simplification_provenance.append(provenance)
+
+        cursor = 0
+        segment_index = 0
+        for event_index, (boundary, transition) in enumerate(gripper_events):
+            if boundary > cursor:
+                append_motion_segment(samples[cursor : boundary + 1], segment_index)
+                segment_index += 1
+            state = str(transition["state"])
+            node_specs.append(
+                (
+                    f"gripper_{state}_{event_index:03d}",
+                    f"gripper.{state if state == 'open' else 'close'}",
+                    {"tool": "$tool"},
+                )
+            )
+            cursor = boundary
+        if cursor < len(samples) - 1:
+            append_motion_segment(samples[cursor:], segment_index)
+        elif not gripper_events:
+            append_motion_segment(samples, segment_index)
+        has_gripper = bool(gripper_events)
         nodes = [
             SkillNode(
                 node_id=node_id,
@@ -1203,11 +2403,12 @@ class MVPApplication:
             "$surface": BindingSpec(
                 variable="$surface",
                 entity_kind=EntityKind.SURFACE,
+                instance_id=str(calibration["surface_anchor_id"]),
                 role="contact_target",
                 minimum_confidence=0.8,
             )
         }
-        if has_close or has_open or has_contact:
+        if has_gripper or has_contact:
             bindings["$tool"] = BindingSpec(
                 variable="$tool",
                 entity_kind=EntityKind.TOOL,
@@ -1217,13 +2418,24 @@ class MVPApplication:
             )
         skill_type = (
             SkillType.COMPOSITE
-            if (has_close or has_open) and has_contact
+            if has_gripper and has_contact
             else SkillType.CONTACT
             if has_contact
             else SkillType.MANIPULATION
-            if has_close or has_open
+            if has_gripper
             else SkillType.MOTION
         )
+        motion_profiles = ["linear_slow"]
+        if any(
+            item.get("chosen_primitive_id") == "motion.move_c"
+            for item in simplification_provenance
+        ):
+            motion_profiles.append("circular_normal")
+        if any(
+            item.get("chosen_primitive_id") == "motion.move_periodic"
+            for item in simplification_provenance
+        ):
+            motion_profiles.append("periodic_safe")
         return SkillGraph(
             skill_id=skill_id,
             version=self._next_recording_candidate_version(skill_id),
@@ -1252,7 +2464,7 @@ class MVPApplication:
             nodes=nodes,
             start_node=nodes[0].node_id,
             terminal_nodes=[nodes[-1].node_id],
-            motion_profiles=["linear_slow"],
+            motion_profiles=motion_profiles,
             force_profiles=["contact_search_soft"] if has_contact else [],
             preconditions=[
                 "fresh_scene",
@@ -1262,9 +2474,31 @@ class MVPApplication:
             postconditions=["mock_validation_only"],
             uncertainty={
                 "hardware_validated": False,
-                "camera_to_surface_calibration_id": calibration["calibration_id"],
+                "task_plane_calibration_id": calibration["calibration_id"],
+                "task_plane_anchor_id": calibration["surface_anchor_id"],
+                "task_plane_source_frame": calibration["source_frame"],
+                "camera_to_task_plane": calibration.get("camera_to_task_plane")
+                or calibration.get("camera_to_surface"),
+                "base_chain": calibration.get("base_chain"),
                 "tcp_trajectory_id": trajectory["trajectory_id"],
                 "trajectory_quality": trajectory["quality"],
+                "gripper_state_transitions": [
+                    {
+                        "frame_index": int(item["frame_index"]),
+                        "timestamp_ns": int(item["timestamp_ns"]),
+                        "previous_state": item.get("previous_state"),
+                        "state": item["state"],
+                        "distance_m": item.get("distance_m"),
+                    }
+                    for _boundary, item in gripper_events
+                ],
+                "gripper_behavior_unresolved": not has_gripper,
+                "motion_simplification": simplification_provenance,
+                "semantic_conflicts": trajectory.get("semantic_conflicts") or [],
+                "initial_scene_anchor_evidence": draft_payload.get(
+                    "initial_scene_anchors"
+                ),
+                "initial_scene_anchor_inputs": initial_scene_anchor_inputs,
                 "semantic_confidence": semantic.get("confidence"),
                 "contact_semantics_deferred": requested_contact and not has_contact,
                 "handeye_transform_candidate": (
@@ -1281,6 +2515,30 @@ class MVPApplication:
             validation_status=ValidationStatus.PENDING,
             lifecycle_status=SkillLifecycleStatus.CANDIDATE,
         )
+
+    @staticmethod
+    def _bounded_path_chunks(
+        path: list[dict[str, Any]],
+        maximum_count: int,
+        *,
+        overlap: bool = False,
+    ) -> list[list[dict[str, Any]]]:
+        if maximum_count < 2:
+            raise ValueError("path chunk maximum_count must be at least two")
+        if not path:
+            raise ValueError("path chunks require at least one pose")
+        if len(path) <= maximum_count:
+            return [path]
+        chunks: list[list[dict[str, Any]]] = []
+        start = 0
+        while start < len(path):
+            end = min(len(path), start + maximum_count)
+            chunk = path[start:end]
+            chunks.append(chunk)
+            if end == len(path):
+                break
+            start = end - 1 if overlap else end
+        return chunks
 
     def _next_recording_candidate_version(self, skill_id: str) -> str:
         for minor in range(1, 1000):
@@ -1306,16 +2564,12 @@ class MVPApplication:
         if not isinstance(draft, dict) or not isinstance(transport, dict):
             raise ValueError("recording draft artifact has an invalid payload")
         tcp_observation = draft.get("tcp_proxy_observation")
-        has_tcp_schema = isinstance(tcp_observation, dict)
         tcp_detected = (
             bool(tcp_observation.get("detected"))
             if isinstance(tcp_observation, dict)
             else False
         )
-        pair_count = int(transport.get("keyframe_pair_count") or 0)
-        has_rgbd_pairs = pair_count > 0 and transport.get("pair_order") == (
-            "rgb_then_aligned_depth_per_keyframe"
-        )
+        has_rgbd_evidence = self._recording_has_complete_rgbd_evidence(payload)
         calibration = self._latest_draft_evidence(
             payload, "surface_calibration_*.json"
         )
@@ -1324,113 +2578,52 @@ class MVPApplication:
             payload, "candidate_registration_*.json"
         )
         handeye_transform = self._latest_legacy_handeye_transform()
-        has_calibration = bool(
-            isinstance(calibration, dict)
-            and calibration.get("operator_confirmed") is True
-            and calibration.get("transform_convention") == "T_camera_surface"
-        )
-        trajectory_quality = (
-            trajectory.get("quality") if isinstance(trajectory, dict) else None
-        )
-        has_pose_trajectory = bool(
-            has_calibration
-            and isinstance(trajectory, dict)
-            and isinstance(calibration, dict)
-            and trajectory.get("operator_confirmed") is True
-            and trajectory.get("calibration_id") == calibration.get("calibration_id")
-            and isinstance(trajectory_quality, dict)
-            and int(trajectory_quality.get("sample_count") or 0) >= 4
-            and float(trajectory_quality.get("mean_confidence") or 0.0) >= 0.6
+        promotion = PromotionPolicy().evaluate_recording(
+            calibration=calibration,
+            trajectory=trajectory,
+            has_rgbd_evidence=has_rgbd_evidence,
+            has_semantic_schema=True,
+            gpt_fingertips_detected=tcp_detected,
+            handeye_verified=bool(
+                handeye_transform and handeye_transform.get("passed") is True
+            ),
+            semantic_confidence=(
+                float(draft["confidence"])
+                if isinstance(draft.get("confidence"), (int, float))
+                else None
+            ),
         )
         mock_validation_passed = bool(
             registration and registration.get("mock_validation_passed") is True
         )
+        registration_finalized = registration is not None
+        mock_validation_check = {
+            "id": "mock_validation",
+            "label": "컴파일 및 Mock 회귀 검증",
+            "passed": mock_validation_passed,
+            "required": registration_finalized,
+            "blocking": registration_finalized,
+            "pending": not registration_finalized,
+            "detail": (
+                f"{registration['skill_id']}@{registration['version']} Mock 검증 통과"
+                if mock_validation_passed and isinstance(registration, dict)
+                else "Candidate SkillGraph의 Mock 회귀 검증이 실패했습니다."
+                if registration_finalized
+                else "Candidate 등록 시 자동 실행되는 후속 검증입니다."
+            ),
+        }
         checks = [
-            {
-                "id": "semantic_analysis",
-                "label": "구조화된 semantic draft",
-                "passed": True,
-                "detail": "GPT 결과가 로컬 스키마와 catalog 검사를 통과했습니다.",
-            },
-            {
-                "id": "rgbd_evidence",
-                "label": "시간 정렬 RGB + Depth 증거",
-                "passed": has_rgbd_pairs,
-                "detail": (
-                    f"{pair_count}개 RGB-D 프레임 쌍"
-                    if has_rgbd_pairs
-                    else "RGB-D 쌍 분석으로 다시 생성해야 합니다."
-                ),
-            },
-            {
-                "id": "tcp_proxy",
-                "label": "두 손가락 TCP 프록시 관찰",
-                "passed": tcp_detected,
-                "detail": (
-                    "두 fingertip 중점의 정성적 동작이 관찰되었습니다."
-                    if tcp_detected
-                    else "두 fingertip이 함께 보이는 구간이 필요합니다."
-                ),
-            },
-            {
-                "id": "calibrated_transform",
-                "label": "보정된 camera → surface/tool TF",
-                "passed": has_calibration,
-                "detail": (
-                    f"{calibration['calibration_id']} · "
-                    f"{calibration.get('method', 'RGB-D 표면 프레임')}"
-                    if has_calibration and isinstance(calibration, dict)
-                    else "Depth 평면을 자동 추출하거나 RGB에서 원점, +X, +Y를 지정하세요."
-                ),
-            },
-            {
-                "id": "handeye_transform_candidate",
-                "label": "선택 증거: NPY 기반 flange → camera TF 후보",
-                "passed": bool(
-                    handeye_transform and handeye_transform.get("passed") is True
-                ),
-                "required": False,
-                "blocking": False,
-                "detail": (
-                    f"{handeye_transform['import_id']} · "
-                    + (
-                        "관측 품질 검증 통과, 물리 검증은 별도 필요"
-                        if handeye_transform.get("passed") is True
-                        else "품질 기준 미통과 · Mock Candidate 등록은 차단하지 않음"
-                    )
-                    if handeye_transform
-                    else "없음 · Mock Candidate 등록은 차단하지 않습니다."
-                ),
-            },
-            {
-                "id": "trusted_pose_trajectory",
-                "label": "신뢰 가능한 tool/TCP pose trajectory",
-                "passed": has_pose_trajectory,
-                "detail": (
-                    f"표면 상대 TCP {trajectory_quality['sample_count']}개 · "
-                    f"경로 {float(trajectory_quality['path_length_m']):.3f} m"
-                    if has_pose_trajectory and isinstance(trajectory_quality, dict)
-                    else "두 fingertip 3D 경로를 추출하고 운영자가 확인해야 합니다."
-                ),
-            },
-            {
-                "id": "mock_validation",
-                "label": "컴파일 및 Mock 회귀 검증",
-                "passed": mock_validation_passed,
-                "detail": (
-                    f"{registration['skill_id']}@{registration['version']} Mock 검증 통과"
-                    if mock_validation_passed and isinstance(registration, dict)
-                    else "Candidate SkillGraph 등록 시 자동 실행됩니다."
-                ),
-            },
+            *promotion.as_dict()["checks"],
+            mock_validation_check,
         ]
-        if not has_rgbd_pairs or not has_tcp_schema:
-            readiness_status = "needs_reanalysis"
-        elif not tcp_detected:
-            readiness_status = "needs_tcp_evidence"
-        elif not has_calibration:
+        failed_blocking_ids = {
+            item["id"]
+            for item in promotion.as_dict()["checks"]
+            if item["blocking"] and not item["passed"]
+        }
+        if "operator_task_plane" in failed_blocking_ids:
             readiness_status = "needs_calibration"
-        elif not has_pose_trajectory:
+        elif failed_blocking_ids:
             readiness_status = "needs_pose_evidence"
         elif mock_validation_passed:
             readiness_status = "candidate_registered"
@@ -1438,14 +2631,10 @@ class MVPApplication:
             readiness_status = "candidate_validation_failed"
         else:
             readiness_status = "ready_for_candidate"
-        can_register_candidate = (
-            has_rgbd_pairs
-            and has_tcp_schema
-            and tcp_detected
-            and has_calibration
-            and has_pose_trajectory
-            and not mock_validation_passed
-        )
+        can_register_candidate = promotion.eligible and not mock_validation_passed
+        readiness_blockers = list(promotion.blockers)
+        if registration_finalized and not mock_validation_passed:
+            readiness_blockers.append(str(mock_validation_check["detail"]))
         return {
             **payload,
             "artifact_uri": artifact_uri,
@@ -1476,14 +2665,12 @@ class MVPApplication:
                 "status": readiness_status,
                 "can_register_candidate": can_register_candidate,
                 "checks": checks,
+                "blockers": readiness_blockers,
+                "warnings": list(promotion.warnings),
                 "next_action": (
-                    "RGB-D와 두 손가락 TCP 프록시로 다시 분석하세요."
-                    if readiness_status == "needs_reanalysis"
-                    else "두 fingertip이 함께 보이도록 다시 티칭하세요."
-                    if readiness_status == "needs_tcp_evidence"
-                    else "Depth 평면 자동 추출 또는 3점 방식으로 표면 TF를 보정하세요."
+                    "RGB에서 원점·+X·+Y를 지정해 최종 task-plane TF를 확정하세요."
                     if readiness_status == "needs_calibration"
-                    else "두 fingertip 경로를 자동 추출하거나 수동으로 지정하세요."
+                    else "같은 task-plane revision에서 metric TCP 경로를 생성하세요."
                     if readiness_status == "needs_pose_evidence"
                     else "Candidate 등록을 눌러 컴파일과 Mock 검증을 실행하세요."
                     if readiness_status == "ready_for_candidate"
@@ -1507,6 +2694,8 @@ class MVPApplication:
 
     def induce_skill(self, request: dict[str, Any]) -> dict[str, Any]:
         source = self._safe_demo_path(str(request["demo_path"]))
+        if source.is_dir() and (source / "rgbd_manifest.json").is_file():
+            return self._induce_rgbd_components(source, request)
         evidence = self._demonstration_evidence(source)
         graph, fitted_operations = build_wipe_skill_graph()
         graph = self._apply_node_argument_updates(
@@ -1531,6 +2720,7 @@ class MVPApplication:
                     "teaching_quality": evidence.quality.model_dump(mode="json"),
                     "trajectory_summary": evidence.summary.model_dump(mode="json"),
                     "observed_primitive": evidence.recommendation.recommended_primitive_id,
+                    "promotion_warnings": list(evidence.promotion_warnings),
                 },
             },
             deep=True,
@@ -1560,8 +2750,21 @@ class MVPApplication:
                 },
             )
         )
+        promotion_warnings = list(evidence.promotion_warnings)
         if semantic.reteach_required:
-            raise ValueError("semantic analysis requires the demonstration to be retaught")
+            promotion_warnings.append(
+                "semantic analysis recommends reteaching; stored as an inactive Candidate"
+            )
+        if promotion_warnings:
+            graph = graph.model_copy(
+                update={
+                    "uncertainty": {
+                        **graph.uncertainty,
+                        "promotion_warnings": list(dict.fromkeys(promotion_warnings)),
+                    }
+                },
+                deep=True,
+            )
         version = self._persist_graph(
             graph,
             status="candidate",
@@ -1573,11 +2776,20 @@ class MVPApplication:
         )
         if not validation["passed"]:
             raise ValueError("induced skill failed deterministic mock regression validation")
-        active = self.activate_skill(graph.skill_id, {"version": graph.version})
+        result_row = self._find_version(graph.skill_id, graph.version)
+        if not promotion_warnings:
+            result = self.activate_skill(graph.skill_id, {"version": graph.version})
+            result_status = result["status"]
+            result_version = result["version"]
+        else:
+            result_status = result_row.status
+            result_version = result_row.semantic_version
         return {
             "skill_id": graph.skill_id,
-            "version": graph.version,
-            "status": active["status"],
+            "version": result_version,
+            "status": result_status,
+            "active": not promotion_warnings,
+            "promotion_warnings": list(dict.fromkeys(promotion_warnings)),
             "source_demo": self._portable_artifact_reference(source),
             "fitted_operations": fitted_operations,
             "observed_primitive": evidence.recommendation.recommended_primitive_id,
@@ -1585,6 +2797,526 @@ class MVPApplication:
             "openai_trace_id": metadata.trace_id,
             "generated_code_uri": version.generated_code_uri,
             "generated_code_checksum_sha256": version.generated_code_checksum_sha256,
+        }
+
+    @staticmethod
+    def _canonical_json_checksum(value: Any) -> str:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    def _put_content_addressed_json(
+        self,
+        *,
+        recording_id: str,
+        artifact_kind: str,
+        value: dict[str, Any],
+    ) -> Any:
+        checksum = self._canonical_json_checksum(value)
+        return self.store.put_json(
+            f"demonstrations/{recording_id}/induction_v1/"
+            f"{artifact_kind}_{checksum}.json",
+            value,
+        )
+
+    def _approved_training_transcript(
+        self, request: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any]]:
+        transcript = request.get("transcript_text")
+        artifact_uri = request.get("transcript_artifact_uri")
+        artifact_checksum = request.get("transcript_artifact_checksum_sha256")
+        if (artifact_uri is None) is not (artifact_checksum is None):
+            raise ValueError("transcript artifact URI and checksum must be provided together")
+        if transcript is not None and artifact_uri is not None:
+            raise ValueError("provide exactly one training transcript source")
+        if transcript is not None:
+            normalized = str(transcript).strip()
+            if normalized:
+                if len(normalized) > 2_000:
+                    raise ValueError("training transcript exceeds 2000 characters")
+                return normalized, {"kind": "request", "approved": True}
+
+        if artifact_uri is None and artifact_checksum is None:
+            return None, {"kind": "missing", "approved": False}
+        if not isinstance(artifact_uri, str) or not isinstance(artifact_checksum, str):
+            raise ValueError("transcript artifact URI and checksum must be strings")
+        with self.database.session() as session:
+            record = session.scalar(
+                select(TeachingSessionRecord).where(
+                    TeachingSessionRecord.artifact_uri == artifact_uri,
+                    TeachingSessionRecord.artifact_checksum_sha256
+                    == artifact_checksum,
+                    TeachingSessionRecord.ended_at_ns.is_not(None),
+                )
+            )
+        if record is None or record.status not in {"finished", "completed"}:
+            raise ValueError(
+                "transcript artifact must be the checksum-pinned output of a finalized "
+                "teaching session"
+            )
+        try:
+            payload = json.loads(
+                self.store.read_bytes(
+                    artifact_uri,
+                    expected_checksum_sha256=artifact_checksum,
+                ).decode("utf-8")
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("approved transcript artifact is not UTF-8 JSON") from exc
+        if not isinstance(payload, dict) or payload.get("success") is False:
+            raise ValueError("approved transcript artifact does not contain a successful session")
+        text_value = payload.get("transcript_text") or payload.get(
+            "operator_instruction"
+        )
+        if not isinstance(text_value, str) or not text_value.strip():
+            return None, {
+                "kind": "finalized_teaching_artifact",
+                "approved": True,
+                "artifact_uri": artifact_uri,
+                "artifact_checksum_sha256": artifact_checksum,
+            }
+        normalized = text_value.strip()
+        if len(normalized) > 2_000:
+            raise ValueError("approved training transcript exceeds 2000 characters")
+        return normalized, {
+            "kind": "finalized_teaching_artifact",
+            "approved": True,
+            "artifact_uri": artifact_uri,
+            "artifact_checksum_sha256": artifact_checksum,
+        }
+
+    def _resolve_training_semantics(
+        self, transcript: str
+    ) -> tuple[TrainingTaskSemantics, dict[str, Any]]:
+        objects = [
+            item
+            for item in self.repository.list_catalog_entries(kind="object")
+            if item.status != "retired"
+        ]
+        actions = [
+            item
+            for item in self.repository.list_catalog_entries(kind="action")
+            if item.status != "retired"
+        ]
+        object_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in objects
+        }
+        action_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in actions
+        }
+        action_required_roles: dict[str, tuple[str, ...]] = {}
+        for item in actions:
+            raw_roles = item.metadata_json.get("required_roles", [])
+            action_required_roles[item.canonical_id] = tuple(
+                role for role in raw_roles if isinstance(role, str)
+            ) if isinstance(raw_roles, list) else ()
+        semantics, metadata = TrainingSemanticResolver(self.settings).resolve(
+            transcript,
+            object_catalog=object_catalog,
+            action_catalog=action_catalog,
+            action_required_roles=action_required_roles,
+        )
+        return semantics, metadata.model_dump(mode="json")
+
+    def _ensure_rgbd_semantic_catalogs(
+        self,
+        *,
+        semantics: TrainingTaskSemantics,
+        manifest_checksum_sha256: str,
+    ) -> dict[str, dict[str, Any]]:
+        if semantics.object_class_id is None or semantics.action_id is None:
+            raise ValueError("resolved training semantics require object and action IDs")
+        catalog: dict[str, dict[str, Any]] = {}
+        for kind, identifier in (
+            ("object", semantics.object_class_id),
+            ("action", semantics.action_id),
+        ):
+            entry = self.repository.get_catalog_entry(
+                kind=kind, identifier=identifier, active_only=False
+            )
+            created = entry is None
+            if entry is None:
+                metadata: dict[str, Any] = {
+                    "discovered_by": "rgbd_training_semantics",
+                    "source_manifest_checksum_sha256": manifest_checksum_sha256,
+                    "semantic_only": True,
+                    "runtime_exposed": False,
+                    "hardware_compatible": False,
+                }
+                if kind == "action":
+                    metadata.update(
+                        {
+                            "required_roles": list(semantics.required_roles),
+                            "input_contract": {},
+                            "output_contract": {},
+                            "anchor_policy": {},
+                        }
+                    )
+                entry = self.repository.create_catalog_entry(
+                    kind=kind,
+                    canonical_id=identifier,
+                    display_name=identifier,
+                    aliases=[],
+                    metadata=metadata,
+                )
+            summary = self._catalog_entry_summary(entry)
+            summary["created_from_training"] = created
+            catalog[kind] = summary
+        return catalog
+
+    def _rgbd_component_candidates(
+        self,
+        *,
+        dataset: Any,
+        segmentation: RGBDDatasetSegmentation,
+        segmentation_report: Any,
+        semantics: TrainingTaskSemantics,
+        catalog: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        if semantics.object_class_id is None or semantics.action_id is None:
+            raise ValueError("component candidates require resolved semantics")
+        common_source = {
+            "recording_id": dataset.manifest.recording_id,
+            "manifest_checksum_sha256": dataset.manifest.manifest_checksum_sha256,
+            "segmentation_report_uri": segmentation_report.uri,
+            "segmentation_report_checksum_sha256": segmentation_report.checksum_sha256,
+            "candidate_only": True,
+            "executable": False,
+            "hardware_compatible": False,
+        }
+        grip_payload = {
+            "schema_version": "1.0",
+            "component_type": "grip_profile_evidence",
+            "object_class_id": semantics.object_class_id,
+            "frame_policy": "camera_relative_observation_only",
+            "grip_interval": segmentation.segmentation.grip.model_dump(mode="json"),
+            "stable_close_evidence": (
+                segmentation.segmentation.evidence.first_stable_close.model_dump(
+                    mode="json"
+                )
+            ),
+            "source": common_source,
+            "missing_hardware_evidence": [
+                "object_relative_6d_pose",
+                "approach_axis",
+                "hand_eye_and_task_plane_revision",
+                "rg2_fingertip_calibration",
+                "post_lift_object_following_verification",
+            ],
+        }
+        grip_artifact = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="grip_candidate",
+            value=grip_payload,
+        )
+        grip_version = self.repository.register_grip_profile_version(
+            object_class_id=semantics.object_class_id,
+            semantic_version=(
+                f"0.0.0-{grip_artifact.checksum_sha256[:12]}-candidate"
+            ),
+            artifact_uri=grip_artifact.uri,
+            artifact_checksum_sha256=grip_artifact.checksum_sha256,
+            object_frame_policy="camera_relative_observation_only",
+            object_frame_revision=dataset.manifest.manifest_checksum_sha256,
+            status="candidate",
+            validation_status="pending",
+            hardware_compatible=False,
+            auto_activation_allowed=False,
+            gripper_calibration_profile_id=None,
+            metadata={
+                "source": "raw_rgbd_local_segmentation",
+                "diagnostic_only": True,
+                "normalized_2d_is_not_an_execution_target": True,
+            },
+        )
+
+        action_payload = {
+            "schema_version": "1.0",
+            "component_type": "action_interval_evidence",
+            "action_id": semantics.action_id,
+            "required_roles": list(semantics.required_roles),
+            "action_interval": segmentation.segmentation.action.model_dump(mode="json"),
+            "intermediate_gripper_transitions": [
+                item.model_dump(mode="json")
+                for item in (
+                    segmentation.segmentation.evidence.action_intermediate_transitions
+                )
+            ],
+            "source": common_source,
+        }
+        action_artifact = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="action_candidate",
+            value=action_payload,
+        )
+        end_payload = {
+            "schema_version": "1.0",
+            "component_type": "end_motion_interval_evidence",
+            "action_id": semantics.action_id,
+            "end_motion_id": None,
+            "end_motion_interval": segmentation.segmentation.end_motion.model_dump(
+                mode="json"
+            ),
+            "final_stable_open": (
+                segmentation.segmentation.evidence.final_stable_open.model_dump(
+                    mode="json"
+                )
+            ),
+            "source": common_source,
+        }
+        end_artifact = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="end_motion_candidate",
+            value=end_payload,
+        )
+        return {
+            "grip": {
+                **self._grip_profile_version_summary(grip_version),
+                "object_class_id": semantics.object_class_id,
+                "catalog_status": catalog["object"]["status"],
+                "component_status": "evidence_candidate",
+                "blockers": grip_payload["missing_hardware_evidence"],
+            },
+            "action": {
+                "action_id": semantics.action_id,
+                "catalog_status": catalog["action"]["status"],
+                "component_status": "segmented_evidence_only",
+                "definition_created": False,
+                "artifact_uri": action_artifact.uri,
+                "artifact_checksum_sha256": action_artifact.checksum_sha256,
+                "hardware_compatible": False,
+                "blockers": [
+                    "anchor-relative action geometry is not available",
+                    "an executable Action SkillGraph has not been compiled",
+                ],
+            },
+            "end_motion": {
+                "end_motion_id": None,
+                "component_status": "segmented_evidence_only",
+                "definition_created": False,
+                "mapping_created": False,
+                "artifact_uri": end_artifact.uri,
+                "artifact_checksum_sha256": end_artifact.checksum_sha256,
+                "hardware_compatible": False,
+                "blockers": [
+                    "an approved anchor-relative EndMotion SkillGraph is required",
+                    "Action-to-End mapping must be selected locally after validation",
+                ],
+            },
+        }
+
+    def _induce_rgbd_components(
+        self, source: Path, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Integrity-load and split raw RGB-D evidence without fabricating a skill."""
+
+        dataset = load_rgbd_dataset(source)
+        segmentation_config = GripActionEndSegmentationConfig(
+            finger_close_threshold_m=self.settings.finger_close_threshold_m,
+            finger_state_stable_frames=self.settings.finger_state_stable_frames,
+        )
+        segmentation: RGBDDatasetSegmentation | None = None
+        segmentation_status = "succeeded"
+        segmentation_failure: dict[str, Any] | None = None
+        try:
+            segmentation = segment_rgbd_dataset(
+                dataset,
+                config=segmentation_config,
+            )
+            report_payload: dict[str, Any] = {
+                "schema_version": "1.0",
+                "report_type": "rgbd_grip_action_end_segmentation",
+                "status": "succeeded",
+                "source": {
+                    "recording_id": dataset.manifest.recording_id,
+                    "manifest_checksum_sha256": (
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                    "frame_count": dataset.manifest.frame_count,
+                    "recording_fps": dataset.manifest.recording_fps,
+                },
+                "configuration": segmentation_config.model_dump(mode="json"),
+                "observations": [
+                    item.model_dump(mode="json") for item in segmentation.observations
+                ],
+                "transitions": [
+                    item.model_dump(mode="json") for item in segmentation.transitions
+                ],
+                "segmentation": segmentation.segmentation.model_dump(mode="json"),
+                "executable": False,
+                "hardware_compatible": False,
+            }
+        except GripActionEndSegmentationError as exc:
+            segmentation_status = "structural_failure"
+            segmentation_failure = exc.failure.model_dump(mode="json")
+            report_payload = {
+                "schema_version": "1.0",
+                "report_type": "rgbd_grip_action_end_segmentation",
+                "status": segmentation_status,
+                "source": {
+                    "recording_id": dataset.manifest.recording_id,
+                    "manifest_checksum_sha256": (
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                    "frame_count": dataset.manifest.frame_count,
+                    "recording_fps": dataset.manifest.recording_fps,
+                },
+                "configuration": segmentation_config.model_dump(mode="json"),
+                "failure": segmentation_failure,
+                "executable": False,
+                "hardware_compatible": False,
+            }
+        except NotConfiguredError as exc:
+            segmentation_status = "configuration_failure"
+            segmentation_failure = {
+                "code": "mediapipe_not_configured",
+                "message": str(exc),
+            }
+            report_payload = {
+                "schema_version": "1.0",
+                "report_type": "rgbd_grip_action_end_segmentation",
+                "status": segmentation_status,
+                "source": {
+                    "recording_id": dataset.manifest.recording_id,
+                    "manifest_checksum_sha256": (
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                    "frame_count": dataset.manifest.frame_count,
+                    "recording_fps": dataset.manifest.recording_fps,
+                },
+                "configuration": segmentation_config.model_dump(mode="json"),
+                "failure": segmentation_failure,
+                "executable": False,
+                "hardware_compatible": False,
+            }
+        segmentation_report = self._put_content_addressed_json(
+            recording_id=dataset.manifest.recording_id,
+            artifact_kind="segmentation_report",
+            value=report_payload,
+        )
+
+        transcript, semantic_source = self._approved_training_transcript(request)
+        semantics: TrainingTaskSemantics | None = None
+        semantic_trace: dict[str, Any] | None = None
+        semantic_status = "resolved"
+        semantic_blockers: list[str] = []
+        catalog: dict[str, dict[str, Any]] = {}
+        if transcript is None:
+            semantic_status = "semantics_missing"
+            semantic_blockers.append(
+                "transcript_text or a checksum-pinned finalized teaching artifact is required"
+            )
+        else:
+            semantics, semantic_trace = self._resolve_training_semantics(transcript)
+            if semantics.ambiguity:
+                semantic_status = "semantics_unresolved"
+                semantic_blockers.extend(semantics.unresolved_ambiguities)
+            else:
+                catalog = self._ensure_rgbd_semantic_catalogs(
+                    semantics=semantics,
+                    manifest_checksum_sha256=(
+                        dataset.manifest.manifest_checksum_sha256
+                    ),
+                )
+
+        blockers = list(semantic_blockers)
+        if segmentation_failure is not None:
+            blockers.append(str(segmentation_failure["message"]))
+        components: dict[str, Any] = {
+            "grip": {"component_status": "not_created"},
+            "action": {"component_status": "not_created"},
+            "end_motion": {"component_status": "not_created"},
+        }
+        if (
+            segmentation is not None
+            and semantics is not None
+            and not semantics.ambiguity
+        ):
+            components = self._rgbd_component_candidates(
+                dataset=dataset,
+                segmentation=segmentation,
+                segmentation_report=segmentation_report,
+                semantics=semantics,
+                catalog=catalog,
+            )
+            blockers.extend(
+                [
+                    "Grip evidence lacks an object-relative 6D execution pose",
+                    "Action and EndMotion lack approved anchor-relative SkillGraphs",
+                    "an active Action-to-End mapping has not been created",
+                ]
+            )
+
+        if segmentation_status == "configuration_failure":
+            result_status = "configuration_failure"
+        elif segmentation_status != "succeeded" or semantic_status != "resolved":
+            result_status = "structural_failure"
+        else:
+            result_status = "candidate"
+        segmentation_summary: dict[str, Any] = {
+            "status": segmentation_status,
+            "report_uri": segmentation_report.uri,
+            "report_checksum_sha256": segmentation_report.checksum_sha256,
+            "failure": segmentation_failure,
+        }
+        if segmentation is not None:
+            segmentation_summary.update(
+                {
+                    "grip": segmentation.segmentation.grip.model_dump(mode="json"),
+                    "action": segmentation.segmentation.action.model_dump(mode="json"),
+                    "end_motion": segmentation.segmentation.end_motion.model_dump(
+                        mode="json"
+                    ),
+                    "warnings": [
+                        item.model_dump(mode="json")
+                        for item in segmentation.segmentation.warnings
+                    ],
+                }
+            )
+        return {
+            "skill_id": None,
+            "status": result_status,
+            "active": False,
+            "executable": False,
+            "hardware_compatible": False,
+            "source_demo": self._portable_artifact_reference(source),
+            "dataset": {
+                "recording_id": dataset.manifest.recording_id,
+                "frame_count": dataset.manifest.frame_count,
+                "manifest_checksum_sha256": (
+                    dataset.manifest.manifest_checksum_sha256
+                ),
+                "integrity_verified": True,
+            },
+            "segmentation": segmentation_summary,
+            "segmentation_report_uri": segmentation_report.uri,
+            "segmentation_report_checksum_sha256": (
+                segmentation_report.checksum_sha256
+            ),
+            "semantic_classification": {
+                "status": semantic_status,
+                "source": semantic_source,
+                "result": (
+                    semantics.model_dump(mode="json") if semantics is not None else None
+                ),
+                "trace": semantic_trace,
+            },
+            "catalog": catalog,
+            "selected_components": components,
+            "task_flow_manifest": None,
+            "fitted_operations": [],
+            "promotion_warnings": list(dict.fromkeys(blockers)),
+            "blockers": list(dict.fromkeys(blockers)),
         }
 
     def search_skills(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -1681,7 +3413,7 @@ class MVPApplication:
                     .order_by(SkillVersionRecord.created_at.desc())
                 ).tuples()
             )
-        return {
+        response: dict[str, Any] = {
             "skills": [
                 {
                     **self._version_summary(version, include_graph=True),
@@ -1694,6 +3426,1084 @@ class MVPApplication:
                 for version, skill in rows
             ]
         }
+        hierarchy = self.list_task_flow_hierarchy()
+        if hierarchy["objects"]:
+            response["task_flow_catalog"] = hierarchy
+        return response
+
+    @staticmethod
+    def _catalog_entry_summary(entry: SemanticCatalogRecord) -> dict[str, Any]:
+        return {
+            "id": entry.id,
+            "kind": entry.kind,
+            "canonical_id": entry.canonical_id,
+            "display_name": entry.display_name,
+            "aliases": list(entry.aliases_json),
+            "status": entry.status,
+            "metadata": dict(entry.metadata_json),
+        }
+
+    def _catalog_entry(self, kind: str, identifier: str) -> SemanticCatalogRecord:
+        entry = self.repository.get_catalog_entry(
+            kind=kind, identifier=identifier, active_only=False
+        )
+        if entry is None:
+            raise KeyError(f"unknown {kind} catalog entry {identifier!r}")
+        return entry
+
+    def _create_catalog_entry(
+        self,
+        *,
+        kind: str,
+        canonical_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        metadata = dict(request.get("metadata", {}))
+        if kind in {"action", "end_motion"}:
+            metadata["required_roles"] = list(request.get("required_roles", []))
+            metadata["input_contract"] = dict(request.get("input_contract", {}))
+            metadata["output_contract"] = dict(request.get("output_contract", {}))
+            metadata["anchor_policy"] = dict(request.get("anchor_policy", {}))
+        entry = self.repository.create_catalog_entry(
+            kind=kind,
+            canonical_id=canonical_id,
+            display_name=str(request["display_name"]),
+            aliases=list(request.get("aliases", [])),
+            metadata=metadata,
+        )
+        return self._catalog_entry_summary(entry)
+
+    def create_catalog_object(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._create_catalog_entry(
+            kind="object",
+            canonical_id=str(request["object_class_id"]),
+            request=request,
+        )
+
+    def create_catalog_action(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._create_catalog_entry(
+            kind="action",
+            canonical_id=str(request["action_id"]),
+            request=request,
+        )
+
+    def create_catalog_end_motion(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self._create_catalog_entry(
+            kind="end_motion",
+            canonical_id=str(request["end_motion_id"]),
+            request=request,
+        )
+
+    def _list_catalog_entries(
+        self, *, kind: str, status: str | None, response_key: str
+    ) -> dict[str, Any]:
+        return {
+            response_key: [
+                self._catalog_entry_summary(entry)
+                for entry in self.repository.list_catalog_entries(
+                    kind=kind, status=status
+                )
+            ]
+        }
+
+    def list_catalog_objects(self, *, status: str | None = None) -> dict[str, Any]:
+        return self._list_catalog_entries(
+            kind="object", status=status, response_key="objects"
+        )
+
+    def list_catalog_actions(self, *, status: str | None = None) -> dict[str, Any]:
+        return self._list_catalog_entries(
+            kind="action", status=status, response_key="actions"
+        )
+
+    def list_catalog_end_motions(
+        self, *, status: str | None = None
+    ) -> dict[str, Any]:
+        return self._list_catalog_entries(
+            kind="end_motion", status=status, response_key="end_motions"
+        )
+
+    def get_catalog_object(self, object_class_id: str) -> dict[str, Any]:
+        summary = self._catalog_entry_summary(
+            self._catalog_entry("object", object_class_id)
+        )
+        summary["grip_profile_versions"] = self.list_grip_profiles(
+            object_class_id
+        )["grip_profile_versions"]
+        return summary
+
+    def get_catalog_action(self, action_id: str) -> dict[str, Any]:
+        summary = self._catalog_entry_summary(self._catalog_entry("action", action_id))
+        summary["definitions"] = [
+            self._stage_definition_summary(stage)
+            for stage in self.repository.list_stage_definitions(
+                kind="action", canonical_id=summary["canonical_id"]
+            )
+        ]
+        mapping = self.repository.get_action_end_mapping(
+            action_id=str(summary["canonical_id"]), active_only=False
+        )
+        summary["active_or_latest_end_mapping"] = (
+            self._action_end_mapping_summary(mapping) if mapping is not None else None
+        )
+        return summary
+
+    def get_catalog_end_motion(self, end_motion_id: str) -> dict[str, Any]:
+        summary = self._catalog_entry_summary(
+            self._catalog_entry("end_motion", end_motion_id)
+        )
+        summary["definitions"] = [
+            self._stage_definition_summary(stage)
+            for stage in self.repository.list_stage_definitions(
+                kind="end_motion", canonical_id=summary["canonical_id"]
+            )
+        ]
+        return summary
+
+    def _update_catalog_entry(
+        self, kind: str, identifier: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        entry = self._catalog_entry(kind, identifier)
+        updated = self.repository.update_catalog_entry(entry.id, **request)
+        return self._catalog_entry_summary(updated)
+
+    def update_catalog_object(
+        self, object_class_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._update_catalog_entry("object", object_class_id, request)
+
+    def update_catalog_action(
+        self, action_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._update_catalog_entry("action", action_id, request)
+
+    def _set_catalog_entry_status(
+        self, kind: str, identifier: str, status: str
+    ) -> dict[str, Any]:
+        entry = self._catalog_entry(kind, identifier)
+        updated = self.repository.set_catalog_entry_status(entry.id, status=status)
+        return self._catalog_entry_summary(updated)
+
+    def set_catalog_object_status(
+        self, object_class_id: str, status: str
+    ) -> dict[str, Any]:
+        return self._set_catalog_entry_status("object", object_class_id, status)
+
+    def set_catalog_action_status(
+        self, action_id: str, status: str
+    ) -> dict[str, Any]:
+        return self._set_catalog_entry_status("action", action_id, status)
+
+    def set_catalog_end_motion_status(
+        self, end_motion_id: str, status: str
+    ) -> dict[str, Any]:
+        return self._set_catalog_entry_status("end_motion", end_motion_id, status)
+
+    @staticmethod
+    def _grip_profile_version_summary(
+        version: GripProfileVersionRecord,
+    ) -> dict[str, Any]:
+        return {
+            "id": version.id,
+            "version": version.semantic_version,
+            "status": version.status,
+            "validation_status": version.validation_status,
+            "hardware_compatible": version.hardware_compatible,
+            "auto_activation_allowed": version.auto_activation_allowed,
+            "object_frame_policy": version.object_frame_policy,
+            "object_frame_revision": version.object_frame_revision,
+            "gripper_calibration_profile_id": (
+                version.gripper_calibration_profile_id
+            ),
+            "artifact_uri": version.artifact_uri,
+            "artifact_checksum_sha256": version.artifact_checksum_sha256,
+            "metadata": dict(version.metadata_json),
+        }
+
+    def list_grip_profiles(self, object_class_id: str) -> dict[str, Any]:
+        entry = self._catalog_entry("object", object_class_id)
+        return {
+            "object_class_id": entry.canonical_id,
+            "grip_profile_versions": [
+                self._grip_profile_version_summary(version)
+                for version in self.repository.list_grip_profile_versions(
+                    object_class_id=entry.canonical_id
+                )
+            ],
+        }
+
+    def activate_grip_profile_version(self, version_id: str) -> dict[str, Any]:
+        return self._grip_profile_version_summary(
+            self.repository.activate_grip_profile_version(
+                version_id, automatic=False
+            )
+        )
+
+    @staticmethod
+    def _stage_definition_summary(stage: StageDefinitionRecord) -> dict[str, Any]:
+        return {
+            "id": stage.id,
+            "kind": stage.stage_type,
+            "version": stage.semantic_version,
+            "skill_version_id": stage.skill_version_id,
+            "status": stage.status,
+            "validation_status": stage.validation_status,
+            "hardware_compatible": stage.hardware_compatible,
+            "graph_checksum_sha256": stage.graph_checksum_sha256,
+            "required_roles": list(stage.required_roles_json),
+            "input_contract": dict(stage.input_contract_json),
+            "output_contract": dict(stage.output_contract_json),
+            "anchor_policy": dict(stage.anchor_policy_json),
+            "metadata": dict(stage.metadata_json),
+        }
+
+    def _create_stage_definition(
+        self, *, kind: str, canonical_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        entry = self._catalog_entry(kind, canonical_id)
+        skill_version = self._find_version(
+            str(request["skill_id"]), str(request["skill_version"])
+        )
+        linked_graph = SkillGraph.model_validate(skill_version.graph_json)
+        if linked_graph.skill_id != request["skill_id"]:
+            raise ValueError("stage SkillGraph identity does not match the request")
+        if linked_graph.version != request["component_version"]:
+            raise ValueError(
+                "component_version must equal the exact linked SkillGraph version"
+            )
+        passed = skill_version.validation_status == "passed"
+        stage = self.repository.register_stage_definition(
+            kind=kind,
+            canonical_id=entry.canonical_id,
+            skill_version_id=skill_version.id,
+            semantic_version=str(request["component_version"]),
+            status="validated" if passed else "candidate",
+            validation_status="passed" if passed else "pending",
+            required_roles=list(request.get("required_roles", [])),
+            input_contract=dict(request.get("input_contract", {})),
+            output_contract=dict(request.get("output_contract", {})),
+            anchor_policy=dict(request.get("anchor_policy", {})),
+            metadata=dict(request.get("metadata", {})),
+        )
+        return self._stage_definition_summary(stage)
+
+    def create_action_definition(
+        self, action_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._create_stage_definition(
+            kind="action", canonical_id=action_id, request=request
+        )
+
+    def create_end_motion_definition(
+        self, end_motion_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._create_stage_definition(
+            kind="end_motion", canonical_id=end_motion_id, request=request
+        )
+
+    def activate_stage_definition(self, definition_id: str) -> dict[str, Any]:
+        return self._stage_definition_summary(
+            self.repository.activate_stage_definition(definition_id)
+        )
+
+    def _action_end_mapping_summary(
+        self, mapping: ActionEndMappingRecord
+    ) -> dict[str, Any]:
+        with self.database.session() as session:
+            action_stage = session.get(
+                StageDefinitionRecord, mapping.action_stage_definition_id
+            )
+            end_stage = session.get(
+                StageDefinitionRecord, mapping.end_motion_stage_definition_id
+            )
+            if action_stage is None or end_stage is None:
+                raise ValueError("action/end mapping references a missing stage")
+            action_entry = session.get(
+                SemanticCatalogRecord, action_stage.catalog_entry_id
+            )
+            end_entry = session.get(SemanticCatalogRecord, end_stage.catalog_entry_id)
+            if action_entry is None or end_entry is None:
+                raise ValueError("action/end mapping references a missing catalog entry")
+            action_id = action_entry.canonical_id
+            end_motion_id = end_entry.canonical_id
+            action_definition = self._stage_definition_summary(action_stage)
+            end_motion_definition = self._stage_definition_summary(end_stage)
+        return {
+            "id": mapping.id,
+            "action_id": action_id,
+            "action_definition_id": mapping.action_stage_definition_id,
+            "end_motion_id": end_motion_id,
+            "end_motion_definition_id": mapping.end_motion_stage_definition_id,
+            "revision": mapping.revision,
+            "status": mapping.status,
+            "mapping_checksum_sha256": mapping.mapping_checksum_sha256,
+            "action_definition": action_definition,
+            "end_motion_definition": end_motion_definition,
+            "metadata": dict(mapping.metadata_json),
+        }
+
+    def map_action_end_motion(
+        self, action_id: str, request: dict[str, Any]
+    ) -> dict[str, Any]:
+        mapping = self.repository.map_action_to_end_motion(
+            action_id=self._catalog_entry("action", action_id).canonical_id,
+            end_motion_id=str(request["end_motion_id"]),
+            revision=request.get("revision"),
+            activate=True,
+        )
+        return self._action_end_mapping_summary(mapping)
+
+    def import_grip_point_candidates(self, request: dict[str, Any]) -> dict[str, Any]:
+        raw_path = Path(str(request.get("artifact_path") or ""))
+        path = (
+            raw_path.resolve()
+            if raw_path.is_absolute()
+            else (self.settings.repo_root / raw_path).resolve()
+        )
+        allowed_root = (self.settings.repo_root / "data/test/grip_point").resolve()
+        if path.suffix != ".json" or not path.is_relative_to(allowed_root):
+            raise ValueError(
+                "grip-point imports are restricted to JSON under data/test/grip_point"
+            )
+        imported = GripPointResultImporter(self.repository, self.store).import_file(path)
+        return {
+            "source_checksum_sha256": imported.source_checksum_sha256,
+            "hardware_compatible": False,
+            "auto_activation_allowed": False,
+            "profiles": [
+                {
+                    "object_class_id": item.object_class_id,
+                    "catalog_entry_id": item.catalog_entry_id,
+                    "grip_profile_id": item.grip_profile_id,
+                    "grip_profile_version_id": item.grip_profile_version_id,
+                    "artifact_uri": item.artifact_uri,
+                    "artifact_checksum_sha256": (
+                        item.artifact_checksum_sha256
+                    ),
+                }
+                for item in imported.profiles
+            ],
+        }
+
+    def list_task_flow_hierarchy(self) -> dict[str, Any]:
+        """List the semantic cross-product; composition decides actual compatibility."""
+
+        objects = self.repository.list_catalog_entries(kind="object")
+        actions = self.repository.list_catalog_entries(kind="action")
+        action_components: dict[str, tuple[StageDefinitionRecord | None, Any]] = {}
+        for action in actions:
+            action_components[action.canonical_id] = (
+                self.repository.active_stage_definition(
+                    kind="action", canonical_id=action.canonical_id
+                ),
+                self.repository.get_action_end_mapping(
+                    action_id=action.canonical_id, active_only=True
+                ),
+            )
+        object_items: list[dict[str, Any]] = []
+        for object_entry in objects:
+            active_grip = self.repository.active_grip_profile_version(
+                object_class_id=object_entry.canonical_id
+            )
+            object_items.append(
+                {
+                    **self._catalog_entry_summary(object_entry),
+                    "active_grip_profile": (
+                        self._grip_profile_version_summary(active_grip)
+                        if active_grip is not None
+                        else None
+                    ),
+                    "actions": [
+                        self._task_flow_hierarchy_action(
+                            object_entry=object_entry,
+                            action_entry=action_entry,
+                            active_grip=active_grip,
+                            action_stage=action_components[action_entry.canonical_id][0],
+                            mapping=action_components[action_entry.canonical_id][1],
+                        )
+                        for action_entry in actions
+                    ],
+                }
+            )
+        return {
+            "selection_policy": "active_grip_x_active_action_then_compose",
+            "has_static_object_action_allowlist": False,
+            "objects": object_items,
+        }
+
+    def _task_flow_hierarchy_action(
+        self,
+        *,
+        object_entry: SemanticCatalogRecord,
+        action_entry: SemanticCatalogRecord,
+        active_grip: GripProfileVersionRecord | None,
+        action_stage: StageDefinitionRecord | None,
+        mapping: ActionEndMappingRecord | None,
+    ) -> dict[str, Any]:
+        blockers: list[str] = []
+        if object_entry.status != "active":
+            blockers.append("object catalog entry is not active")
+        if active_grip is None:
+            blockers.append("active, passed GripProfile is missing")
+        if action_entry.status != "active":
+            blockers.append("action catalog entry is not active")
+        if action_stage is None:
+            blockers.append("active, passed ActionDefinition is missing")
+        if mapping is None:
+            blockers.append("active ActionEndMotionMapping is missing")
+        return {
+            **self._catalog_entry_summary(action_entry),
+            "active_action_definition": (
+                self._stage_definition_summary(action_stage)
+                if action_stage is not None
+                else None
+            ),
+            "mapped_end_motion": (
+                self._action_end_mapping_summary(mapping)
+                if mapping is not None
+                else None
+            ),
+            "executable": not blockers,
+            "blockers": blockers,
+        }
+
+    def get_skill_editor_catalog(self) -> dict[str, Any]:
+        """Expose only canonical, locally owned primitive schemas and profile ids."""
+
+        registry = get_default_registry()
+        motion_profiles = self._motion_profiles()
+        force_profiles = self._force_profiles()
+        primitives: list[dict[str, Any]] = []
+        for operation in registry.operation_names():
+            if registry.canonical_operation_name(operation) != operation:
+                continue
+            metadata = registry.metadata(operation)
+            motion_profile_ids = [
+                profile_id
+                for profile_id, profile in motion_profiles.items()
+                if self._editor_motion_profile_supports(operation, profile.motion_kinds)
+            ]
+            force_profile_ids = (
+                sorted(force_profiles)
+                if "force_profile_id" in metadata.typed_parameter_schema.get(
+                    "properties", {}
+                )
+                else []
+            )
+            profile_options = {
+                "motion_profile_ids": motion_profile_ids,
+                "force_profile_ids": force_profile_ids,
+                "recovery_profile_ids": (
+                    ["safe_retract_default"]
+                    if "recovery_profile_id"
+                    in metadata.typed_parameter_schema.get("properties", {})
+                    else []
+                ),
+            }
+            primitives.append(
+                {
+                    **metadata.model_dump(mode="json"),
+                    "approved_profile_ids": profile_options,
+                    "default_arguments": self._editor_default_arguments(
+                        operation,
+                        metadata.typed_parameter_schema,
+                        profile_options,
+                    ),
+                }
+            )
+        return {
+            "schema_version": "1.0",
+            "primitives": primitives,
+            "approved_profiles": {
+                "motion_profile_ids": sorted(motion_profiles),
+                "force_profile_ids": sorted(force_profiles),
+                "recovery_profile_ids": ["safe_retract_default"],
+            },
+            "constraints": {
+                "sequential_only": True,
+                "loops_allowed": False,
+                "branches_allowed": False,
+                "free_form_code_allowed": False,
+                "free_form_json_editor_allowed": False,
+                "inline_velocity_acceleration_force_allowed": False,
+                "candidate_only": True,
+                "hardware_compatible": False,
+            },
+        }
+
+    def preview_skill_editor_blocks(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Validate and compile a sequential graph without writing any artifact."""
+
+        try:
+            graph = self._build_editor_skill_graph(request, version="0.1.0-candidate")
+            report = SkillGraphValidator().inspect(graph)
+            if not report.valid:
+                return {
+                    "valid": False,
+                    "errors": list(report.errors),
+                    "warnings": list(report.warnings),
+                    "persisted": False,
+                }
+            compiled = SkillCompiler().compile(graph)
+        except (RobotSkillError, ValueError) as error:
+            return {
+                "valid": False,
+                "errors": [str(error)],
+                "warnings": [],
+                "persisted": False,
+            }
+        return {
+            "valid": compiled.validation_report.valid,
+            "errors": [],
+            "warnings": list(report.warnings),
+            "persisted": False,
+            "graph_checksum_sha256": SkillCompiler.graph_checksum(graph),
+            "skill_graph": graph.model_dump(mode="json"),
+            "normalized_blocks": [
+                {
+                    "node_id": node.node_id,
+                    "operation": node.operation,
+                    "arguments": report.normalized_arguments[node.node_id],
+                }
+                for node in graph.nodes
+            ],
+        }
+
+    def create_skill_editor_candidate(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Persist an independently created sequential block skill as a Candidate."""
+
+        promotion = PromotionPolicy().evaluate_block_candidate(
+            operator_confirmed=request.get("acknowledge_mock_only") is True
+        )
+        if not promotion.eligible:
+            raise ValueError(
+                "block candidate promotion blocked: "
+                + "; ".join(promotion.blockers)
+            )
+        skill_id = str(request["skill_id"])
+        if self._find_version_optional(skill_id) is not None:
+            raise ValueError(
+                "skill_id already exists; use the checksum-guarded parameter Candidate API"
+            )
+        version = self._next_editor_candidate_version(skill_id)
+        try:
+            graph = self._build_editor_skill_graph(request, version=version)
+            graph = graph.model_copy(
+                update={
+                    "uncertainty": {
+                        **graph.uncertainty,
+                        "promotion_policy": promotion.as_dict(),
+                    }
+                },
+                deep=True,
+            )
+            row = self._persist_graph(
+                graph,
+                status="candidate",
+                validation_status="pending",
+                variant=f"block_{skill_id}",
+            )
+        except RobotSkillError as error:
+            raise ValueError(str(error)) from error
+        validation = self.validate_skill(
+            skill_id,
+            {"version": row.semantic_version, "mode": "mock"},
+        )
+        created = self._find_version(skill_id, row.semantic_version)
+        return {
+            "created": True,
+            "candidate": self._version_summary(created, include_graph=True),
+            "validation": validation,
+            "mock_validation_passed": validation["passed"],
+            "hardware_compatible": False,
+            "promotion_policy": promotion.as_dict(),
+        }
+
+    def create_skill_parameter_candidate(
+        self,
+        skill_id: str,
+        version: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create a checksum-guarded child graph while leaving its parent untouched."""
+
+        if request.get("acknowledge_mock_only") is not True:
+            raise ValueError(
+                "parameter Candidate creation requires Mock-only acknowledgement"
+            )
+        parent = self._find_version(skill_id, version)
+        expected_checksum = str(request["expected_parent_checksum_sha256"])
+        if expected_checksum != parent.graph_checksum_sha256:
+            raise ValueError("parent SkillGraph checksum changed; reload before editing")
+        parent_graph = SkillGraph.model_validate(parent.graph_json)
+        if SkillCompiler.graph_checksum(parent_graph) != parent.graph_checksum_sha256:
+            raise ValueError("stored parent SkillGraph checksum verification failed")
+
+        edits = {
+            str(edit["node_id"]): dict(edit["arguments"])
+            for edit in request["edits"]
+        }
+        known_node_ids = {node.node_id for node in parent_graph.nodes}
+        unknown_node_ids = sorted(set(edits) - known_node_ids)
+        if unknown_node_ids:
+            raise ValueError(f"parameter edits reference unknown nodes {unknown_node_ids}")
+
+        registry = get_default_registry()
+        updated_nodes: list[SkillNode] = []
+        normalized_arguments: list[tuple[str, dict[str, Any]]] = []
+        for node in parent_graph.nodes:
+            if node.node_id not in edits:
+                updated_nodes.append(node.model_copy(deep=True))
+                normalized_arguments.append((node.operation, dict(node.arguments)))
+                continue
+            try:
+                validated = registry.validate_operation(
+                    node.operation,
+                    edits[node.node_id],
+                    skill_type=parent_graph.skill_type.value,
+                )
+            except RobotSkillError as error:
+                raise ValueError(str(error)) from error
+            arguments = validated.model_dump(mode="json", exclude_none=True)
+            self._validate_editor_profiles(node.operation, arguments)
+            updated_nodes.append(
+                node.model_copy(update={"arguments": arguments}, deep=True)
+            )
+            normalized_arguments.append((node.operation, arguments))
+
+        placeholder_hints = self._editor_placeholder_hints(
+            [arguments for _, arguments in normalized_arguments]
+        )
+        for placeholder, hint in placeholder_hints.items():
+            binding = parent_graph.bindings.get(placeholder)
+            if binding is None:
+                raise ValueError(
+                    f"parameter edits cannot introduce new binding {placeholder!r}"
+                )
+            if hint is not None and binding.entity_kind is not hint:
+                raise ValueError(
+                    f"binding {placeholder!r} conflicts with edited anchor/tool type"
+                )
+
+        motion_profile_ids, force_profile_ids = self._editor_declared_profiles(
+            normalized_arguments
+        )
+        candidate_version = self._next_editor_candidate_version(
+            skill_id,
+            parent_version=parent_graph.version,
+        )
+        candidate_graph = parent_graph.model_copy(
+            update={
+                "version": candidate_version,
+                "parent_version": parent_graph.version,
+                "nodes": updated_nodes,
+                "motion_profiles": list(
+                    dict.fromkeys([*parent_graph.motion_profiles, *motion_profile_ids])
+                ),
+                "force_profiles": list(
+                    dict.fromkeys([*parent_graph.force_profiles, *force_profile_ids])
+                ),
+                "uncertainty": {
+                    **parent_graph.uncertainty,
+                    "parameter_candidate": {
+                        "parent_graph_checksum_sha256": expected_checksum,
+                        "edited_node_ids": sorted(edits),
+                    },
+                },
+                "validation_status": ValidationStatus.UNVALIDATED,
+                "lifecycle_status": SkillLifecycleStatus.CANDIDATE,
+            },
+            deep=True,
+        )
+        try:
+            row = self._persist_graph(
+                candidate_graph,
+                status="candidate",
+                validation_status="pending",
+                variant=self._skill_variant(parent),
+                parent_version_id=parent.id,
+            )
+        except RobotSkillError as error:
+            raise ValueError(str(error)) from error
+        validation = self.validate_skill(
+            skill_id,
+            {"version": row.semantic_version, "mode": "mock"},
+        )
+        unchanged_parent = self._find_version(skill_id, parent.semantic_version)
+        return {
+            "created": True,
+            "skill_id": skill_id,
+            "parent_version": parent.semantic_version,
+            "parent_checksum_sha256": parent.graph_checksum_sha256,
+            "parent_unchanged": (
+                unchanged_parent.graph_checksum_sha256 == parent.graph_checksum_sha256
+            ),
+            "candidate": self._version_summary(
+                self._find_version(skill_id, row.semantic_version), include_graph=True
+            ),
+            "validation": validation,
+            "mock_validation_passed": validation["passed"],
+            "hardware_compatible": False,
+        }
+
+    def _build_editor_skill_graph(
+        self,
+        request: dict[str, Any],
+        *,
+        version: str,
+    ) -> SkillGraph:
+        registry = get_default_registry()
+        skill_type = SkillType(str(request.get("skill_type", SkillType.COMPOSITE.value)))
+        normalized_blocks: list[tuple[str, dict[str, Any]]] = []
+        for raw_block in request["blocks"]:
+            operation = str(raw_block["operation"])
+            try:
+                if registry.canonical_operation_name(operation) != operation:
+                    raise ValueError(
+                        f"compatibility alias {operation!r} is not allowed in new block skills"
+                    )
+                validated = registry.validate_operation(
+                    operation,
+                    dict(raw_block.get("arguments", {})),
+                    skill_type=skill_type.value,
+                )
+            except RobotSkillError as error:
+                raise ValueError(str(error)) from error
+            arguments = validated.model_dump(mode="json", exclude_none=True)
+            self._validate_editor_profiles(operation, arguments)
+            normalized_blocks.append((operation, arguments))
+
+        supplied_bindings = {
+            str(key): BindingSpec.model_validate(value)
+            for key, value in dict(request.get("bindings", {})).items()
+        }
+        bindings = self._editor_bindings(
+            [arguments for _, arguments in normalized_blocks],
+            supplied_bindings,
+        )
+        nodes = [
+            SkillNode(
+                node_id=f"block_{index + 1:03d}",
+                operation=operation,
+                arguments=arguments,
+                on_success=(
+                    f"block_{index + 2:03d}"
+                    if index + 1 < len(normalized_blocks)
+                    else None
+                ),
+            )
+            for index, (operation, arguments) in enumerate(normalized_blocks)
+        ]
+        motion_profile_ids, force_profile_ids = self._editor_declared_profiles(
+            normalized_blocks
+        )
+        required_tools = sorted(
+            {
+                binding.class_name
+                for binding in bindings.values()
+                if binding.entity_kind is EntityKind.TOOL
+                and binding.class_name is not None
+            }
+        )
+        required_roles = {
+            placeholder: binding.role
+            for placeholder, binding in bindings.items()
+            if binding.role is not None
+        }
+        return SkillGraph(
+            skill_id=str(request["skill_id"]),
+            version=version,
+            name=str(request["name"]),
+            description=str(request["description"]),
+            skill_type=skill_type,
+            source_demonstrations=[],
+            required_tools=required_tools,
+            required_entity_roles=required_roles,
+            bindings=bindings,
+            nodes=nodes,
+            start_node=nodes[0].node_id,
+            terminal_nodes=[nodes[-1].node_id],
+            motion_profiles=motion_profile_ids,
+            force_profiles=force_profile_ids,
+            uncertainty={
+                "authoring_method": "sequential_block_editor",
+                "demonstration_required": False,
+                "hardware_compatible": False,
+            },
+            validation_status=ValidationStatus.UNVALIDATED,
+            lifecycle_status=SkillLifecycleStatus.CANDIDATE,
+        )
+
+    def _validate_editor_profiles(
+        self,
+        operation: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        motion_profile_id = arguments.get("motion_profile_id")
+        if isinstance(motion_profile_id, str):
+            profiles = self._motion_profiles()
+            profile = profiles.get(motion_profile_id)
+            if profile is None:
+                raise ValueError(
+                    f"motion profile {motion_profile_id!r} is not locally approved"
+                )
+            if not self._editor_motion_profile_supports(
+                operation, profile.motion_kinds
+            ):
+                raise ValueError(
+                    f"motion profile {motion_profile_id!r} does not support {operation!r}"
+                )
+        force_profile_id = arguments.get("force_profile_id")
+        if (
+            isinstance(force_profile_id, str)
+            and force_profile_id not in self._force_profiles()
+        ):
+            raise ValueError(
+                f"force profile {force_profile_id!r} is not locally approved"
+            )
+        recovery_profile_id = arguments.get("recovery_profile_id")
+        if recovery_profile_id not in (None, "safe_retract_default"):
+            raise ValueError(
+                f"recovery profile {recovery_profile_id!r} is not locally approved"
+            )
+
+    @staticmethod
+    def _editor_motion_profile_supports(
+        operation: str,
+        motion_kinds: tuple[str, ...],
+    ) -> bool:
+        supported_kinds = {
+            "motion.move_j": {"move_j"},
+            "motion.move_l": {"move_l"},
+            "motion.move_c": {"move_c"},
+            "motion.move_spline": {"move_spline"},
+            "motion.move_periodic": {"move_periodic"},
+            "contact.follow_path": {"move_l", "move_spline"},
+        }.get(operation)
+        return supported_kinds is None or not supported_kinds.isdisjoint(motion_kinds)
+
+    @staticmethod
+    def _editor_declared_profiles(
+        blocks: list[tuple[str, dict[str, Any]]],
+    ) -> tuple[list[str], list[str]]:
+        motion_profile_ids = list(
+            dict.fromkeys(
+                value
+                for _, arguments in blocks
+                if isinstance((value := arguments.get("motion_profile_id")), str)
+            )
+        )
+        force_profile_ids = list(
+            dict.fromkeys(
+                value
+                for _, arguments in blocks
+                if isinstance((value := arguments.get("force_profile_id")), str)
+            )
+        )
+        return motion_profile_ids, force_profile_ids
+
+    @staticmethod
+    def _editor_placeholder_hints(
+        arguments_list: list[dict[str, Any]],
+    ) -> dict[str, EntityKind | None]:
+        hints: dict[str, EntityKind | None] = {}
+        anchor_type_kinds = {
+            "object": EntityKind.OBJECT,
+            "tool": EntityKind.TOOL,
+            "surface": EntityKind.SURFACE,
+            "fixture": EntityKind.SURFACE,
+            "workspace_region": EntityKind.WORKSPACE,
+        }
+
+        def visit(value: Any, key: str | None = None) -> None:
+            if isinstance(value, dict):
+                anchor_id = value.get("anchor_id")
+                anchor_type = value.get("anchor_type")
+                if isinstance(anchor_id, str) and anchor_id.startswith("$"):
+                    inferred = (
+                        anchor_type_kinds.get(str(anchor_type))
+                        if anchor_type is not None
+                        else None
+                    )
+                    previous = hints.get(anchor_id)
+                    if previous is not None and inferred is not None and previous is not inferred:
+                        raise ValueError(
+                            f"binding {anchor_id!r} is used with conflicting anchor types"
+                        )
+                    hints[anchor_id] = previous or inferred
+                for child_key, child in value.items():
+                    visit(child, str(child_key))
+                return
+            if isinstance(value, list):
+                for child in value:
+                    visit(child, key)
+                return
+            if not isinstance(value, str) or not value.startswith("$"):
+                return
+            inferred = (
+                {
+                    "tool": EntityKind.TOOL,
+                    "surface": EntityKind.SURFACE,
+                    "region": EntityKind.WORKSPACE,
+                    "anchor_id": None,
+                }.get(key)
+                if key is not None
+                else None
+            )
+            previous = hints.get(value)
+            if previous is not None and inferred is not None and previous is not inferred:
+                raise ValueError(f"binding {value!r} has conflicting parameter roles")
+            hints[value] = previous or inferred
+
+        for arguments in arguments_list:
+            visit(arguments)
+        return hints
+
+    def _editor_bindings(
+        self,
+        arguments_list: list[dict[str, Any]],
+        supplied: dict[str, BindingSpec],
+    ) -> dict[str, BindingSpec]:
+        hints = self._editor_placeholder_hints(arguments_list)
+        unused = sorted(set(supplied) - set(hints))
+        if unused:
+            raise ValueError(f"block skill declares unused bindings {unused}")
+        bindings: dict[str, BindingSpec] = {}
+        conventional = {
+            "$tool": EntityKind.TOOL,
+            "$surface": EntityKind.SURFACE,
+            "$object": EntityKind.OBJECT,
+            "$workspace": EntityKind.WORKSPACE,
+        }
+        for placeholder, hint in hints.items():
+            existing = supplied.get(placeholder)
+            if existing is not None:
+                if existing.variable != placeholder:
+                    raise ValueError("binding dictionary key must match binding variable")
+                if hint is not None and existing.entity_kind is not hint:
+                    raise ValueError(
+                        f"binding {placeholder!r} conflicts with its parameter role"
+                    )
+                bindings[placeholder] = existing
+                continue
+            entity_kind = hint or conventional.get(placeholder)
+            if entity_kind is None:
+                raise ValueError(
+                    f"binding {placeholder!r} needs an explicit typed binding specification"
+                )
+            bindings[placeholder] = BindingSpec(
+                variable=placeholder,
+                entity_kind=entity_kind,
+                must_be_attached=True if entity_kind is EntityKind.TOOL else None,
+            )
+        return bindings
+
+    def _next_editor_candidate_version(
+        self,
+        skill_id: str,
+        *,
+        parent_version: str | None = None,
+    ) -> str:
+        parent = SemanticVersion.parse(parent_version) if parent_version else None
+        major = parent.major if parent is not None else 0
+        starting_minor = parent.minor + 1 if parent is not None else 1
+        for minor in range(starting_minor, starting_minor + 1000):
+            candidate = f"{major}.{minor}.0-candidate"
+            if self._find_version_optional(skill_id, candidate) is None:
+                return candidate
+        raise ValueError("no editor Candidate semantic-version slot remains")
+
+    def _editor_default_arguments(
+        self,
+        operation: str,
+        schema: dict[str, Any],
+        profile_options: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        def resolve(item: dict[str, Any]) -> dict[str, Any]:
+            reference = item.get("$ref")
+            if isinstance(reference, str) and reference.startswith("#/$defs/"):
+                definitions = schema.get("$defs")
+                resolved = (
+                    definitions.get(reference.rsplit("/", 1)[-1])
+                    if isinstance(definitions, dict)
+                    else None
+                )
+                return resolved if isinstance(resolved, dict) else item
+            variants = item.get("anyOf")
+            if isinstance(variants, list):
+                selected = next(
+                    (
+                        variant
+                        for variant in variants
+                        if isinstance(variant, dict) and variant.get("type") != "null"
+                    ),
+                    item,
+                )
+                return resolve(selected)
+            return item
+
+        def default_value(item: dict[str, Any], field_name: str) -> Any:
+            resolved = resolve(item)
+            if field_name == "motion_profile_id":
+                options = profile_options["motion_profile_ids"]
+                return options[0] if options else ""
+            if field_name == "force_profile_id":
+                options = profile_options["force_profile_ids"]
+                return options[0] if options else ""
+            if field_name == "recovery_profile_id":
+                return "safe_retract_default"
+            if field_name == "anchor_id":
+                return "$surface"
+            if field_name == "anchor_type":
+                return "surface"
+            if field_name == "tool":
+                return "$tool"
+            if field_name == "surface":
+                return "$surface"
+            if field_name == "region":
+                return "$workspace"
+            if "default" in resolved:
+                return resolved["default"]
+            enum = resolved.get("enum")
+            if isinstance(enum, list) and enum:
+                return enum[0]
+            item_type = resolved.get("type")
+            if item_type == "object" or "properties" in resolved:
+                required = set(resolved.get("required", []))
+                return {
+                    key: default_value(child, key)
+                    for key, child in resolved.get("properties", {}).items()
+                    if key in required or "default" in resolve(child)
+                }
+            if item_type == "array":
+                count = int(resolved.get("minItems", 0))
+                return [
+                    default_value(dict(resolved.get("items", {})), field_name)
+                    for _ in range(count)
+                ]
+            if item_type == "integer":
+                return int(resolved.get("minimum", 1))
+            if item_type == "number":
+                if field_name == "width_m":
+                    return 0.05
+                if field_name == "w":
+                    return 1.0
+                if "exclusiveMinimum" in resolved:
+                    return float(resolved["exclusiveMinimum"]) + 1.0
+                return float(resolved.get("minimum", 0.0))
+            if item_type == "boolean":
+                return False
+            return ""
+
+        generated = default_value(schema, "arguments")
+        arguments: dict[str, Any] = generated if isinstance(generated, dict) else {}
+        if operation == "motion.move_periodic":
+            arguments.setdefault("amplitude_m", {})["x"] = 0.01
+        try:
+            validated = get_default_registry().validate_arguments(operation, arguments)
+        except RobotSkillError:
+            return arguments
+        return validated.model_dump(mode="json", exclude_none=True)
 
     def get_skill(self, skill_id: str, version: str | None = None) -> dict[str, Any]:
         row = self._find_version(skill_id, version)
@@ -1860,8 +4670,19 @@ class MVPApplication:
             ),
             parent_normalized_path_m=self._parent_normalized_path(parent_graph),
         )
+        candidate_graph = proposal.candidate_graph
+        if evidence.promotion_warnings:
+            candidate_graph = candidate_graph.model_copy(
+                update={
+                    "uncertainty": {
+                        **candidate_graph.uncertainty,
+                        "promotion_warnings": list(evidence.promotion_warnings),
+                    }
+                },
+                deep=True,
+            )
         version = self._persist_graph(
-            proposal.candidate_graph,
+            candidate_graph,
             status="candidate",
             validation_status="pending",
             variant=proposal.variant,
@@ -1875,10 +4696,30 @@ class MVPApplication:
             "variant": self._skill_variant(version),
             "force_profile_preserved": proposal.force_profile_preserved,
             "components": [component.value for component in proposal.components],
+            "promotion_warnings": list(evidence.promotion_warnings),
         }
 
     def resolve_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         scene = self._scene(str(request["scene_id"])) if request.get("scene_id") else None
+        active_objects = self.repository.list_catalog_entries(
+            kind="object", status="active"
+        )
+        active_actions = self.repository.list_catalog_entries(
+            kind="action", status="active"
+        )
+        if active_objects or active_actions:
+            if not active_objects or not active_actions:
+                raise ValueError(
+                    "task-flow runtime requires both active object and action catalogs"
+                )
+            if scene is None:
+                raise ValueError("task-flow runtime resolution requires a current scene_id")
+            return self._resolve_task_flow_intent(
+                text=str(request["text"]),
+                scene=scene,
+                active_objects=active_objects,
+                active_actions=active_actions,
+            )
         entity_ids: list[str] = []
         if scene is not None:
             entity_ids = [
@@ -1909,12 +4750,330 @@ class MVPApplication:
             "intent": intent.model_dump(mode="json"),
             "trace": metadata.model_dump(mode="json"),
             "skill_candidates": matches,
+            "resolver_mode": "legacy_monolithic_compatibility",
         }
+
+    @staticmethod
+    def _task_scene_entities(
+        scene: SceneSnapshot,
+    ) -> dict[str, dict[str, str]]:
+        entities: dict[str, dict[str, str]] = {}
+        for object_item in scene.objects:
+            entities[object_item.instance_id] = {
+                "kind": "object",
+                "class_or_role": object_item.class_name,
+            }
+        for tool_item in scene.tools:
+            entities[tool_item.instance_id] = {
+                "kind": "tool",
+                "class_or_role": tool_item.tool_class,
+            }
+        for surface_item in scene.surfaces:
+            entities[surface_item.instance_id] = {
+                "kind": "surface",
+                "class_or_role": surface_item.role.value,
+            }
+        for region_item in scene.workspace_regions:
+            entities[region_item.region_id] = {
+                "kind": "workspace_region",
+                "class_or_role": region_item.role.value,
+            }
+        return entities
+
+    def _resolve_task_flow_intent(
+        self,
+        *,
+        text: str,
+        scene: SceneSnapshot,
+        active_objects: list[SemanticCatalogRecord],
+        active_actions: list[SemanticCatalogRecord],
+    ) -> dict[str, Any]:
+        object_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in active_objects
+        }
+        action_catalog = {
+            item.canonical_id: tuple(
+                dict.fromkeys([item.display_name, *item.aliases_json])
+            )
+            for item in active_actions
+        }
+        stages = {
+            item.canonical_id: self.repository.active_stage_definition(
+                kind="action", canonical_id=item.canonical_id
+            )
+            for item in active_actions
+        }
+        if any(stage is None for stage in stages.values()):
+            raise ValueError("active action catalog contains no active ActionDefinition")
+        required_roles = {
+            action_id: tuple(stage.required_roles_json)
+            for action_id, stage in stages.items()
+            if stage is not None
+        }
+        intent, metadata = TaskIntentResolver(self.settings).resolve(
+            text,
+            object_catalog=object_catalog,
+            action_catalog=action_catalog,
+            scene_entities=self._task_scene_entities(scene),
+            required_roles=required_roles,
+        )
+        grip = self.repository.active_grip_profile_version(
+            object_class_id=intent.object_class_id
+        )
+        action_stage = stages[intent.action_id]
+        mapping = self.repository.get_action_end_mapping(
+            action_id=intent.action_id, active_only=True
+        )
+        blockers: list[str] = []
+        if grip is None:
+            blockers.append("active, passed GripProfile is missing")
+        if action_stage is None:
+            blockers.append("active, passed ActionDefinition is missing")
+        if mapping is None:
+            blockers.append("active ActionEndMotionMapping is missing")
+        if intent.ambiguity:
+            blockers.extend(intent.unresolved_ambiguities or ["task intent is ambiguous"])
+        selected = {
+            "grip": (
+                self._grip_profile_version_summary(grip)
+                if grip is not None
+                else None
+            ),
+            "action": (
+                self._stage_definition_summary(action_stage)
+                if action_stage is not None
+                else None
+            ),
+            "end_motion_mapping": (
+                self._action_end_mapping_summary(mapping)
+                if mapping is not None
+                else None
+            ),
+        }
+        task_flow_manifest: dict[str, Any] | None = None
+        results: list[dict[str, Any]] = []
+        if not blockers:
+            try:
+                materialized = TaskFlowMaterializer(
+                    self.repository, self.store
+                ).materialize(
+                    object_class_id=intent.object_class_id,
+                    action_id=intent.action_id,
+                    resolved_role_bindings=intent.role_bindings,
+                    require_hardware_compatible=False,
+                )
+                row = self._persist_graph(
+                    materialized.graph,
+                    status="active",
+                    validation_status="passed",
+                    variant="task_flow_composite",
+                    index_for_legacy_retrieval=False,
+                )
+                suggested_bindings = dict(intent.role_bindings)
+                if intent.object_instance_id is not None:
+                    suggested_bindings["$object"] = intent.object_instance_id
+                preflight = self._preflight_materialized_flow(
+                    row=row,
+                    graph=materialized.graph,
+                    scene=scene,
+                    binding_hints=suggested_bindings,
+                )
+                preflight_blockers = [
+                    f"{item['name']}: {item.get('detail') or 'failed'}"
+                    for item in preflight["checks"]
+                    if not item["passed"]
+                ]
+                blockers.extend(preflight_blockers)
+                storage_plan = self.repository.record_task_flow_plan(
+                    grip_profile_version_id=(
+                        materialized.selection.grip_profile_version_id
+                    ),
+                    action_end_mapping_id=(
+                        materialized.selection.action_end_mapping_record_id
+                    ),
+                    composer_version=materialized.manifest.composer_version,
+                    composite_skill_version_id=row.id,
+                    validation_status=(
+                        "passed" if preflight["passed"] else "failed"
+                    ),
+                    hardware_compatible=False,
+                    metadata={
+                        "composer_plan_checksum_sha256": (
+                            materialized.manifest.plan_checksum_sha256
+                        )
+                    },
+                )
+                task_flow_manifest = {
+                    **materialized.manifest.model_dump(mode="json"),
+                    "storage_plan_id": storage_plan.id,
+                    "storage_plan_checksum_sha256": (
+                        storage_plan.plan_checksum_sha256
+                    ),
+                    "selection": materialized.selection.model_dump(mode="json"),
+                    "preflight": preflight,
+                }
+                results.append(
+                    {
+                        "skill_id": materialized.graph.skill_id,
+                        "version": materialized.graph.version,
+                        "name": materialized.graph.name,
+                        "score": 1.0,
+                        "factors": {
+                            "selection": "exact active Grip + Action + mapped End",
+                            "embedding_used": False,
+                        },
+                        "bindings": suggested_bindings,
+                        "executable": preflight["passed"],
+                        "blockers": preflight_blockers,
+                    }
+                )
+            except (
+                RobotSkillError,
+                RuntimeErrorBase,
+                ValueError,
+            ) as exc:
+                blockers.append(f"composition rejected: {exc}")
+        return {
+            "intent": intent.model_dump(mode="json"),
+            "trace": metadata.model_dump(mode="json"),
+            "resolver_mode": "grip_action_end_hierarchical",
+            "selected_components": selected,
+            "task_flow_manifest": task_flow_manifest,
+            "skill_candidates": {
+                "mode": "hierarchical_component_selection",
+                "results": results,
+                "blockers": blockers,
+            },
+        }
+
+    def _preflight_materialized_flow(
+        self,
+        *,
+        row: SkillVersionRecord,
+        graph: SkillGraph,
+        scene: SceneSnapshot,
+        binding_hints: dict[str, str],
+    ) -> dict[str, Any]:
+        requirements = [
+            requirement.model_copy(
+                update={"instance_id": binding_hints.get(requirement.variable)}
+            )
+            if requirement.variable in binding_hints
+            else requirement
+            for requirement in graph.binding_requirements()
+        ]
+        bindings = EntityBinder().bind_entities(
+            scene,
+            requirements,
+            maximum_scene_age_ms=self.settings.scene_freshness_ms,
+        )
+        robot = MockRobotAdapter()
+        robot.connect()
+        report = PreflightValidator().validate(
+            scene=scene,
+            skill=graph,
+            bindings=bindings,
+            robot=robot,
+            execution_mode=ExecutionMode.MOCK,
+            skill_validation_status=row.validation_status,
+            expected_calibration_id=scene.calibration_id,
+            expected_tool_class=(
+                graph.required_tools[0] if graph.required_tools else None
+            ),
+            skill_uses_force=bool(graph.force_profiles),
+            motion_profiles=self._motion_profiles(),
+            force_profiles=self._force_profiles(),
+            verification_profiles=self._verification_profiles(),
+            safety_policy=self._safety_policy(),
+            robot_backend="mock",
+            enable_real_robot=False,
+            dry_run=True,
+            raise_on_failure=False,
+        )
+        return report.as_dict()
+
+    def _scene_with_graph_task_plane(
+        self, scene: SceneSnapshot, graph: SkillGraph
+    ) -> SceneSnapshot:
+        """Attach the graph's exact calibrated task plane to a fresh Scene."""
+
+        uncertainty = graph.uncertainty
+        anchor_id = uncertainty.get("task_plane_anchor_id")
+        camera_transform_payload = uncertainty.get("camera_to_task_plane")
+        source_frame = uncertainty.get("task_plane_source_frame")
+        if not isinstance(anchor_id, str) or not isinstance(
+            camera_transform_payload, dict
+        ):
+            return scene
+        transform_payload: dict[str, Any] | None = None
+        transform_source = "camera_relative_task_plane"
+        base_chain = uncertainty.get("base_chain")
+        if (
+            scene.reference_frame in {"base", "base_link", "robot_base"}
+            and isinstance(base_chain, dict)
+            and base_chain.get("verified") is True
+            and isinstance(base_chain.get("base_to_task_plane"), dict)
+        ):
+            transform_payload = base_chain["base_to_task_plane"]
+            transform_source = "verified_base_task_plane_chain"
+        elif scene.reference_frame == source_frame:
+            transform_payload = camera_transform_payload
+        if transform_payload is None:
+            return scene
+        transform = RigidTransform.model_validate(transform_payload)
+        normal = rotate_vector(
+            transform.rotation_xyzw,
+            Vector3(x=0.0, y=0.0, z=1.0),
+        )
+        allowed_contact_links = sorted(
+            {
+                link
+                for surface in scene.surfaces
+                for link in surface.allowed_contact_links
+            }
+        )
+        task_plane = SurfaceInstance(
+            instance_id=anchor_id,
+            role=SurfaceRole.CONTACT_TARGET,
+            pose=Pose(
+                frame_id=scene.reference_frame,
+                position_m=transform.translation_m,
+                orientation_xyzw=transform.rotation_xyzw,
+                timestamp_ns=scene.timestamp_ns,
+                source=transform_source,
+                confidence=0.99,
+            ),
+            center_m=transform.translation_m,
+            normal=normal,
+            boundary_m=[],
+            confidence=0.99,
+            allowed_contact_links=allowed_contact_links,
+            material="operator_confirmed_task_plane",
+        )
+        surfaces = [
+            surface for surface in scene.surfaces if surface.instance_id != anchor_id
+        ]
+        surfaces.append(task_plane)
+        return scene.model_copy(
+            update={
+                "surfaces": surfaces,
+                "calibration_id": str(
+                    uncertainty.get("task_plane_calibration_id")
+                    or scene.calibration_id
+                ),
+            },
+            deep=True,
+        )
 
     def bind_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         row = self._find_version(str(request["skill_id"]), request.get("version"))
         graph = SkillGraph.model_validate(row.graph_json)
-        scene = self._scene(str(request["scene_id"]))
+        scene = self._scene_with_graph_task_plane(
+            self._scene(str(request["scene_id"])), graph
+        )
         hints = dict(request.get("entity_hints", {}))
         requirements = [
             requirement.model_copy(update={"instance_id": hints.get(requirement.variable)})
@@ -1951,6 +5110,7 @@ class MVPApplication:
             skill_uses_force=bool(graph.force_profiles),
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             safety_policy=safety_policy,
             robot_backend=self.settings.robot_backend,
             enable_real_robot=self.settings.enable_real_robot,
@@ -1960,11 +5120,26 @@ class MVPApplication:
 
     def execute_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         requested_mode = str(request.get("mode", "mock"))
+        mock_override = request.get("mock_override")
+        if mock_override is not None:
+            if requested_mode != "mock":
+                raise ValueError("validation override is available only in mode=mock")
+            if (
+                mock_override.get("override_all_overridable") is not True
+                or mock_override.get("acknowledge_mock_only") is not True
+                or not str(mock_override.get("operator_id") or "").strip()
+                or not str(mock_override.get("reason") or "").strip()
+            ):
+                raise ValueError(
+                    "Mock override requires operator, reason, and explicit acknowledgements"
+                )
         if requested_mode == "hardware":
             if not self.settings.hardware_enabled:
                 raise ValueError("hardware execution gates are not all enabled")
             raise ValueError("Doosan hardware adapter is not configured or physically validated")
-        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(request)
+        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(
+            request, allow_mock_candidate=mock_override is not None
+        )
         safety_policy = self._safety_policy()
         report = PreflightValidator().validate(
             scene=scene,
@@ -1972,11 +5147,14 @@ class MVPApplication:
             bindings=bindings,
             robot=robot,
             execution_mode=ExecutionMode(requested_mode),
-            skill_validation_status=row.validation_status,
+            skill_validation_status=(
+                "passed" if mock_override is not None else row.validation_status
+            ),
             expected_tool_class=graph.required_tools[0] if graph.required_tools else None,
             skill_uses_force=bool(graph.force_profiles),
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             safety_policy=safety_policy,
             robot_backend="mock",
             enable_real_robot=False,
@@ -1986,11 +5164,35 @@ class MVPApplication:
         gripper = MockGripperAdapter()
         gripper.connect()
         event_sink = InMemoryEventSink()
+        if mock_override is not None:
+            bypassed_check_ids = [
+                check_id
+                for check_id, bypassed
+                in (
+                    ("component_lifecycle_active", row.status != "active"),
+                    ("skill_validation", row.validation_status != "passed"),
+                )
+                if bypassed
+            ]
+            event_sink.record(
+                "mock_validation_override",
+                {
+                    "operator_id": str(mock_override["operator_id"]),
+                    "reason": str(mock_override["reason"]),
+                    "override_all_overridable": True,
+                    "acknowledge_mock_only": True,
+                    "bypassed_check_ids": bypassed_check_ids,
+                    "component_activation_changed": False,
+                    "hardware_compatibility_changed": False,
+                },
+                severity="warning",
+            )
         context = RuntimeContext(
             scene=scene,
             bindings=bindings,
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             execution_mode=ExecutionMode(requested_mode),
             skill=graph,
             safety_policy=safety_policy,
@@ -2136,7 +5338,10 @@ class MVPApplication:
             }
 
     def _runtime_parts(
-        self, request: dict[str, Any]
+        self,
+        request: dict[str, Any],
+        *,
+        allow_mock_candidate: bool = False,
     ) -> tuple[
         SkillVersionRecord,
         SkillGraph,
@@ -2148,10 +5353,23 @@ class MVPApplication:
     ]:
         row = self._find_version(str(request["skill_id"]), request.get("version"))
         if row.status != "active" or row.validation_status != "passed":
-            raise ValueError("runtime accepts only active, validated skill versions")
+            if not allow_mock_candidate:
+                raise ValueError("runtime accepts only active, validated skill versions")
+            if row.status not in {"candidate", "validated"}:
+                raise ValueError(
+                    "Mock override cannot run rejected or retired skill versions"
+                )
+            if row.validation_status == "failed":
+                raise ValueError(
+                    "Mock override cannot bypass a failed deterministic validation"
+                )
         verify_skill_checksum(row.graph_json, row.graph_checksum_sha256)
         graph = SkillGraph.model_validate(row.graph_json)
-        scene = self._scene(str(request["scene_id"]))
+        SkillGraphValidator().validate(graph)
+        SkillCompiler().compile(graph)
+        scene = self._scene_with_graph_task_plane(
+            self._scene(str(request["scene_id"])), graph
+        )
         hints = dict(request.get("bindings", {}))
         requirements = [
             requirement.model_copy(update={"instance_id": hints.get(requirement.variable)})
@@ -2173,7 +5391,10 @@ class MVPApplication:
     ) -> dict[str, Any]:
         """Compile, bind, preflight, and execute a candidate against a fresh mock scene."""
 
-        scene = capture_mock_scene(frame_count=self.settings.scene_burst_frame_count)
+        scene = self._scene_with_graph_task_plane(
+            capture_mock_scene(frame_count=self.settings.scene_burst_frame_count),
+            graph,
+        )
         bindings = EntityBinder().bind_entities(
             scene,
             graph.binding_requirements(),
@@ -2197,6 +5418,7 @@ class MVPApplication:
             skill_uses_force=bool(graph.force_profiles),
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             safety_policy=safety_policy,
             robot_backend="mock",
             enable_real_robot=False,
@@ -2208,6 +5430,7 @@ class MVPApplication:
             bindings=bindings,
             motion_profiles=motion,
             force_profiles=force,
+            verification_profiles=self._verification_profiles(),
             execution_mode=ExecutionMode.MOCK,
             skill=graph,
             safety_policy=safety_policy,
@@ -2236,10 +5459,18 @@ class MVPApplication:
             event_sink=event_sink,
         )
         asyncio.run(executor.execute_compiled(self._load_verified_run(row, graph)))
+        gripper_state = gripper.get_state()
         return {
             "passed": True,
             "preflight": preflight.as_dict(),
             "robot_commands": [command.operation for command in robot.commands],
+            "gripper_commands": [operation for operation, _ in gripper.commands],
+            "final_gripper_state": {
+                "connected": gripper_state.connected,
+                "width_m": gripper_state.width_m,
+                "is_holding": gripper_state.is_holding,
+                "fault_code": gripper_state.fault_code,
+            },
             "events": [event.event_type for event in event_sink.events],
         }
 
@@ -2289,6 +5520,12 @@ class MVPApplication:
             self.settings.repo_root / "configs/force_profiles/default.json"
         )
 
+    def _verification_profiles(self) -> dict[str, Any]:
+        return load_grasp_verification_profiles(
+            self.settings.repo_root
+            / "configs/grasp_verification_profiles/default.json"
+        )
+
     def _safety_policy(self) -> SafetyPolicy:
         policies = load_safety_policies(
             self.settings.repo_root / "configs/safety_policies/default.json"
@@ -2303,6 +5540,7 @@ class MVPApplication:
         validation_status: str,
         variant: str,
         parent_version_id: str | None = None,
+        index_for_legacy_retrieval: bool = True,
     ) -> SkillVersionRecord:
         graph_report = SkillGraphValidator().validate(graph)
         compiled = SkillCompiler().compile(graph)
@@ -2350,7 +5588,12 @@ class MVPApplication:
             raise ValueError("skill manifest checksum verification failed")
         existing = self._find_version_optional(graph.skill_id, graph.version)
         if existing is not None:
-            self._ensure_skill_embedding(existing, graph)
+            if existing.graph_checksum_sha256 != graph_artifact.checksum_sha256:
+                raise ValueError(
+                    "existing skill identity/version has a different graph checksum"
+                )
+            if index_for_legacy_retrieval:
+                self._ensure_skill_embedding(existing, graph)
             return existing
         registered = self.repository.register_skill_version(
             name=graph.name,
@@ -2366,7 +5609,8 @@ class MVPApplication:
             validation_status=validation_status,
             hardware_compatible=False,
         )
-        self._ensure_skill_embedding(registered, graph)
+        if index_for_legacy_retrieval:
+            self._ensure_skill_embedding(registered, graph)
         return registered
 
     def _ensure_skill_embedding(
@@ -2517,6 +5761,7 @@ class MVPApplication:
             "version": row.semantic_version,
             "status": row.status,
             "validation_status": row.validation_status,
+            "graph_checksum_sha256": row.graph_checksum_sha256,
             "generated_code_uri": row.generated_code_uri,
             "generated_code_checksum_sha256": row.generated_code_checksum_sha256,
             "hardware_compatible": row.hardware_compatible,
@@ -2545,12 +5790,28 @@ class MVPApplication:
         trajectory = self._load_demonstration_source(source)
         if trajectory.successful is False:
             raise ValueError("failed demonstrations cannot induce or update a skill")
-        processed = preprocess_trajectory(trajectory)
+        warnings: list[str] = []
+        try:
+            processed = preprocess_trajectory(trajectory)
+        except TrajectoryPreprocessingError as exc:
+            # Preserve a locally analyzable Candidate for operator review even
+            # when every pose falls below the normal observation threshold.
+            # This fallback changes no robot safety/profile threshold.
+            processed = preprocess_trajectory(
+                trajectory,
+                replace(PreprocessingConfig(), confidence_threshold=0.0),
+            )
+            warnings.append(f"low-quality preprocessing fallback: {exc}")
         quality = assess_trajectory_quality(processed)
-        segmentation = segment_trajectory(processed)
-        if quality.reteach_required or segmentation.reteach_required:
-            reason = quality.reason or segmentation.reason or "insufficient demonstration quality"
-            raise ValueError(f"demonstration requires reteaching: {reason}")
+        segmentation = segment_trajectory(trajectory)
+        if quality.reteach_required:
+            warnings.append(
+                quality.reason or "local quality assessment recommends reteaching"
+            )
+        if segmentation.reteach_required:
+            warnings.append(
+                segmentation.reason or "local segmentation recommends reteaching"
+            )
         return DemonstrationEvidence(
             source=source,
             trajectory=trajectory,
@@ -2558,6 +5819,7 @@ class MVPApplication:
             quality=quality,
             summary=summarize_trajectory(processed),
             recommendation=recommend_primitive(processed),
+            promotion_warnings=tuple(dict.fromkeys(warnings)),
         )
 
     @staticmethod
@@ -2671,6 +5933,7 @@ class MVPApplication:
             candidate = repo_candidate if repo_candidate.exists() else artifact_candidate
         allowed_roots = (
             (self.settings.repo_root / "tests/fixtures").resolve(),
+            (self.settings.repo_root / "data/demonstrations").resolve(),
             (self.settings.artifact_root / "demonstrations").resolve(),
         )
         if not any(candidate == root or root in candidate.parents for root in allowed_roots):

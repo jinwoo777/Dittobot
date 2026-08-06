@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,10 @@ from robot_skill_system.openai_integration.client import (
     OpenAIClientFactory,
     RetryExecutor,
 )
-from robot_skill_system.openai_integration.demonstration_analyzer import DemonstrationAnalyzer
+from robot_skill_system.openai_integration.demonstration_analyzer import (
+    ANALYZER_INSTRUCTIONS,
+    DemonstrationAnalyzer,
+)
 from robot_skill_system.openai_integration.embeddings import (
     SkillEmbeddingService,
     SkillSearchDocument,
@@ -24,6 +28,9 @@ from robot_skill_system.openai_integration.embeddings import (
 from robot_skill_system.openai_integration.intent_resolver import RuntimeIntentResolver
 from robot_skill_system.openai_integration.mock_client import MockOpenAIClient
 from robot_skill_system.openai_integration.recording_skill_analyzer import (
+    FIRST_FRAME_TRACE_INSTRUCTIONS,
+    RECORDING_PDF_FALLBACK_INSTRUCTIONS,
+    RECORDING_SKILL_INSTRUCTIONS,
     ImageInputRejectedError,
     RecordingSkillDraftAnalyzer,
 )
@@ -36,7 +43,10 @@ from robot_skill_system.openai_integration.schemas import (
     RuntimeIntent,
     SkillGraphProposal,
 )
-from robot_skill_system.openai_integration.skill_composer import SkillGraphComposer
+from robot_skill_system.openai_integration.skill_composer import (
+    COMPOSER_INSTRUCTIONS,
+    SkillGraphComposer,
+)
 from robot_skill_system.openai_integration.transcription import TranscriptionService
 from robot_skill_system.settings import Settings
 
@@ -57,6 +67,43 @@ def analysis_input(confidence: float = 0.9) -> DemonstrationAnalysisInput:
         approved_force_profiles=["wipe_standard"],
         motion_fitting_candidates=[{"operation": "motion.move_l"}],
         confidence_summary={"pose": confidence},
+    )
+
+
+def test_all_semantic_motion_prompts_share_local_simplification_policy() -> None:
+    prompts = (
+        RECORDING_SKILL_INSTRUCTIONS,
+        RECORDING_PDF_FALLBACK_INSTRUCTIONS,
+        FIRST_FRAME_TRACE_INSTRUCTIONS,
+        ANALYZER_INSTRUCTIONS,
+        COMPOSER_INSTRUCTIONS,
+    )
+
+    for prompt in prompts:
+        assert "Preserve intended contact phases" in prompt
+        assert "gripper state-transition boundary" in prompt
+        assert "motion.move_l" in prompt
+        assert "motion.move_c only" in prompt
+        assert "motion.move_spline only as a fallback" in prompt
+        assert "classification thresholds" in prompt
+        assert "minimum primitive sequence" in prompt
+        assert "local motion fitter is authoritative" in prompt
+
+    for prompt in (
+        RECORDING_SKILL_INSTRUCTIONS,
+        RECORDING_PDF_FALLBACK_INSTRUCTIONS,
+        FIRST_FRAME_TRACE_INSTRUCTIONS,
+    ):
+        assert "semantic object" in prompt
+        assert "compact thumb/index trace" in prompt
+        assert "complete recording" in prompt
+        assert "coordinates or motion targets" in prompt
+
+    assert "exactly two inputs" in FIRST_FRAME_TRACE_INSTRUCTIONS
+    assert "one RGB image from the first manifest frame" in FIRST_FRAME_TRACE_INSTRUCTIONS
+    assert "covering every stored video frame" in FIRST_FRAME_TRACE_INSTRUCTIONS
+    assert "excludes depth, metric distance, gripper classification" in (
+        FIRST_FRAME_TRACE_INSTRUCTIONS
     )
 
 
@@ -205,6 +252,154 @@ def test_live_recording_draft_sends_bounded_rgb_depth_pairs_with_store_disabled(
     assert "EVERY supplied keyframe" in captured["instructions"]
     assert "scene_observation" in captured["instructions"]
     assert "test-secret" not in repr(captured)
+
+
+def test_first_frame_trace_transport_sends_one_rgb_and_image_coordinates_only(
+    tmp_path: Path,
+) -> None:
+    first_rgb = tmp_path / "000000.jpg"
+    first_rgb.write_bytes(b"\xff\xd8mock-first-rgb\xff\xd9")
+    request = RecordingSkillDraftInput(
+        recording_id="rgbd_0123456789abcdef0123456789abcdef",
+        name_hint="recorded_wipe",
+        operator_instruction="두 손가락으로 표면을 닦는다",
+        recording_summary={"frame_count": 2, "recording_fps": 10},
+        primitive_catalog=["motion.move_l"],
+        entity_role_catalog=["tool", "target_surface"],
+        keyframe_indices=[0],
+        first_frame_index=0,
+        fingertip_trace=[
+            {
+                "frame_index": 0,
+                "timestamp_ns": 1_000,
+                "thumb_tip": {
+                    "landmark_index": 4,
+                    "normalized_xy": (0.4, 0.5),
+                    "pixel_xy": (40, 50),
+                },
+                "index_tip": {
+                    "landmark_index": 8,
+                    "normalized_xy": (0.6, 0.5),
+                    "pixel_xy": (60, 50),
+                },
+                "status": "valid",
+            },
+            {
+                "frame_index": 1,
+                "timestamp_ns": 2_000,
+                "thumb_tip": {
+                    "landmark_index": 4,
+                    "normalized_xy": None,
+                    "pixel_xy": None,
+                },
+                "index_tip": {
+                    "landmark_index": 8,
+                    "normalized_xy": None,
+                    "pixel_xy": None,
+                },
+                "status": "uncertain",
+            },
+        ],
+        visual_input_policy="first_rgb_plus_local_fingertip_trace",
+        limitations=["Metric hand state remains local."],
+    )
+    expected = MockOpenAIClient().analyze_recording_skill_draft(request, "trace")[0]
+    captured: dict[str, object] = {}
+
+    def parse(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(output_parsed=expected, id="resp_first_rgb", usage=None)
+
+    analyzer = RecordingSkillDraftAnalyzer(
+        settings(tmp_path, OPENAI_MODE="live", OPENAI_API_KEY="test-secret"),
+        client=SimpleNamespace(responses=SimpleNamespace(parse=parse)),
+        retry=RetryExecutor(0, sleep=lambda _seconds: None),
+    )
+    result, metadata = analyzer.analyze_first_frame_trace(
+        request, first_rgb_path=first_rgb
+    )
+
+    assert result == expected
+    assert metadata.response_id == "resp_first_rgb"
+    assert captured["instructions"] == FIRST_FRAME_TRACE_INSTRUCTIONS
+    [message] = captured["input"]  # type: ignore[misc]
+    assert [item["type"] for item in message["content"]] == [
+        "input_text",
+        "input_image",
+    ]
+    assert message["content"][1]["image_url"].startswith(
+        "data:image/jpeg;base64,"
+    )
+    payload = json.loads(message["content"][0]["text"])
+    trace = payload["fingertip_trace"]
+    assert len(trace) == 2
+    assert set(trace[0]) == {
+        "frame_index",
+        "timestamp_ns",
+        "thumb_tip",
+        "index_tip",
+        "status",
+    }
+    assert set(trace[0]["thumb_tip"]) == {
+        "landmark_index",
+        "normalized_xy",
+        "pixel_xy",
+    }
+    serialized_trace = json.dumps(trace)
+    for forbidden in ("depth", "distance", "candidate_state", "stable_state"):
+        assert forbidden not in serialized_trace
+    assert payload["keyframe_indices"] == [0]
+    assert "image_pair_order" not in payload
+    assert "depth_visualization" not in payload
+
+    captured.clear()
+    analyzer.analyze_first_frame_trace(
+        request,
+        first_rgb_path=first_rgb,
+        as_file_fallback=True,
+    )
+    [fallback_message] = captured["input"]  # type: ignore[misc]
+    assert [item["type"] for item in fallback_message["content"]] == [
+        "input_text",
+        "input_file",
+    ]
+    assert fallback_message["content"][1]["filename"] == "000000.jpg"
+
+
+def test_compact_trace_schema_rejects_metric_or_state_fields() -> None:
+    base = {
+        "recording_id": "rgbd_0123456789abcdef0123456789abcdef",
+        "name_hint": "recorded_wipe",
+        "operator_instruction": "두 손가락으로 표면을 닦는다",
+        "recording_summary": {"frame_count": 1},
+        "primitive_catalog": ["motion.move_l"],
+        "entity_role_catalog": ["target_surface"],
+        "keyframe_indices": [0],
+        "first_frame_index": 0,
+        "visual_input_policy": "first_rgb_plus_local_fingertip_trace",
+        "limitations": ["Metric state remains local."],
+    }
+    trace_frame = {
+        "frame_index": 0,
+        "timestamp_ns": 1,
+        "thumb_tip": {
+            "landmark_index": 4,
+            "normalized_xy": (0.4, 0.5),
+            "pixel_xy": (40, 50),
+        },
+        "index_tip": {
+            "landmark_index": 8,
+            "normalized_xy": (0.6, 0.5),
+            "pixel_xy": (60, 50),
+        },
+        "status": "valid",
+        "distance_m": 0.02,
+    }
+
+    with pytest.raises(ValidationError, match="distance_m"):
+        RecordingSkillDraftInput.model_validate(
+            {**base, "fingertip_trace": [trace_frame]}
+        )
 
 
 def test_responses_parse_sends_pdf_as_base64_input_file(tmp_path: Path) -> None:

@@ -14,7 +14,10 @@ from robot_skill_system.api.contracts import (
     RecordingSkillDraftRequest,
     SkillActivateRequest,
     SkillCompileRequest,
+    SkillEditorCandidateRequest,
+    SkillEditorPreviewRequest,
     SkillInduceRequest,
+    SkillParameterCandidateRequest,
     SkillRollbackRequest,
     SkillSearchRequest,
     SkillUpdateRequest,
@@ -28,6 +31,27 @@ router = APIRouter(prefix="/skills", tags=["skills"])
 @router.get("")
 def list_skills(service: ServiceDependency) -> dict[str, Any]:
     return service.list_skills()
+
+
+@router.get("/editor/catalog")
+def get_skill_editor_catalog(service: ServiceDependency) -> dict[str, Any]:
+    return service.get_skill_editor_catalog()
+
+
+@router.post("/editor/preview")
+def preview_skill_editor_blocks(
+    request: SkillEditorPreviewRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.preview_skill_editor_blocks(request.model_dump(mode="json"))
+
+
+@router.post("/editor/candidates")
+def create_skill_editor_candidate(
+    request: SkillEditorCandidateRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.create_skill_editor_candidate(request.model_dump(mode="json"))
 
 
 @router.post("/induce")
@@ -122,6 +146,20 @@ def get_skill(
 @router.get("/{skill_id}/versions")
 def get_versions(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
     return service.get_skill_versions(skill_id)
+
+
+@router.post("/{skill_id}/versions/{version}/parameter-candidates")
+def create_skill_parameter_candidate(
+    skill_id: str,
+    version: str,
+    request: SkillParameterCandidateRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.create_skill_parameter_candidate(
+        skill_id,
+        version,
+        request.model_dump(mode="json"),
+    )
 
 
 @router.post("/{skill_id}/compile")

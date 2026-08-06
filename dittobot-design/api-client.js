@@ -86,6 +86,36 @@
       return this.request("/skills");
     }
 
+    skillEditorCatalog() {
+      return this.request("/skills/editor/catalog");
+    }
+
+    previewSkillBlocks(payload) {
+      return this.request("/skills/editor/preview", {
+        method: "POST",
+        body: payload,
+      });
+    }
+
+    createSkillBlockCandidate(payload) {
+      return this.request("/skills/editor/candidates", {
+        method: "POST",
+        body: { ...payload, acknowledge_mock_only: true },
+        timeoutMs: 120000,
+      });
+    }
+
+    createSkillParameterCandidate(skillId, version, payload) {
+      return this.request(
+        `/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}/parameter-candidates`,
+        {
+          method: "POST",
+          body: { ...payload, acknowledge_mock_only: true },
+          timeoutMs: 120000,
+        },
+      );
+    }
+
     listSkillDrafts() {
       return this.request("/skills/drafts");
     }

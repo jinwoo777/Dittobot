@@ -9,12 +9,14 @@ from robot_skill_system.settings import OpenAIMode, Settings
 from ._live import parse_structured_response
 from .client import OpenAIClientFactory, RetryExecutor, new_trace_id
 from .mock_client import MockOpenAIClient
+from .motion_policy import MOTION_SIMPLIFICATION_INSTRUCTIONS
 from .schemas import APICallMetadata, DemonstrationAnalysis, SkillGraphProposal
 from .semantic_validation import validate_skill_graph_proposal
 
 COMPOSER_INSTRUCTIONS = """Propose only supplied primitive operations, binding references, and
 approved profile IDs. Do not supply motion coordinates or numeric speed, acceleration, force,
 safety, or hardware parameters. Local validation and deterministic compilation are authoritative."""
+COMPOSER_INSTRUCTIONS += f"\n\n{MOTION_SIMPLIFICATION_INSTRUCTIONS}"
 
 
 class SkillGraphComposer:

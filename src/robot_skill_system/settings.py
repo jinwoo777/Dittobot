@@ -89,6 +89,10 @@ class Settings(BaseModel):
     scene_burst_frame_count: int = Field(default=5, ge=1, le=30)
     rgbd_max_timestamp_delta_ms: float = Field(default=20.0, gt=0, le=1_000)
     pose_inference_fps: int = Field(default=10, ge=1, le=30)
+    finger_close_threshold_m: float = Field(default=0.03, gt=0.0, le=0.2)
+    finger_state_stable_frames: int = Field(default=3, ge=1, le=30)
+    mediapipe_minimum_detection_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
+    mediapipe_minimum_tracking_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     realsense_device_serial: str | None = None
     realsense_width_px: int = Field(default=640, ge=1, le=4096)
     realsense_height_px: int = Field(default=480, ge=1, le=2160)
@@ -241,6 +245,18 @@ class Settings(BaseModel):
                 env.get("RGBD_MAX_TIMESTAMP_DELTA_MS", "20")
             ),
             pose_inference_fps=int(env.get("POSE_INFERENCE_FPS", "10")),
+            finger_close_threshold_m=float(
+                env.get("FINGER_CLOSE_THRESHOLD_M", "0.03")
+            ),
+            finger_state_stable_frames=int(
+                env.get("FINGER_STATE_STABLE_FRAMES", "3")
+            ),
+            mediapipe_minimum_detection_confidence=float(
+                env.get("MEDIAPIPE_MINIMUM_DETECTION_CONFIDENCE", "0.6")
+            ),
+            mediapipe_minimum_tracking_confidence=float(
+                env.get("MEDIAPIPE_MINIMUM_TRACKING_CONFIDENCE", "0.6")
+            ),
             realsense_device_serial=(
                 env.get("REALSENSE_DEVICE_SERIAL", "").strip() or None
             ),
@@ -281,6 +297,14 @@ class Settings(BaseModel):
             "handeye_legacy_npy_configured": self.handeye_legacy_npy_path is not None,
             "handeye_legacy_expected_tcp": self.handeye_legacy_expected_tcp,
             "scene_capture_mode": self.scene_capture_mode.value,
+            "finger_close_threshold_m": self.finger_close_threshold_m,
+            "finger_state_stable_frames": self.finger_state_stable_frames,
+            "mediapipe_minimum_detection_confidence": (
+                self.mediapipe_minimum_detection_confidence
+            ),
+            "mediapipe_minimum_tracking_confidence": (
+                self.mediapipe_minimum_tracking_confidence
+            ),
             "realsense_device_serial": self.realsense_device_serial,
             "realsense_resolution": (
                 self.realsense_width_px,

@@ -9,7 +9,12 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from robot_skill_system.exceptions import ConfigurationError, ProfileNotFoundError
-from robot_skill_system.primitives.models import ForceProfile, MotionProfile, SafetyPolicy
+from robot_skill_system.primitives.models import (
+    ForceProfile,
+    GraspVerificationProfile,
+    MotionProfile,
+    SafetyPolicy,
+)
 
 ProfileT = TypeVar("ProfileT", bound=BaseModel)
 
@@ -47,6 +52,14 @@ def load_force_profiles(path: Path) -> dict[str, ForceProfile]:
     """Load and validate a force-profile JSON file."""
 
     return _load_profile_list(path, "force_profiles", ForceProfile)
+
+
+def load_grasp_verification_profiles(path: Path) -> dict[str, GraspVerificationProfile]:
+    """Load locally approved grasp/release interpretation profiles."""
+
+    return _load_profile_list(
+        path, "grasp_verification_profiles", GraspVerificationProfile
+    )
 
 
 def load_safety_policies(path: Path) -> dict[str, SafetyPolicy]:
