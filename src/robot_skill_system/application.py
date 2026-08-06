@@ -3431,6 +3431,23 @@ class MVPApplication:
             response["task_flow_catalog"] = hierarchy
         return response
 
+    def delete_skill(self, skill_id: str) -> dict[str, Any]:
+        """Delete an inactive skill identity and all of its candidate versions."""
+
+        graph_skill_ids = {
+            str(row.graph_json.get("skill_id")) for row in self._versions(skill_id)
+        }
+        result = self.repository.delete_skill(skill_id)
+        deleted_artifacts = sum(
+            self.store.delete_tree(f"skills/{graph_skill_id}")
+            for graph_skill_id in graph_skill_ids
+        )
+        return {
+            "deleted": True,
+            **result,
+            "deleted_artifacts": deleted_artifacts,
+        }
+
     @staticmethod
     def _catalog_entry_summary(entry: SemanticCatalogRecord) -> dict[str, Any]:
         return {

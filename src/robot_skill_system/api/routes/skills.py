@@ -148,6 +148,11 @@ def get_versions(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
     return service.get_skill_versions(skill_id)
 
 
+@router.delete("/{skill_id}")
+def delete_skill(skill_id: str, service: ServiceDependency) -> dict[str, Any]:
+    return service.delete_skill(skill_id)
+
+
 @router.post("/{skill_id}/versions/{version}/parameter-candidates")
 def create_skill_parameter_candidate(
     skill_id: str,
