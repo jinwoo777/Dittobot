@@ -32,7 +32,17 @@
     .shell { display: grid; grid-template-columns: 270px minmax(0, 1fr); min-height: 100vh; }
     .sidebar { position: sticky; top: 0; height: 100vh; padding: 30px 22px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--panel); }
     .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
-    .brand-mark { width: 44px; height: 44px; display: grid; place-items: center; border-radius: 60% 40% 56% 44%; color: white; font-weight: 800; background: linear-gradient(145deg, #9a7ae8, #6540c2); box-shadow: 0 6px 18px #7250c940; }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-logo {
+      height: 50px;
+      width: 50px;
+      object-fit: contain;
+      transform: translateY(-10px);
+    }
     .brand strong { display: block; font-size: 19px; }
     .brand small { display: block; margin-top: 3px; color: var(--muted); font: 12px ui-monospace, monospace; }
     .nav { display: grid; gap: 4px; }
@@ -252,13 +262,520 @@
       .camera-grid { grid-template-columns: 1fr; }
       .draft-semantic-grid { grid-template-columns: 1fr; }
     }
+    /* =========================================================
+      DITTOBOT UI REFRESH
+      ========================================================= */
+
+    :root {
+      --bg: #f5f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f8f9fb;
+      --surface-dark: #17191d;
+
+      --border: #e2e5e9;
+      --border-strong: #cfd4da;
+
+      --text: #17191d;
+      --text-secondary: #69717d;
+      --text-tertiary: #969da7;
+
+      --accent: #4f46e5;
+      --accent-hover: #4338ca;
+      --accent-soft: #eef0ff;
+
+      --ok: #16845b;
+      --ok-soft: #e9f7f0;
+
+      --warn: #a16207;
+      --warn-soft: #fff7df;
+
+      --danger: #c24141;
+      --danger-soft: #fff0f0;
+
+      --shadow-sm: 0 1px 2px rgba(16, 24, 40, .04);
+      --shadow-md: 0 5px 18px rgba(16, 24, 40, .06);
+    }
+
+
+    /* ---------------------------------------------------------
+      전체
+      --------------------------------------------------------- */
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family:
+        Inter,
+        Pretendard,
+        "Noto Sans KR",
+        system-ui,
+        sans-serif;
+    }
+
+    .shell {
+      grid-template-columns: 238px minmax(0, 1fr);
+    }
+
+
+    /* ---------------------------------------------------------
+      Sidebar
+      --------------------------------------------------------- */
+
+    .sidebar {
+      padding: 24px 16px;
+      background: #fff;
+      border-right: 1px solid var(--border);
+    }
+
+    .brand {
+      padding: 4px 8px;
+      margin-bottom: 28px;
+    }
+
+    .brand-mark {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: var(--accent);
+      box-shadow: none;
+    }
+
+    .brand strong {
+      font-size: 17px;
+      letter-spacing: -.02em;
+    }
+
+    .brand small {
+      color: var(--text-tertiary);
+    }
+
+    .nav {
+      gap: 3px;
+    }
+
+    .nav button {
+      padding: 11px 12px;
+      border-radius: 8px;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+
+    .nav button:hover {
+      background: var(--surface-soft);
+      color: var(--text);
+    }
+
+    .nav button[aria-current="page"] {
+      color: var(--accent);
+      background: var(--accent-soft);
+      font-weight: 700;
+    }
+
+    .connection {
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-soft);
+    }
+
+    .mode {
+      padding: 5px 8px;
+      border-radius: 5px;
+      font-size: 10px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Main
+      --------------------------------------------------------- */
+
+    main {
+      width: min(1280px, 100%);
+      padding: 38px 46px 70px;
+    }
+
+    h1 {
+      font-size: 30px;
+      letter-spacing: -.035em;
+    }
+
+    .subtitle {
+      color: var(--text-secondary);
+    }
+
+
+    /* ---------------------------------------------------------
+      Filter
+      --------------------------------------------------------- */
+
+    .filters {
+      gap: 5px;
+    }
+
+    .chip {
+      padding: 7px 13px;
+      border-radius: 7px;
+      background: #fff;
+      font-size: 12px;
+    }
+
+    .chip:hover {
+      border-color: var(--border-strong);
+    }
+
+    .chip[aria-pressed="true"] {
+      color: var(--accent);
+      border-color: #c7cbff;
+      background: var(--accent-soft);
+    }
+
+
+    /* ---------------------------------------------------------
+      Banner
+      --------------------------------------------------------- */
+
+    .banner {
+      border: 1px solid #eadfbf;
+      border-radius: 8px;
+    }
+
+    .banner.ok {
+      border-color: #c8eadb;
+    }
+
+    .banner.danger {
+      border-color: #f1cccc;
+    }
+
+
+    /* ---------------------------------------------------------
+      Skill List
+      --------------------------------------------------------- */
+
+    .list {
+      gap: 8px;
+    }
+
+    .skill-card {
+      padding: 16px 18px;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+      transition:
+        border-color .15s ease,
+        box-shadow .15s ease,
+        transform .15s ease;
+    }
+
+    .skill-card:hover {
+      border-color: #c9ced6;
+      background: #fff;
+      box-shadow: var(--shadow-md);
+      transform: translateY(-1px);
+    }
+
+    .skill-card h2 {
+      margin-bottom: 5px;
+      font-size: 15px;
+      color: var(--text);
+    }
+
+    .meta {
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Tags
+      --------------------------------------------------------- */
+
+    .tag {
+      margin-left: 6px;
+      padding: 3px 7px;
+      border-radius: 5px;
+      font-size: 10px;
+    }
+
+    .tag.draft {
+      color: #475569;
+      background: #eef2f7;
+    }
+
+    .tag.candidate {
+      color: var(--warn);
+      background: var(--warn-soft);
+    }
+
+    .tag.tested {
+      color: var(--ok);
+      background: var(--ok-soft);
+    }
+
+    .tag.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+
+    /* ---------------------------------------------------------
+      Buttons
+      --------------------------------------------------------- */
+
+    .button {
+      padding: 8px 13px;
+      border-radius: 7px;
+      background: #fff;
+      font-size: 12px;
+      transition: all .15s ease;
+    }
+
+    .button:hover:not(:disabled) {
+      border-color: var(--border-strong);
+      background: var(--surface-soft);
+    }
+
+    .button.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+    }
+
+    .button.primary:hover:not(:disabled) {
+      border-color: var(--accent-hover);
+      background: var(--accent-hover);
+    }
+
+
+    /* ---------------------------------------------------------
+      Panels
+      --------------------------------------------------------- */
+
+    .panel {
+      padding: 20px;
+      border-radius: 12px;
+      border-color: var(--border);
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+    }
+
+
+    /* ---------------------------------------------------------
+      Skill Detail
+      --------------------------------------------------------- */
+
+    .detail-head {
+      padding-bottom: 20px;
+      margin-bottom: 22px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .detail-head h1 {
+      font-size: 24px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Skill Node
+      --------------------------------------------------------- */
+
+    .skill-node-block {
+      margin-bottom: 12px;
+      padding: 0;
+      overflow: hidden;
+
+      border: 1px solid var(--border);
+      border-radius: 12px;
+
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .skill-node-header {
+      margin: 0;
+      padding: 13px 16px;
+
+      border-bottom: 1px solid var(--border);
+
+      background: #fafbfc;
+    }
+
+    .skill-node-header > div {
+      gap: 10px;
+    }
+
+    .skill-node-number {
+      width: 27px;
+      height: 27px;
+
+      border-radius: 7px;
+
+      background: var(--accent);
+
+      font-size: 12px;
+    }
+
+    .skill-node-operation {
+      font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--text);
+    }
+
+
+    /* ---------------------------------------------------------
+      Parameters
+      --------------------------------------------------------- */
+
+    .skill-node-parameters {
+      padding: 17px 18px;
+      gap: 10px;
+    }
+
+    .parameter-row {
+      grid-template-columns: 170px minmax(0, 1fr);
+      gap: 14px;
+
+      min-height: 40px;
+      padding: 5px 0;
+    }
+
+    .parameter-label {
+      color: var(--text-secondary);
+      font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .parameter-input {
+      min-height: 36px;
+
+      border: 1px solid var(--border);
+      border-radius: 7px;
+
+      padding: 8px 10px;
+
+      color: var(--text);
+      background: var(--surface-soft);
+
+      font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+
+      transition:
+        border-color .15s ease,
+        box-shadow .15s ease,
+        background .15s ease;
+    }
+
+    .parameter-input:hover {
+      border-color: var(--border-strong);
+    }
+
+    .parameter-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, .10);
+    }
+
+    .parameter-object {
+      min-height: 120px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Node Actions
+      --------------------------------------------------------- */
+
+    .skill-node-actions {
+      justify-content: flex-end;
+
+      padding: 11px 18px;
+
+      border-top: 1px solid var(--border);
+
+      background: #fafbfc;
+    }
+
+    .skill-node-actions .button {
+      min-width: 110px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Empty
+      --------------------------------------------------------- */
+
+    .empty-parameters {
+      padding: 16px;
+
+      border: 1px dashed var(--border);
+      border-radius: 7px;
+
+      color: var(--text-tertiary);
+      background: var(--surface-soft);
+
+      text-align: center;
+      font-size: 12px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Form
+      --------------------------------------------------------- */
+
+    .form-grid input,
+    .form-grid select,
+    .form-grid textarea {
+      border-color: var(--border);
+      border-radius: 7px;
+      background: var(--surface-soft);
+    }
+
+    .form-grid input:focus,
+    .form-grid select:focus,
+    .form-grid textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, .10);
+    }
+
+
+    /* ---------------------------------------------------------
+      Camera
+      --------------------------------------------------------- */
+
+    .camera-view {
+      border-radius: 10px;
+    }
+
+    .camera-label {
+      border-radius: 5px;
+      font-size: 9px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Responsive
+      --------------------------------------------------------- */
+
+    @media (max-width: 800px) {
+      main {
+        padding: 28px 18px 50px;
+      }
+
+      .parameter-row {
+        grid-template-columns: 1fr;
+        gap: 5px;
+      }
+
+      .skill-node-parameters {
+        padding: 14px;
+      }
+    }
   </style>
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark" aria-hidden="true">D</div>
+        <img src="assets/ditto.png" alt="Dittobot Logo" class="brand-logo">
+
         <div><strong>dittobot</strong><small>M0609 · RG2 · D435i</small></div>
       </div>
       <nav class="nav" aria-label="주요 화면">
@@ -477,7 +994,7 @@
               <h3 id="geometry-teaching-title">표면 TF 보정</h3>
               <p id="geometry-teaching-instruction"></p>
               <label id="surface-anchor-label">표면 anchor ID
-                <input id="surface-anchor-id" type="text" value="teaching_surface" pattern="[A-Za-z][A-Za-z0-9_.-]{0,63}" maxlength="64">
+                <input id="surface-anchor-id" type="text" value="teaching_surface" pattern="[A-Za-z][A-Za-z0-9_\-]{0,63}" maxlength="64">
               </label>
               <p id="geometry-point-summary"></p>
               <div class="actions">

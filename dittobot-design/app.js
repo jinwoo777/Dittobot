@@ -655,7 +655,9 @@
         parameterSchema.properties || {};
 
       const definitions =
-        parameterSchema.$defs || {};
+        parameterSchema.$defs ||
+        parameterSchema.definitions ||
+        {};
 
       // 실제 저장된 arguments를 기준으로 표시
       const entries = Object.entries(args);
@@ -670,139 +672,92 @@
       }
 
       entries.forEach(([name, value]) => {
-        // 해당 파라미터의 schema
-        const schema = properties[name] || {};
+      const rawSchema = properties[name] || {};
 
-        // $ref 해석
-        let resolvedSchema = schema;
+      const schema = resolveParameterSchema(
+        rawSchema,
+        definitions,
+      );
 
-        if (
-          schema.$ref &&
-          schema.$ref.startsWith("#/$defs/")
-        ) {
-          const definitionName = schema.$ref.replace(
-            "#/$defs/",
-            "",
+      const row = createParameterEditor(
+        name,
+        schema,
+        value,
+      );
+
+      const input = row.querySelector(
+        "[data-parameter-name]",
+      );
+
+      if (!input) {
+        parameters.append(row);
+        return;
+      }
+
+      if (schema.type === "boolean") {
+        input.addEventListener("change", () => {
+          saveNodeParameter(
+            skill,
+            skillNode,
+            name,
+            input.checked,
           );
+        });
+      } else {
+        input.addEventListener("change", () => {
+          let newValue = input.value;
 
-          resolvedSchema =
-            definitions[definitionName] || schema;
-        }
+          if (schema.type === "number") {
+            newValue = Number(input.value);
 
-        // schema가 없으면 실제 값 타입으로 추정
-        if (!resolvedSchema.type) {
-          if (Array.isArray(value)) {
-            resolvedSchema = {
-              type: "array",
-            };
-          } else if (
-            value !== null &&
-            typeof value === "object"
-          ) {
-            resolvedSchema = {
-              type: "object",
-            };
-          } else if (typeof value === "number") {
-            resolvedSchema = {
-              type: "number",
-            };
-          } else if (typeof value === "boolean") {
-            resolvedSchema = {
-              type: "boolean",
-            };
-          } else {
-            resolvedSchema = {
-              type: "string",
-            };
-          }
-        }
-
-        const row = createParameterEditor(
-          name,
-          resolvedSchema,
-          value,
-        );
-
-        const input = row.querySelector(
-          "[data-parameter-name]",
-        );
-
-        if (input) {
-          input.addEventListener("change", () => {
-            let newValue;
-
-            try {
-              // boolean
-              if (resolvedSchema.type === "boolean") {
-                newValue = input.checked;
-              }
-
-              // number
-              else if (resolvedSchema.type === "number") {
-                newValue = Number(input.value);
-
-                if (!Number.isFinite(newValue)) {
-                  throw new Error(
-                    `${name}은 숫자여야 합니다.`,
-                  );
-                }
-              }
-
-              // integer
-              else if (resolvedSchema.type === "integer") {
-                newValue = Number.parseInt(
-                  input.value,
-                  10,
-                );
-
-                if (!Number.isFinite(newValue)) {
-                  throw new Error(
-                    `${name}은 정수여야 합니다.`,
-                  );
-                }
-              }
-
-              // object / array
-              else if (
-                resolvedSchema.type === "object" ||
-                resolvedSchema.type === "array" ||
-                (
-                  value !== null &&
-                  typeof value === "object"
-                )
-              ) {
-                newValue = JSON.parse(input.value);
-              }
-
-              // string
-              else {
-                newValue = input.value;
-              }
-
-              console.log(
-                "파라미터 변경:",
-                name,
-                newValue,
-              );
-
-              saveNodeParameter(
-                skill,
-                skillNode,
-                name,
-                newValue,
-              );
-
-            } catch (error) {
+            if (!Number.isFinite(newValue)) {
               setBanner(
-                `${name} 수정 실패: ${errorText(error)}`,
+                `${name}은 숫자여야 합니다.`,
                 "danger",
               );
+              return;
             }
-          });
-        }
+          }
 
-        parameters.append(row);
-      });
+          else if (schema.type === "integer") {
+            newValue =
+              Number.parseInt(input.value, 10);
+
+            if (!Number.isFinite(newValue)) {
+              setBanner(
+                `${name}은 정수여야 합니다.`,
+                "danger",
+              );
+              return;
+            }
+          }
+
+          else if (
+            typeof value === "object" &&
+            value !== null
+          ) {
+            try {
+              newValue = JSON.parse(input.value);
+            } catch {
+              setBanner(
+                `${name}의 JSON 형식이 올바르지 않습니다.`,
+                "danger",
+              );
+              return;
+            }
+          }
+
+          saveNodeParameter(
+            skill,
+            skillNode,
+            name,
+            newValue,
+          );
+        });
+      }
+
+      parameters.append(row);
+    });
 
 
       // =========================
@@ -1369,9 +1324,82 @@
   }
 
   function getPrimitiveMetadata(operation) {
-    return state.primitiveCatalog.find(
+    const primitive = state.primitiveCatalog.find(
       (primitive) => primitive.operation_name === operation
     );
+
+    return primitive;
+  }
+
+  function resolveParameterSchema(schema, definitions = {}) {
+    if (!schema) {
+      return {};
+    }
+
+    // 직접적인 $ref
+    if (
+      schema.$ref &&
+      schema.$ref.startsWith("#/$defs/")
+    ) {
+      const name = schema.$ref.replace(
+        "#/$defs/",
+        "",
+      );
+
+      const resolved = definitions[name];
+
+      if (resolved) {
+        return resolveParameterSchema(
+          resolved,
+          definitions,
+        );
+      }
+    }
+
+    // anyOf
+    if (Array.isArray(schema.anyOf)) {
+      const candidate = schema.anyOf.find(
+        (item) =>
+          item &&
+          (
+            item.type ||
+            item.$ref ||
+            item.properties
+          ),
+      );
+
+      if (candidate) {
+        return resolveParameterSchema(
+          candidate,
+          definitions,
+        );
+      }
+    }
+
+    // oneOf
+    if (Array.isArray(schema.oneOf)) {
+      const candidate = schema.oneOf.find(
+        (item) =>
+          item &&
+          (
+            item.type ||
+            item.$ref ||
+            item.properties
+          ),
+      );
+
+      if (candidate) {
+        return resolveParameterSchema(
+          candidate,
+          definitions,
+        );
+      }
+    }
+
+    return {
+      ...schema,
+      __definitions: definitions,
+    };
   }
 
   function createParameterEditor(name, schema, value) {
@@ -1384,39 +1412,103 @@
       text: name,
     });
 
-    row.append(label);
+    const control = create("div", {
+      className: "parameter-control",
+    });
 
-    let input;
+    row.append(label, control);
 
+    // =========================================================
+    // schema 안전 처리
+    // =========================================================
+
+    schema = schema || {};
+
+    // =========================================================
     // enum
+    // =========================================================
+
     if (schema.enum) {
-      input = document.createElement("select");
+      const input = document.createElement("select");
+
       input.className = "parameter-input";
 
       schema.enum.forEach((option) => {
         const item = document.createElement("option");
+
         item.value = option;
         item.textContent = option;
+
         input.append(item);
       });
 
-      input.value = value ?? schema.default ?? schema.enum[0];
+      input.value =
+        value ??
+        schema.default ??
+        schema.enum[0];
+
+      input.dataset.parameterName = name;
+
+      control.append(input);
+
+      return row;
     }
 
+    // =========================================================
     // boolean
-    else if (schema.type === "boolean") {
-      input = document.createElement("input");
+    // =========================================================
+
+    if (schema.type === "boolean") {
+      const toggleWrap = create("label", {
+        className: "parameter-toggle",
+      });
+
+      const input = document.createElement("input");
+
       input.type = "checkbox";
-      input.checked = value ?? schema.default ?? false;
-      input.className = "parameter-input";
+
+      input.checked =
+        value ??
+        schema.default ??
+        false;
+
+      input.dataset.parameterName = name;
+
+      const slider = create("span", {
+        className: "parameter-toggle-slider",
+      });
+
+      const text = create("span", {
+        className: "parameter-toggle-text",
+        text: input.checked ? "ON" : "OFF",
+      });
+
+      input.addEventListener("change", () => {
+        text.textContent =
+          input.checked ? "ON" : "OFF";
+      });
+
+      toggleWrap.append(
+        input,
+        slider,
+        text,
+      );
+
+      control.append(toggleWrap);
+
+      return row;
     }
 
-    // number
-    else if (
+    // =========================================================
+    // number / integer
+    // =========================================================
+
+    if (
       schema.type === "number" ||
       schema.type === "integer"
     ) {
-      input = document.createElement("input");
+      const input = document.createElement("input");
+
       input.type = "number";
       input.className = "parameter-input";
 
@@ -1438,48 +1530,353 @@
       } else if (schema.default !== undefined) {
         input.value = schema.default;
       }
+
+      input.dataset.parameterName = name;
+
+      control.append(input);
+
+      return row;
     }
 
+    // =========================================================
     // object
-    else if (schema.type === "object") {
-      input = document.createElement("textarea");
-      input.className = "parameter-input parameter-object";
-      input.rows = 5;
+    // =========================================================
 
-      input.value =
-        value !== undefined
-          ? JSON.stringify(value, null, 2)
-          : "{}";
+    if (schema.type === "object") {
+      const objectEditor = createObjectEditor(
+        schema,
+        value ?? {},
+      );
+
+      const hidden = document.createElement("textarea");
+
+      hidden.className =
+        "parameter-input parameter-object parameter-json-hidden";
+
+      hidden.dataset.parameterName = name;
+      hidden.hidden = true;
+
+      hidden.value = JSON.stringify(
+        value ?? {},
+      );
+
+      control.append(
+        objectEditor,
+        hidden,
+      );
+
+      const sync = () => {
+        const result =
+          objectEditor.__getValue
+            ? objectEditor.__getValue()
+            : value ?? {};
+
+        hidden.value = JSON.stringify(result);
+
+        hidden.dispatchEvent(
+          new Event("change", {
+            bubbles: true,
+          }),
+        );
+      };
+
+      objectEditor
+        .querySelectorAll("input, select, textarea")
+        .forEach((editorInput) => {
+          editorInput.addEventListener(
+            "change",
+            sync,
+          );
+
+          editorInput.addEventListener(
+            "input",
+            sync,
+          );
+        });
+
+      return row;
     }
 
+    // =========================================================
     // array
-    else if (schema.type === "array") {
-      input = document.createElement("textarea");
-      input.className = "parameter-input parameter-object";
-      input.rows = 5;
+    // =========================================================
+
+    if (schema.type === "array") {
+      const input = document.createElement("textarea");
+
+      input.className =
+        "parameter-input parameter-object";
+
+      input.rows = 4;
 
       input.value =
         value !== undefined
           ? JSON.stringify(value, null, 2)
           : "[]";
+
+      input.dataset.parameterName = name;
+
+      control.append(input);
+
+      return row;
     }
 
+    // =========================================================
     // string
-    else {
-      input = document.createElement("input");
-      input.type = "text";
-      input.className = "parameter-input";
+    // =========================================================
 
-      if (value !== undefined) {
-        input.value = value;
-      }
+    const input = document.createElement("input");
+
+    input.type = "text";
+    input.className = "parameter-input";
+
+    if (value !== undefined) {
+      input.value = value;
+    } else if (schema.default !== undefined) {
+      input.value = schema.default;
     }
 
     input.dataset.parameterName = name;
 
-    row.append(input);
+    control.append(input);
 
     return row;
+  }
+
+  function createObjectEditor(schema, value = {}) {
+    const wrapper = create("div", {
+      className: "parameter-object-editor",
+    });
+
+    const definitions = schema.__definitions || {};
+
+    function resolve(s) {
+      if (!s) return {};
+
+      if (s.$ref && s.$ref.startsWith("#/$defs/")) {
+        const name = s.$ref.replace("#/$defs/", "");
+        return resolve(definitions[name]);
+      }
+
+      if (Array.isArray(s.anyOf)) {
+        const candidate = s.anyOf.find(
+          (v) => v.type || v.$ref || v.properties,
+        );
+        if (candidate) {
+          return resolve(candidate);
+        }
+      }
+
+      if (Array.isArray(s.oneOf)) {
+        const candidate = s.oneOf.find(
+          (v) => v.type || v.$ref || v.properties,
+        );
+        if (candidate) {
+          return resolve(candidate);
+        }
+      }
+
+      return s;
+    }
+
+    function build(parent, currentSchema, currentValue) {
+      currentSchema = resolve(currentSchema);
+
+      Object.entries(currentSchema.properties || {}).forEach(
+        ([key, raw]) => {
+          const fieldSchema = resolve(raw);
+          const fieldValue = currentValue?.[key];
+
+          // ============================
+          // object
+          // ============================
+
+          if (fieldSchema.type === "object") {
+            const group = create("div", {
+              className: "parameter-object-group",
+            });
+
+            group.dataset.objectKey = key;
+
+            group.__schema = fieldSchema;
+
+            const title = create("div", {
+              className: "parameter-object-title",
+              text: key,
+            });
+
+            const body = create("div", {
+              className: "parameter-object-body",
+            });
+
+            build(body, fieldSchema, fieldValue || {});
+
+            group.append(title, body);
+
+            parent.append(group);
+
+            return;
+          }
+
+          // ============================
+          // primitive
+          // ============================
+
+          const row = create("div", {
+            className: "parameter-object-field",
+          });
+
+          const label = create("label", {
+            className: "parameter-object-field-label",
+            text: key,
+          });
+
+          let input;
+
+          if (fieldSchema.enum) {
+            input = document.createElement("select");
+
+            fieldSchema.enum.forEach((option) => {
+              const o = document.createElement("option");
+              o.value = option;
+              o.textContent = option;
+              input.append(o);
+            });
+
+            input.value =
+              fieldValue ??
+              fieldSchema.default ??
+              fieldSchema.enum[0];
+          }
+
+          else if (
+            fieldSchema.type === "number" ||
+            fieldSchema.type === "integer"
+          ) {
+            input = document.createElement("input");
+            input.type = "number";
+
+            input.step =
+              fieldSchema.type === "integer"
+                ? "1"
+                : "0.001";
+
+            input.value =
+              fieldValue ??
+              fieldSchema.default ??
+              0;
+          }
+
+          else if (
+            fieldSchema.type === "boolean"
+          ) {
+            input = document.createElement("input");
+            input.type = "checkbox";
+            input.checked =
+              fieldValue ??
+              fieldSchema.default ??
+              false;
+          }
+
+          else {
+            input = document.createElement("input");
+            input.type = "text";
+            input.value =
+              fieldValue ??
+              fieldSchema.default ??
+              "";
+          }
+
+          input.className = "parameter-input";
+          input.dataset.objectKey = key;
+
+          input.__schema = fieldSchema;
+
+          row.append(label, input);
+
+          parent.append(row);
+        },
+      );
+    }
+
+    build(wrapper, schema, value);
+
+    function collect(container) {
+      const result = {};
+
+      Array.from(container.children).forEach((child) => {
+
+        if (
+          child.classList.contains(
+            "parameter-object-group",
+          )
+        ) {
+          const key = child.dataset.objectKey;
+
+          const body =
+            child.querySelector(
+              ".parameter-object-body",
+            );
+
+          result[key] = collect(body);
+
+          return;
+        }
+
+        if (
+          child.classList.contains(
+            "parameter-object-field",
+          )
+        ) {
+          const input =
+            child.querySelector(
+              "[data-object-key]",
+            );
+
+          const key =
+            input.dataset.objectKey;
+
+          const schema =
+            input.__schema || {};
+
+          if (
+            input.type === "checkbox"
+          ) {
+            result[key] =
+              input.checked;
+          }
+
+          else if (
+            schema.type === "number"
+          ) {
+            result[key] =
+              Number(input.value);
+          }
+
+          else if (
+            schema.type === "integer"
+          ) {
+            result[key] =
+              parseInt(
+                input.value,
+                10,
+              );
+          }
+
+          else {
+            result[key] =
+              input.value;
+          }
+        }
+
+      });
+
+      return result;
+    }
+
+    wrapper.__getValue = () => collect(wrapper);
+
+    return wrapper;
   }
 
   let saveTimer = null;
@@ -1488,7 +1885,6 @@
     skillNode.arguments[name] = value;
 
     clearTimeout(saveTimer);
-
     saveTimer = setTimeout(async () => {
       try {
         await api.updateSkillNode(
@@ -2095,13 +2491,6 @@
 
     const nodeId = skillNode.nodeId;
 
-    console.log("노드 파라미터 저장:", {
-      skillId: skill.id,
-      nodeId,
-      name,
-      value,
-    });
-
     if (!nodeId) {
       console.error("nodeId를 찾을 수 없습니다.", skillNode);
       setBanner("노드 ID를 찾을 수 없습니다.", "danger");
@@ -2117,8 +2506,6 @@
         },
         skill.version,
       );
-
-      console.log("노드 파라미터 저장 완료", updated);
 
       setBanner(
         `${name} 파라미터가 저장되었습니다.`,
@@ -2206,7 +2593,10 @@
     createManualSkill,
   );
   renderAll();
-  loadRegistry().then(() => Promise.all([
+  Promise.all([
+    loadPrimitiveCatalog(),
+    loadRegistry(),
+  ]).then(() => Promise.all([
     refreshCameraStatus(),
     refreshHandeyeCalibrationStatus(),
   ])).catch(() => undefined);
