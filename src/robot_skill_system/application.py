@@ -15,7 +15,9 @@ from typing import Any, Literal
 
 from sqlalchemy import select
 
+from robot_skill_system.adapters.doosan_m0609 import DoosanM0609Adapter
 from robot_skill_system.adapters.mock_robot import MockGripperAdapter, MockRobotAdapter
+from robot_skill_system.adapters.robot import RobotAdapter
 from robot_skill_system.calibration.controller import HandEyeCalibrationController
 from robot_skill_system.calibration.robot import DoosanHandEyeCalibrationRobot
 from robot_skill_system.capture.realsense_capture import (
@@ -60,6 +62,7 @@ from robot_skill_system.demonstrations.trajectory import (
     TrajectorySummary,
     summarize_trajectory,
 )
+from robot_skill_system.exceptions import HardwareExecutionDenied, NotConfiguredError
 from robot_skill_system.openai_integration.demonstration_analyzer import DemonstrationAnalyzer
 from robot_skill_system.openai_integration.embeddings import (
     SkillEmbeddingService,
@@ -80,8 +83,14 @@ from robot_skill_system.openai_integration.recording_skill_analyzer import (
 from robot_skill_system.openai_integration.schemas import (
     DemonstrationAnalysisInput,
     RecordingSkillDraftInput,
+    TCPProxyTeachingDefinition,
 )
 from robot_skill_system.perception.hand_pose import MediaPipeHandPoseEstimator
+from robot_skill_system.perception.hand_tracking import (
+    LocalHandTrackingSummary,
+    MediaPipeHandLandmarkTracker,
+    unavailable_hand_tracking_summary,
+)
 from robot_skill_system.primitives.models import SafetyPolicy
 from robot_skill_system.primitives.profiles import (
     load_force_profiles,
@@ -124,7 +133,7 @@ from robot_skill_system.skills.retrieval import (
 )
 from robot_skill_system.skills.updater import SkillUpdater, UpdateEvidence
 from robot_skill_system.skills.versioning import stable_version
-from robot_skill_system.storage.artifact_store import LocalArtifactStore
+from robot_skill_system.storage.artifact_store import ArtifactMetadata, LocalArtifactStore
 from robot_skill_system.storage.database import Database, StorageRepository
 from robot_skill_system.storage.orm import (
     ExecutionRunRecord,
@@ -151,9 +160,9 @@ class DemonstrationEvidence:
 
 @dataclass(frozen=True, slots=True)
 class ActiveExecution:
-    """Abort handles for a currently running mock/dry-run execution."""
+    """Abort handles for a currently running execution."""
 
-    robot: MockRobotAdapter
+    robot: RobotAdapter
     force_supervisor: GlobalForceSupervisor
     safety_supervisor: GlobalSafetySupervisor
 
@@ -415,6 +424,19 @@ class MVPApplication:
             "uploads_rgb_and_aligned_depth_pairs": True,
             "image_pair_order": "rgb_then_aligned_depth_per_keyframe",
             "tcp_proxy_mode": "two_finger_gripper_midpoint_semantic_only",
+            "local_hand_tracking_backend": "mediapipe_hands_0_10",
+            "local_hand_tracking_included_in_prompt": True,
+            "local_hand_tracking_selected_landmarks": [
+                "wrist",
+                "thumb_tip",
+                "index_mcp",
+                "index_tip",
+                "pinky_mcp",
+            ],
+            "tcp_landmark_confidence_threshold_default": 0.20,
+            "tcp_landmark_confidence_threshold_minimum": 0.10,
+            "tcp_landmark_confidence_threshold_maximum": 0.90,
+            "trusted_trajectory_mean_confidence_threshold": 0.60,
             "provider_video_input_supported": False,
             "direct_image_transport": True,
             "fallback_analysis_transport": "pdf_contact_sheet",
@@ -451,6 +473,9 @@ class MVPApplication:
             "workspace_region",
         ]
         keyframe_indices = [index for index, _rgb_path, _depth_path in selected]
+        local_hand_tracking = self._track_recording_hands(
+            recording_id, keyframe_indices
+        )
         analysis_input = RecordingSkillDraftInput(
             recording_id=recording_id,
             name_hint=str(request.get("name_hint", "recorded_skill")),
@@ -462,9 +487,15 @@ class MVPApplication:
                 "depth_aligned_to_color": manifest.get("depth_aligned_to_color"),
                 "timestamps_preserved": manifest.get("timestamps_preserved"),
             },
+            local_hand_tracking=local_hand_tracking,
             primitive_catalog=primitive_catalog,
             entity_role_catalog=entity_role_catalog,
             keyframe_indices=keyframe_indices,
+            tcp_proxy_definition=TCPProxyTeachingDefinition(
+                semantic_landmark_confidence_threshold=float(
+                    request.get("tcp_landmark_confidence_threshold", 0.20)
+                )
+            ),
             limitations=[
                 "RGB-D keyframes contain no trusted robot-base pose trajectory or TF chain.",
                 "Depth NPZ artifacts remain local and are not uploaded to OpenAI.",
@@ -472,6 +503,8 @@ class MVPApplication:
                 "The midpoint of two visible fingertips is a semantic TCP proxy, not a pose.",
                 "Normalized OpenAI regions are hints; local raw depth and intrinsics "
                 "own metric geometry.",
+                "MediaPipe x/y landmarks are semantic image evidence; z_relative is "
+                "non-metric and cannot authorize robot geometry.",
                 "A missing TCP landmark trajectory must be reported with an explicit reason.",
                 "Force, velocity, acceleration, and execution permission remain local-only.",
             ],
@@ -537,6 +570,12 @@ class MVPApplication:
             "openai_mode": self.settings.openai_mode.value,
             "openai_model": self.settings.openai_reasoning_model,
             "openai_trace_id": metadata.trace_id,
+            "analysis_parameters": {
+                "tcp_proxy_definition": analysis_input.tcp_proxy_definition.model_dump(
+                    mode="json"
+                ),
+                "local_hand_tracking": local_hand_tracking.model_dump(mode="json"),
+            },
             "transport": transport,
             "draft": draft.model_dump(mode="json"),
         }
@@ -561,6 +600,29 @@ class MVPApplication:
             "executable": False,
             "requires_pose_trajectory": True,
         }
+
+    def _track_recording_hands(
+        self, recording_id: str, keyframe_indices: list[int]
+    ) -> LocalHandTrackingSummary:
+        """Produce local, non-metric hand evidence for the semantic prompt."""
+
+        tracker = MediaPipeHandLandmarkTracker()
+
+        def frames() -> Iterator[tuple[int, Any]]:
+            for frame_index in keyframe_indices:
+                frame = self.camera_controller.load_recording_rgbd_frame(
+                    recording_id, frame_index
+                )
+                yield frame_index, frame.color_image_rgb
+
+        try:
+            return tracker.track_sequence(
+                frames(), requested_frame_count=len(keyframe_indices)
+            )
+        except NotConfiguredError as exc:
+            return unavailable_hand_tracking_summary(
+                len(keyframe_indices), str(exc)
+            )
 
     def list_recording_skill_drafts(self) -> dict[str, Any]:
         """List persisted semantic drafts separately from registered SkillGraph versions."""
@@ -781,7 +843,26 @@ class MVPApplication:
                         camera_to_surface=camera_to_surface,
                     )
                 )
-        elif method == "openai_rgbd":
+        elif method in {
+            "openai_rgbd",
+            "openai_rgbd_operator_confirmed",
+            "openai_rgbd_low_confidence_mock",
+        }:
+            low_confidence_mock = method == "openai_rgbd_low_confidence_mock"
+            operator_tcp_confirmed = method == "openai_rgbd_operator_confirmed"
+            if low_confidence_mock and request.get(
+                "acknowledge_low_confidence_mock_only"
+            ) is not True:
+                raise ValueError(
+                    "low-confidence GPT geometry requires explicit Mock-only acknowledgement"
+                )
+            if operator_tcp_confirmed and request.get(
+                "acknowledge_two_fingertip_tcp_proxy"
+            ) is not True:
+                raise ValueError(
+                    "operator must confirm the two-fingertip midpoint as the intended "
+                    "robot TCP proxy"
+                )
             tcp_observation = draft_payload.get("draft", {}).get(
                 "tcp_proxy_observation"
             )
@@ -791,7 +872,11 @@ class MVPApplication:
                 raise ValueError(
                     "semantic draft predates GPT landmark auditing; analyze the recording again"
                 )
-            if tcp_observation.get("usable_for_local_depth_path") is not True:
+            if (
+                tcp_observation.get("usable_for_local_depth_path") is not True
+                and not low_confidence_mock
+                and not operator_tcp_confirmed
+            ):
                 reason = tcp_observation.get("failure_reason") or (
                     "fewer than four keyframes contain both fingertip landmarks"
                 )
@@ -889,6 +974,8 @@ class MVPApplication:
                 "MediaPipe detected a valid two-finger pose in fewer than 50% of frames"
             )
         trajectory_id = f"trajectory_{uuid.uuid4().hex}"
+        low_confidence_mock = method == "openai_rgbd_low_confidence_mock"
+        operator_tcp_confirmed = method == "openai_rgbd_operator_confirmed"
         evidence = {
             "schema_version": "1.0",
             "evidence_type": "surface_relative_tcp_trajectory",
@@ -907,7 +994,12 @@ class MVPApplication:
             ),
             "semantic_draft_artifact_uri": (
                 draft_path.relative_to(self.store.root).as_posix()
-                if method == "openai_rgbd"
+                if method
+                in {
+                    "openai_rgbd",
+                    "openai_rgbd_operator_confirmed",
+                    "openai_rgbd_low_confidence_mock",
+                }
                 else None
             ),
             "extraction_failures": extraction_failures,
@@ -923,6 +1015,16 @@ class MVPApplication:
                 for sample in samples
             ],
             "quality": {**quality, "coverage_ratio": coverage_ratio},
+            "quality_tier": (
+                "low_confidence_mock_only"
+                if low_confidence_mock
+                else "operator_confirmed_two_fingertip_proxy"
+                if operator_tcp_confirmed
+                else "operator_confirmed_candidate"
+            ),
+            "hardware_execution_blocked": low_confidence_mock,
+            "two_fingertip_tcp_proxy_acknowledged": operator_tcp_confirmed,
+            "low_confidence_mock_only_acknowledged": low_confidence_mock,
             "operator_confirmed": True,
             "hardware_validated": False,
             "created_at_ns": time.time_ns(),
@@ -941,7 +1043,7 @@ class MVPApplication:
     def register_recording_draft_candidate(
         self, draft_id: str, request: dict[str, Any]
     ) -> dict[str, Any]:
-        """Materialize, compile, and Mock-validate a surface-relative candidate."""
+        """Register semantics first; materialize geometry only when evidence exists."""
 
         if request.get("acknowledge_mock_only") is not True:
             raise ValueError("candidate registration requires Mock-only acknowledgement")
@@ -954,10 +1056,88 @@ class MVPApplication:
         trajectory = self._latest_draft_evidence(
             draft_payload, "tcp_trajectory_*.json"
         )
-        if calibration is None or trajectory is None:
-            raise ValueError("surface calibration and TCP trajectory are required")
-        if trajectory.get("calibration_id") != calibration.get("calibration_id"):
+        has_materialized_geometry = bool(
+            calibration is not None
+            and trajectory is not None
+            and trajectory.get("calibration_id") == calibration.get("calibration_id")
+        )
+        if (
+            calibration is not None
+            and trajectory is not None
+            and not has_materialized_geometry
+        ):
             raise ValueError("TCP trajectory was not generated from the latest calibration")
+        existing_registration = self._latest_draft_evidence(
+            draft_payload, "candidate_registration_*.json"
+        )
+        if not has_materialized_geometry:
+            if (
+                existing_registration is not None
+                and existing_registration.get("candidate_stage") == "semantic_only"
+            ):
+                return {
+                    **existing_registration,
+                    "already_registered": True,
+                    "validation": {
+                        "passed": False,
+                        "mock_validation": False,
+                        "hardware_validated": False,
+                        "errors": [
+                            "execution geometry is intentionally deferred until TF and "
+                            "TCP trajectory evidence are available"
+                        ],
+                    },
+                }
+            graph = self._recording_semantic_candidate_graph(draft_payload)
+            row, graph_artifact = self._persist_semantic_candidate(graph)
+            registration_id = f"candidate_{uuid.uuid4().hex}"
+            evidence = {
+                "schema_version": "1.0",
+                "evidence_type": "candidate_registration",
+                "registration_id": registration_id,
+                "draft_id": draft_id,
+                "skill_id": graph.skill_id,
+                "version": row.semantic_version,
+                "status": "semantic_candidate_registered",
+                "candidate_stage": "semantic_only",
+                "semantic_graph_artifact_uri": graph_artifact.uri,
+                "semantic_graph_artifact_checksum_sha256": (
+                    graph_artifact.checksum_sha256
+                ),
+                "mock_validation_passed": False,
+                "execution_blocked": True,
+                "missing_execution_evidence": [
+                    item
+                    for item, available in (
+                        ("T_camera_surface", calibration is not None),
+                        ("surface_relative_tcp_trajectory", trajectory is not None),
+                    )
+                    if not available
+                ],
+                "handeye_transform_candidate": None,
+                "hardware_validated": False,
+                "created_at_ns": time.time_ns(),
+            }
+            artifact = self.store.put_json(
+                f"{self._draft_evidence_root(draft_payload)}/"
+                f"candidate_registration_{registration_id}.json",
+                evidence,
+            )
+            return {
+                **evidence,
+                "artifact_uri": artifact.uri,
+                "artifact_checksum_sha256": artifact.checksum_sha256,
+                "validation": {
+                    "passed": False,
+                    "mock_validation": False,
+                    "hardware_validated": False,
+                    "errors": [
+                        "semantic candidate registered; execution materialization is deferred"
+                    ],
+                },
+            }
+        if calibration is None or trajectory is None:
+            raise RuntimeError("materialized geometry evidence disappeared during registration")
         latest_handeye_transform = self._latest_legacy_handeye_transform()
         handeye_transform = (
             latest_handeye_transform
@@ -989,6 +1169,7 @@ class MVPApplication:
             "skill_id": graph.skill_id,
             "version": row.semantic_version,
             "status": "validated" if validation["passed"] else "rejected",
+            "candidate_stage": "materialized",
             "mock_validation_passed": bool(validation["passed"]),
             "handeye_transform_candidate": (
                 {
@@ -1021,6 +1202,93 @@ class MVPApplication:
             "artifact_checksum_sha256": artifact.checksum_sha256,
             "validation": validation,
         }
+
+    def _recording_semantic_candidate_graph(
+        self, draft_payload: dict[str, Any]
+    ) -> SkillGraph:
+        """Represent reviewed semantics without pretending geometry is executable."""
+
+        semantic = draft_payload["draft"]
+        skill_id = str(semantic["suggested_skill_id"])
+        roles = [
+            str(role) for role in semantic.get("required_entity_roles") or []
+        ]
+        primitives = [
+            {
+                "operation": str(item.get("operation")),
+                "rationale": str(item.get("rationale") or ""),
+                "confidence": float(item.get("confidence") or 0.0),
+            }
+            for item in semantic.get("primitive_sequence") or []
+            if isinstance(item, dict)
+        ]
+        return SkillGraph(
+            skill_id=skill_id,
+            version=self._next_recording_candidate_version(skill_id),
+            name=str(semantic["display_name"]),
+            description=(
+                "Semantic-only RGB-D teaching candidate; execution geometry is deferred. "
+                f"{semantic['task_description']}"
+            ),
+            skill_type=SkillType.COMPOSITE,
+            source_demonstrations=[str(draft_payload["artifact_uri"])],
+            required_tools=["unresolved_tool"] if "tool" in roles else [],
+            required_entity_roles={f"${role}": role for role in roles},
+            nodes=[
+                SkillNode(
+                    node_id="materialize_geometry",
+                    operation="semantic.materialization_required",
+                    arguments={},
+                )
+            ],
+            start_node="materialize_geometry",
+            terminal_nodes=["materialize_geometry"],
+            preconditions=["execution_geometry_materialized"],
+            uncertainty={
+                "candidate_stage": "semantic_only",
+                "execution_blocked": True,
+                "blocking_reason": (
+                    "T_camera_surface and a trusted TCP trajectory have not been materialized"
+                ),
+                "proposed_primitive_sequence": primitives,
+                "scene_observation": semantic.get("scene_observation"),
+                "tcp_proxy_observation": semantic.get("tcp_proxy_observation"),
+                "unresolved_ambiguities": semantic.get("unresolved_ambiguities") or [],
+            },
+            validation_status=ValidationStatus.PENDING,
+            lifecycle_status=SkillLifecycleStatus.CANDIDATE,
+        )
+
+    def _persist_semantic_candidate(
+        self, graph: SkillGraph
+    ) -> tuple[SkillVersionRecord, ArtifactMetadata]:
+        """Store a registry-visible candidate without generated executable code."""
+
+        graph_artifact = self.store.put_json(
+            f"skills/{graph.skill_id}/{graph.version}/semantic_candidate.json",
+            graph.model_dump(mode="json"),
+        )
+        registered = self.repository.register_skill_version(
+            name=graph.name,
+            intent=graph.skill_id,
+            semantic_version=graph.version,
+            graph=graph,
+            status="candidate",
+            variant=f"rgbd_{graph.skill_id}",
+            description=graph.description,
+            generated_code_uri=None,
+            generated_code_checksum_sha256=None,
+            validation_status="blocked",
+            hardware_compatible=False,
+        )
+        return registered, graph_artifact
+
+    @staticmethod
+    def _is_semantic_only_candidate(graph: SkillGraph) -> bool:
+        return bool(
+            graph.uncertainty.get("candidate_stage") == "semantic_only"
+            and graph.uncertainty.get("execution_blocked") is True
+        )
 
     def _recording_skill_draft_path(self, draft_id: str) -> Path:
         if not _RECORDING_DRAFT_ID_PATTERN.fullmatch(draft_id):
@@ -1265,6 +1533,10 @@ class MVPApplication:
                 "camera_to_surface_calibration_id": calibration["calibration_id"],
                 "tcp_trajectory_id": trajectory["trajectory_id"],
                 "trajectory_quality": trajectory["quality"],
+                "trajectory_quality_tier": trajectory.get("quality_tier"),
+                "trajectory_hardware_execution_blocked": trajectory.get(
+                    "hardware_execution_blocked", True
+                ),
                 "semantic_confidence": semantic.get("confidence"),
                 "contact_semantics_deferred": requested_contact and not has_contact,
                 "handeye_transform_candidate": (
@@ -1306,7 +1578,6 @@ class MVPApplication:
         if not isinstance(draft, dict) or not isinstance(transport, dict):
             raise ValueError("recording draft artifact has an invalid payload")
         tcp_observation = draft.get("tcp_proxy_observation")
-        has_tcp_schema = isinstance(tcp_observation, dict)
         tcp_detected = (
             bool(tcp_observation.get("detected"))
             if isinstance(tcp_observation, dict)
@@ -1323,6 +1594,13 @@ class MVPApplication:
         registration = self._latest_draft_evidence(
             payload, "candidate_registration_*.json"
         )
+        registration_stage = (
+            str(registration.get("candidate_stage") or "materialized")
+            if isinstance(registration, dict)
+            else "not_registered"
+        )
+        semantic_candidate_registered = registration_stage == "semantic_only"
+        materialized_candidate_registered = registration_stage == "materialized"
         handeye_transform = self._latest_legacy_handeye_transform()
         has_calibration = bool(
             isinstance(calibration, dict)
@@ -1340,10 +1618,16 @@ class MVPApplication:
             and trajectory.get("calibration_id") == calibration.get("calibration_id")
             and isinstance(trajectory_quality, dict)
             and int(trajectory_quality.get("sample_count") or 0) >= 4
-            and float(trajectory_quality.get("mean_confidence") or 0.0) >= 0.6
+            and (
+                float(trajectory_quality.get("mean_confidence") or 0.0) >= 0.6
+                or trajectory.get("quality_tier")
+                == "operator_confirmed_two_fingertip_proxy"
+            )
         )
         mock_validation_passed = bool(
-            registration and registration.get("mock_validation_passed") is True
+            materialized_candidate_registered
+            and registration
+            and registration.get("mock_validation_passed") is True
         )
         checks = [
             {
@@ -1364,18 +1648,20 @@ class MVPApplication:
             },
             {
                 "id": "tcp_proxy",
-                "label": "두 손가락 TCP 프록시 관찰",
+                "label": "엄지–검지 TCP 프록시 관찰",
                 "passed": tcp_detected,
                 "detail": (
-                    "두 fingertip 중점의 정성적 동작이 관찰되었습니다."
+                    "엄지–검지 끝/접촉점 중점의 정성적 동작이 관찰되었습니다."
                     if tcp_detected
-                    else "두 fingertip이 함께 보이는 구간이 필요합니다."
+                    else "엄지와 검지의 끝/접촉점이 각각 보이는 구간이 필요합니다."
                 ),
             },
             {
                 "id": "calibrated_transform",
                 "label": "보정된 camera → surface/tool TF",
                 "passed": has_calibration,
+                "required": False,
+                "blocking": False,
                 "detail": (
                     f"{calibration['calibration_id']} · "
                     f"{calibration.get('method', 'RGB-D 표면 프레임')}"
@@ -1406,45 +1692,67 @@ class MVPApplication:
                 "id": "trusted_pose_trajectory",
                 "label": "신뢰 가능한 tool/TCP pose trajectory",
                 "passed": has_pose_trajectory,
+                "required": False,
+                "blocking": False,
                 "detail": (
                     f"표면 상대 TCP {trajectory_quality['sample_count']}개 · "
                     f"경로 {float(trajectory_quality['path_length_m']):.3f} m"
                     if has_pose_trajectory and isinstance(trajectory_quality, dict)
-                    else "두 fingertip 3D 경로를 추출하고 운영자가 확인해야 합니다."
+                    else "엄지–검지 중점의 3D 경로를 추출하고 운영자가 확인해야 합니다."
+                ),
+            },
+            {
+                "id": "semantic_candidate_registration",
+                "label": "스킬 목록 Semantic Candidate 등록",
+                "passed": registration is not None,
+                "detail": (
+                    f"{registration['skill_id']}@{registration['version']} · "
+                    + (
+                        "의미 스킬 등록 완료, 실행 기하는 나중에 연결"
+                        if semantic_candidate_registered
+                        else "실행 기하까지 연결된 Candidate"
+                    )
+                    if isinstance(registration, dict)
+                    else "TF 없이도 먼저 비실행 스킬로 등록할 수 있습니다."
                 ),
             },
             {
                 "id": "mock_validation",
                 "label": "컴파일 및 Mock 회귀 검증",
                 "passed": mock_validation_passed,
+                "required": False,
+                "blocking": False,
                 "detail": (
                     f"{registration['skill_id']}@{registration['version']} Mock 검증 통과"
                     if mock_validation_passed and isinstance(registration, dict)
-                    else "Candidate SkillGraph 등록 시 자동 실행됩니다."
+                    else "TF/TCP 경로를 연결한 실행 Candidate 단계에서 수행됩니다."
                 ),
             },
         ]
-        if not has_rgbd_pairs or not has_tcp_schema:
+        if not has_rgbd_pairs:
             readiness_status = "needs_reanalysis"
-        elif not tcp_detected:
-            readiness_status = "needs_tcp_evidence"
-        elif not has_calibration:
-            readiness_status = "needs_calibration"
-        elif not has_pose_trajectory:
-            readiness_status = "needs_pose_evidence"
         elif mock_validation_passed:
             readiness_status = "candidate_registered"
-        elif registration is not None:
+        elif materialized_candidate_registered:
             readiness_status = "candidate_validation_failed"
+        elif semantic_candidate_registered and has_calibration and has_pose_trajectory:
+            readiness_status = "ready_for_materialization"
+        elif semantic_candidate_registered:
+            readiness_status = "semantic_candidate_registered"
+        elif has_calibration and has_pose_trajectory:
+            readiness_status = "ready_for_materialization"
         else:
-            readiness_status = "ready_for_candidate"
+            readiness_status = "ready_for_semantic_candidate"
         can_register_candidate = (
             has_rgbd_pairs
-            and has_tcp_schema
-            and tcp_detected
-            and has_calibration
-            and has_pose_trajectory
-            and not mock_validation_passed
+            and (
+                registration is None
+                or (
+                    not mock_validation_passed
+                    and has_calibration
+                    and has_pose_trajectory
+                )
+            )
         )
         return {
             **payload,
@@ -1474,19 +1782,18 @@ class MVPApplication:
             },
             "promotion_readiness": {
                 "status": readiness_status,
+                "candidate_stage": registration_stage,
                 "can_register_candidate": can_register_candidate,
                 "checks": checks,
                 "next_action": (
-                    "RGB-D와 두 손가락 TCP 프록시로 다시 분석하세요."
+                    "RGB-D 녹화를 다시 분석해 Semantic Candidate를 만드세요."
                     if readiness_status == "needs_reanalysis"
-                    else "두 fingertip이 함께 보이도록 다시 티칭하세요."
-                    if readiness_status == "needs_tcp_evidence"
-                    else "Depth 평면 자동 추출 또는 3점 방식으로 표면 TF를 보정하세요."
-                    if readiness_status == "needs_calibration"
-                    else "두 fingertip 경로를 자동 추출하거나 수동으로 지정하세요."
-                    if readiness_status == "needs_pose_evidence"
-                    else "Candidate 등록을 눌러 컴파일과 Mock 검증을 실행하세요."
-                    if readiness_status == "ready_for_candidate"
+                    else "스킬 목록에 우선 등록하세요. TF와 경로는 지금 필요하지 않습니다."
+                    if readiness_status == "ready_for_semantic_candidate"
+                    else "Semantic Candidate가 등록되었습니다. TF/TCP 연결은 나중에 진행하세요."
+                    if readiness_status == "semantic_candidate_registered"
+                    else "실행 Candidate로 구체화하고 컴파일·Mock 검증을 수행하세요."
+                    if readiness_status == "ready_for_materialization"
                     else "Candidate 검증 실패 원인을 확인한 뒤 다시 등록하세요."
                     if readiness_status == "candidate_validation_failed"
                     else "검증된 후보가 스킬 목록에 등록되었습니다. 활성화 전 검토하세요."
@@ -1706,6 +2013,10 @@ class MVPApplication:
     def compile_skill(self, skill_id: str, request: dict[str, Any]) -> dict[str, Any]:
         row = self._find_version(skill_id, request.get("version"))
         graph = SkillGraph.model_validate(row.graph_json)
+        if self._is_semantic_only_candidate(graph):
+            raise ValueError(
+                "semantic candidate cannot compile until TF and TCP geometry are materialized"
+            )
         artifact = SkillCompiler().compile(graph)
         stored = self.store.put_text(
             f"skills/{graph.skill_id}/{graph.version}/compiled_skill.py",
@@ -1724,6 +2035,25 @@ class MVPApplication:
     def validate_skill(self, skill_id: str, request: dict[str, Any]) -> dict[str, Any]:
         row = self._find_version(skill_id, request.get("version"))
         graph = SkillGraph.model_validate(row.graph_json)
+        if self._is_semantic_only_candidate(graph):
+            result = {
+                "skill_id": skill_id,
+                "version": row.semantic_version,
+                "passed": False,
+                "mock_validation": False,
+                "hardware_validated": False,
+                "errors": [
+                    "semantic candidate is registered, but execution geometry is deferred"
+                ],
+                "warnings": [],
+                "runtime": {"passed": False, "robot_commands": [], "events": []},
+            }
+            self.repository.record_validation_run(
+                skill_version_id=row.id,
+                status="blocked",
+                result=result,
+            )
+            return result
         report = SkillGraphValidator().inspect(graph)
         errors = list(report.errors)
         runtime_evidence: dict[str, Any] = {
@@ -1808,6 +2138,143 @@ class MVPApplication:
             attached.status = "active"
             skill.active_version_id = attached.id
         return self._version_summary(self._find_version(skill_id, row.semantic_version))
+
+    def commission_skill(self, skill_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        """Run non-moving, operator-confirmed hardware commissioning checks."""
+
+        acknowledgements = (
+            "operator_confirmed",
+            "workspace_cleared",
+            "estop_ready",
+            "path_reviewed",
+        )
+        if not all(request.get(name) is True for name in acknowledgements):
+            raise ValueError("all hardware commissioning acknowledgements are required")
+        if not self.settings.hardware_enabled:
+            raise HardwareExecutionDenied(
+                "hardware commissioning requires all hardware environment gates"
+            )
+        row = self._find_version(skill_id, str(request["version"]))
+        graph = SkillGraph.model_validate(row.graph_json)
+        sources = tuple(str(value) for value in graph.source_demonstrations)
+        calibration = self.calibration_controller.status()
+        transform = calibration.get("latest_result") or calibration.get("legacy_transform")
+        camera = self.camera_controller.status()
+        camera_timestamp_ns = camera.get("timestamp_ns")
+        camera_fresh = (
+            camera.get("backend") == "realsense"
+            and camera.get("state") == "streaming"
+            and isinstance(camera_timestamp_ns, int)
+            and 0 <= time.time_ns() - camera_timestamp_ns <= 2_000_000_000
+        )
+        checks: list[dict[str, Any]] = [
+            {
+                "name": "active_validated_skill",
+                "passed": row.status == "active" and row.validation_status == "passed",
+                "detail": f"status={row.status}, validation={row.validation_status}",
+            },
+            {
+                "name": "surface_relative_path",
+                "passed": all(
+                    node.operation not in {
+                        "motion.move_l",
+                        "motion.move_c",
+                        "motion.move_spline",
+                        "workspace.validate_path",
+                    }
+                    or "$surface" in json.dumps(node.arguments, sort_keys=True)
+                    for node in graph.nodes
+                ),
+                "detail": "Cartesian targets must remain anchored to $surface",
+            },
+            {
+                "name": "surface_calibration_evidence",
+                "passed": any("surface_calibration_" in source for source in sources),
+                "detail": "recording-derived T_camera_surface evidence",
+            },
+            {
+                "name": "tcp_trajectory_evidence",
+                "passed": any("tcp_trajectory_" in source for source in sources),
+                "detail": "recording-derived surface-relative TCP trajectory",
+            },
+            {
+                "name": "handeye_runtime_authorized",
+                "passed": bool(
+                    isinstance(transform, dict)
+                    and transform.get("passed") is True
+                    and transform.get("runtime_authorized") is True
+                ),
+                "detail": (
+                    "; ".join(transform.get("failures", ()))
+                    if isinstance(transform, dict) and transform.get("failures")
+                    else "no runtime-authorized T_flange_camera is available"
+                ),
+            },
+            {
+                "name": "realsense_live",
+                "passed": camera_fresh,
+                "detail": (
+                    "fresh synchronized RGB-D frame available"
+                    if camera_fresh
+                    else "start RealSense preview and wait for a fresh frame"
+                ),
+            },
+        ]
+        robot = DoosanM0609Adapter(
+            robot_id=self.settings.doosan_robot_id,
+            robot_model=self.settings.doosan_robot_model,
+            execution_mode="hardware",
+            hardware_enabled=True,
+        )
+        try:
+            robot.connect()
+            state = robot.get_state()
+            robot_ready = (
+                state.connected
+                and state.operational_state.value == "idle"
+                and not state.emergency_stop_active
+                and not state.protective_stop_active
+                and state.fault_code is None
+            )
+            robot_detail = f"operational_state={state.operational_state.value}"
+        except Exception as exc:
+            robot_ready = False
+            robot_detail = f"{type(exc).__name__}: {exc}"
+        finally:
+            robot.disconnect()
+        checks.append(
+            {"name": "doosan_ready", "passed": robot_ready, "detail": robot_detail}
+        )
+        passed = all(check["passed"] for check in checks)
+        with self.database.session() as session:
+            attached = session.get(SkillVersionRecord, row.id)
+            if attached is None:
+                raise KeyError(row.id)
+            if passed:
+                attached.hardware_compatible = True
+            metadata = dict(attached.metadata_json)
+            metadata["latest_hardware_commissioning"] = {
+                "operator_id": str(request.get("operator_id") or "operator"),
+                "timestamp_ns": time.time_ns(),
+                "passed": passed,
+                "checks": checks,
+            }
+            attached.metadata_json = metadata
+        result = {
+            "skill_id": skill_id,
+            "version": row.semantic_version,
+            "passed": passed,
+            "hardware_compatible": passed,
+            "checks": checks,
+            "runtime_ready": self.get_runtime_capabilities()["hardware_execution_ready"],
+            "runtime_blockers": self.get_runtime_capabilities()["hardware_blockers"],
+        }
+        self.repository.record_validation_run(
+            skill_version_id=row.id,
+            status="passed" if passed else "blocked",
+            result={"hardware_commissioning": result},
+        )
+        return result
 
     def rollback_skill(self, skill_id: str, request: dict[str, Any]) -> dict[str, Any]:
         target = self._find_version(skill_id, str(request["version"]))
@@ -1934,57 +2401,105 @@ class MVPApplication:
             "bindings": {name: value.entity_id for name, value in bindings.items()},
         }
 
+    def get_runtime_capabilities(self) -> dict[str, Any]:
+        """Describe configured execution without claiming unavailable safety evidence."""
+
+        blockers: list[str] = []
+        if not self.settings.hardware_enabled:
+            blockers.append("hardware environment gates are not all enabled")
+        # The application currently has only deterministic mock geometry and a
+        # mock obstacle monitor.  Keep these explicit so a hardware-configured
+        # server cannot be mistaken for a commissioned execution runtime.
+        blockers.extend(
+            (
+                "real RGB-D scene reconstruction is not configured",
+                "verified IK/collision validator is not configured",
+                "verified dynamic obstacle monitor is not configured",
+                "verified continuous scene monitor is not configured",
+            )
+        )
+        return {
+            "configured_execution_mode": self.settings.robot_execution_mode.value,
+            "hardware_environment_enabled": self.settings.hardware_enabled,
+            "hardware_execution_ready": not blockers,
+            "robot_backend": self.settings.robot_backend,
+            "dry_run": self.settings.dry_run,
+            "scene_capture_provider": "mock",
+            "hardware_blockers": blockers,
+        }
+
     def preflight_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         row, graph, scene, bindings, robot, motion, force = self._runtime_parts(request)
         mode = ExecutionMode(str(request.get("mode", "mock")))
         safety_policy = self._safety_policy()
-        report = PreflightValidator().validate(
-            scene=scene,
-            skill=graph,
-            bindings=bindings,
-            robot=robot,
-            execution_mode=mode,
-            enable_hardware_execution=self.settings.hardware_enabled,
-            skill_validation_status=row.validation_status,
-            expected_calibration_id=scene.calibration_id,
-            expected_tool_class=graph.required_tools[0] if graph.required_tools else None,
-            skill_uses_force=bool(graph.force_profiles),
-            motion_profiles=motion,
-            force_profiles=force,
-            safety_policy=safety_policy,
-            robot_backend=self.settings.robot_backend,
-            enable_real_robot=self.settings.enable_real_robot,
-            dry_run=self.settings.dry_run,
-        )
-        return report.as_dict()
+        try:
+            report = PreflightValidator().validate(
+                scene=scene,
+                skill=graph,
+                bindings=bindings,
+                robot=robot,
+                execution_mode=mode,
+                enable_hardware_execution=self.settings.hardware_enabled,
+                skill_validation_status=row.validation_status,
+                expected_calibration_id=scene.calibration_id,
+                expected_tool_class=(
+                    graph.required_tools[0] if graph.required_tools else None
+                ),
+                skill_uses_force=bool(graph.force_profiles),
+                motion_profiles=motion,
+                force_profiles=force,
+                safety_policy=safety_policy,
+                robot_backend=self.settings.robot_backend,
+                enable_real_robot=self.settings.enable_real_robot,
+                dry_run=self.settings.dry_run,
+            )
+            return report.as_dict()
+        finally:
+            robot.disconnect()
 
     def execute_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         requested_mode = str(request.get("mode", "mock"))
-        if requested_mode == "hardware":
-            if not self.settings.hardware_enabled:
-                raise ValueError("hardware execution gates are not all enabled")
-            raise ValueError("Doosan hardware adapter is not configured or physically validated")
+        if requested_mode == "hardware" and not self.settings.hardware_enabled:
+            raise ValueError("hardware execution gates are not all enabled")
         row, graph, scene, bindings, robot, motion, force = self._runtime_parts(request)
+        if requested_mode == "hardware" and not row.hardware_compatible:
+            robot.disconnect()
+            raise ValueError(
+                "selected skill version has not passed hardware commissioning validation"
+            )
         safety_policy = self._safety_policy()
-        report = PreflightValidator().validate(
-            scene=scene,
-            skill=graph,
-            bindings=bindings,
-            robot=robot,
-            execution_mode=ExecutionMode(requested_mode),
-            skill_validation_status=row.validation_status,
-            expected_tool_class=graph.required_tools[0] if graph.required_tools else None,
-            skill_uses_force=bool(graph.force_profiles),
-            motion_profiles=motion,
-            force_profiles=force,
-            safety_policy=safety_policy,
-            robot_backend="mock",
-            enable_real_robot=False,
-            dry_run=True,
-        )
+        is_hardware = requested_mode == "hardware"
+        try:
+            report = PreflightValidator().validate(
+                scene=scene,
+                skill=graph,
+                bindings=bindings,
+                robot=robot,
+                execution_mode=ExecutionMode(requested_mode),
+                enable_hardware_execution=self.settings.hardware_enabled,
+                skill_validation_status=row.validation_status,
+                expected_tool_class=(
+                    graph.required_tools[0] if graph.required_tools else None
+                ),
+                skill_uses_force=bool(graph.force_profiles),
+                motion_profiles=motion,
+                force_profiles=force,
+                safety_policy=safety_policy,
+                robot_backend=self.settings.robot_backend if is_hardware else "mock",
+                enable_real_robot=self.settings.enable_real_robot if is_hardware else False,
+                dry_run=self.settings.dry_run if is_hardware else True,
+            )
+        except Exception:
+            robot.disconnect()
+            raise
         run = self._load_verified_run(row, graph)
-        gripper = MockGripperAdapter()
-        gripper.connect()
+        gripper = None
+        if not is_hardware:
+            gripper = MockGripperAdapter()
+            gripper.connect()
+        elif any(node.operation.startswith("gripper.") for node in graph.nodes):
+            robot.disconnect()
+            raise ValueError("hardware skill uses a gripper but no verified RG2 adapter is active")
         event_sink = InMemoryEventSink()
         context = RuntimeContext(
             scene=scene,
@@ -2039,6 +2554,7 @@ class MVPApplication:
                 safety_supervisor=safety_supervisor,
             )
         error: BaseException | None = None
+        robot_commands: list[str] = []
         try:
             asyncio.run(executor.execute_compiled(run))
         except BaseException as exc:
@@ -2069,6 +2585,10 @@ class MVPApplication:
                 error_code=None if error is None else type(error).__name__,
                 error_message=None if error is None else str(error),
             )
+            robot_commands = [
+                command.operation for command in getattr(robot, "commands", ())
+            ]
+            robot.disconnect()
         if error is not None:
             raise error
         return {
@@ -2077,7 +2597,7 @@ class MVPApplication:
             "mode": requested_mode,
             "preflight": report.as_dict(),
             "bindings": {name: value.entity_id for name, value in bindings.items()},
-            "robot_commands": [command.operation for command in robot.commands],
+            "robot_commands": robot_commands,
             "events": [event.event_type for event in event_sink.events],
         }
 
@@ -2107,7 +2627,10 @@ class MVPApplication:
         if active.force_supervisor.force_active:
             direction = active.force_supervisor.emergency_release()
             if direction is not None:
-                active.robot.safe_retract(direction_xyz=direction, distance_m=0.05)
+                safe_retract = getattr(active.robot, "safe_retract", None)
+                if not callable(safe_retract):
+                    raise ValueError("active robot adapter has no safe retract capability")
+                safe_retract(direction_xyz=direction, distance_m=0.05)
         return {"run_id": run_id, "abort_requested": True, "reason": reason}
 
     def get_runtime_run(self, run_id: str) -> dict[str, Any]:
@@ -2142,7 +2665,7 @@ class MVPApplication:
         SkillGraph,
         SceneSnapshot,
         dict[str, Any],
-        MockRobotAdapter,
+        RobotAdapter,
         dict[str, Any],
         dict[str, Any],
     ]:
@@ -2164,7 +2687,18 @@ class MVPApplication:
             requirements,
             maximum_scene_age_ms=self.settings.scene_freshness_ms,
         )
-        robot = MockRobotAdapter()
+        requested_mode = ExecutionMode(str(request.get("mode", "mock")))
+        if requested_mode is ExecutionMode.HARDWARE:
+            if not self.settings.hardware_enabled:
+                raise ValueError("hardware execution gates are not all enabled")
+            robot: RobotAdapter = DoosanM0609Adapter(
+                robot_id=self.settings.doosan_robot_id,
+                robot_model=self.settings.doosan_robot_model,
+                execution_mode="hardware",
+                hardware_enabled=True,
+            )
+        else:
+            robot = MockRobotAdapter()
         robot.connect()
         return row, graph, scene, bindings, robot, self._motion_profiles(), self._force_profiles()
 

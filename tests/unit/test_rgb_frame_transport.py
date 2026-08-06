@@ -9,7 +9,10 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
-from robot_skill_system.api.contracts import RecordingSkillDraftRequest
+from robot_skill_system.api.contracts import (
+    DraftTCPPathRequest,
+    RecordingSkillDraftRequest,
+)
 from robot_skill_system.capture.rgb_frame_transport import (
     build_rgb_contact_sheet_pdf,
     build_rgb_keyframe_zip,
@@ -100,3 +103,35 @@ def test_recording_draft_contract_and_settings_allow_300_frames(tmp_path: Path) 
             operator_instruction="작업을 분석한다",
             keyframe_count=301,
         )
+
+
+def test_low_confidence_tcp_materialization_requires_mock_only_acknowledgement() -> None:
+    with pytest.raises(ValidationError, match="Mock-only acknowledgement"):
+        DraftTCPPathRequest(
+            method="openai_rgbd_low_confidence_mock",
+            operator_confirmed=True,
+        )
+
+    request = DraftTCPPathRequest(
+        method="openai_rgbd_low_confidence_mock",
+        operator_confirmed=True,
+        acknowledge_low_confidence_mock_only=True,
+    )
+
+    assert request.acknowledge_low_confidence_mock_only is True
+
+
+def test_operator_confirmed_fingertip_tcp_proxy_requires_acknowledgement() -> None:
+    with pytest.raises(ValidationError, match="two-fingertip midpoint"):
+        DraftTCPPathRequest(
+            method="openai_rgbd_operator_confirmed",
+            annotations=[],
+            operator_confirmed=True,
+        )
+    request = DraftTCPPathRequest(
+        method="openai_rgbd_operator_confirmed",
+        annotations=[],
+        operator_confirmed=True,
+        acknowledge_two_fingertip_tcp_proxy=True,
+    )
+    assert request.acknowledge_two_fingertip_tcp_proxy is True

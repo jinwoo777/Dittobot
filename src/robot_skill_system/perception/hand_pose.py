@@ -16,7 +16,7 @@ from .interfaces import HandPoseEstimate, HandPoseEstimator
 
 def _load_mediapipe() -> ModuleType:
     try:
-        import mediapipe  # type: ignore[import-not-found]
+        import mediapipe  # type: ignore
     except ImportError as exc:
         raise NotConfiguredError(
             "MediaPipe hand estimation requires the optional mediapipe package"

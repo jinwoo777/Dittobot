@@ -85,6 +85,9 @@ class RecordingSkillDraftRequest(APIModel):
     )
     operator_instruction: str = Field(min_length=1, max_length=2000)
     keyframe_count: int = Field(default=100, ge=1, le=300)
+    tcp_landmark_confidence_threshold: float = Field(
+        default=0.20, ge=0.10, le=0.90
+    )
 
 
 class PixelPointRequest(APIModel):
@@ -120,20 +123,62 @@ class TwoFingerFrameAnnotationRequest(APIModel):
 
 
 class DraftTCPPathRequest(APIModel):
-    method: Literal["manual_two_fingertip", "mediapipe_rgbd", "openai_rgbd"] = (
-        "manual_two_fingertip"
-    )
+    method: Literal[
+        "manual_two_fingertip",
+        "mediapipe_rgbd",
+        "openai_rgbd",
+        "openai_rgbd_operator_confirmed",
+        "openai_rgbd_low_confidence_mock",
+    ] = "manual_two_fingertip"
     annotations: list[TwoFingerFrameAnnotationRequest] = Field(
         default_factory=list, max_length=256
     )
     operator_confirmed: bool
+    acknowledge_two_fingertip_tcp_proxy: bool = False
+    acknowledge_low_confidence_mock_only: bool = False
 
     @model_validator(mode="after")
     def validate_method_evidence(self) -> DraftTCPPathRequest:
         if self.method == "manual_two_fingertip" and len(self.annotations) < 4:
             raise ValueError("manual TCP teaching requires at least four annotated frames")
-        if self.method in {"mediapipe_rgbd", "openai_rgbd"} and self.annotations:
+        automatic_methods = {
+            "mediapipe_rgbd",
+            "openai_rgbd",
+            "openai_rgbd_operator_confirmed",
+            "openai_rgbd_low_confidence_mock",
+        }
+        if self.method in automatic_methods and self.annotations:
             raise ValueError("automatic TCP extraction does not accept manual annotations")
+        if (
+            self.method == "openai_rgbd_operator_confirmed"
+            and not self.acknowledge_two_fingertip_tcp_proxy
+        ):
+            raise ValueError(
+                "operator-confirmed GPT geometry requires acknowledgement that the "
+                "two-fingertip midpoint is the intended robot TCP proxy"
+            )
+        if (
+            self.method != "openai_rgbd_operator_confirmed"
+            and self.acknowledge_two_fingertip_tcp_proxy
+        ):
+            raise ValueError(
+                "two-fingertip TCP acknowledgement is valid only for the "
+                "operator-confirmed method"
+            )
+        if (
+            self.method == "openai_rgbd_low_confidence_mock"
+            and not self.acknowledge_low_confidence_mock_only
+        ):
+            raise ValueError(
+                "low-confidence GPT geometry requires explicit Mock-only acknowledgement"
+            )
+        if (
+            self.method != "openai_rgbd_low_confidence_mock"
+            and self.acknowledge_low_confidence_mock_only
+        ):
+            raise ValueError(
+                "low-confidence acknowledgement is valid only for the Mock-only method"
+            )
         return self
 
 
@@ -160,6 +205,15 @@ class SkillValidateRequest(APIModel):
 
 class SkillActivateRequest(APIModel):
     version: str
+
+
+class SkillCommissionRequest(APIModel):
+    version: str
+    operator_id: str = Field(default="operator", min_length=1, max_length=64)
+    operator_confirmed: bool
+    workspace_cleared: bool
+    estop_ready: bool
+    path_reviewed: bool
 
 
 class SkillRollbackRequest(APIModel):

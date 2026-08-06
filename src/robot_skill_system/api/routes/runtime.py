@@ -18,6 +18,11 @@ from robot_skill_system.api.dependencies import ServiceDependency
 router = APIRouter(prefix="/runtime", tags=["runtime"])
 
 
+@router.get("/capabilities")
+def capabilities(service: ServiceDependency) -> dict[str, Any]:
+    return service.get_runtime_capabilities()
+
+
 @router.post("/resolve")
 @router.post("/intent", include_in_schema=True)
 def resolve(

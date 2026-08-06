@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from robot_skill_system.perception.hand_tracking import LocalHandTrackingSummary
+
 
 class StrictModel(BaseModel):
     """Base schema that rejects model-supplied fields outside the contract."""
@@ -98,6 +100,10 @@ class TCPProxyTeachingDefinition(StrictModel):
         "midpoint_between_fingertips"
     )
     coordinate_policy: Literal["semantic_observation_only"] = "semantic_observation_only"
+    semantic_landmark_confidence_threshold: float = Field(
+        default=0.20, ge=0.10, le=0.90
+    )
+    local_depth_minimum_frame_count: Literal[4] = 4
 
 
 class NormalizedImagePoint(StrictModel):
@@ -169,7 +175,7 @@ class TCPProxyObservation(StrictModel):
             raise ValueError("valid_landmark_frame_count does not match observed states")
         if self.detected is not (valid_count > 0):
             raise ValueError("TCP proxy detected flag does not match landmark evidence")
-        if self.usable_for_local_depth_path is not (valid_count >= 4):
+        if self.usable_for_local_depth_path and valid_count < 4:
             raise ValueError("local depth path requires at least four landmark frames")
         expected_status = (
             "not_detected"
@@ -255,6 +261,7 @@ class RecordingSkillDraftInput(StrictModel):
     name_hint: str = Field(pattern=r"^[a-z][a-z0-9_]{2,63}$")
     operator_instruction: str = Field(min_length=1, max_length=2000)
     recording_summary: dict[str, Any]
+    local_hand_tracking: LocalHandTrackingSummary | None = None
     primitive_catalog: list[str] = Field(min_length=1, max_length=64)
     entity_role_catalog: list[str] = Field(min_length=1, max_length=16)
     keyframe_indices: list[int] = Field(min_length=1, max_length=300)
@@ -268,6 +275,19 @@ class RecordingSkillDraftInput(StrictModel):
         default_factory=TCPProxyTeachingDefinition
     )
     limitations: list[str] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _local_tracking_matches_keyframes(self) -> RecordingSkillDraftInput:
+        tracking = self.local_hand_tracking
+        if tracking is None:
+            return self
+        if tracking.requested_frame_count != len(self.keyframe_indices):
+            raise ValueError("local hand tracking must cover the requested keyframe count")
+        if tracking.status == "completed" and [
+            frame.frame_index for frame in tracking.frames
+        ] != self.keyframe_indices:
+            raise ValueError("local hand tracking must preserve keyframe order and indices")
+        return self
 
 
 class RuntimeIntent(StrictModel):

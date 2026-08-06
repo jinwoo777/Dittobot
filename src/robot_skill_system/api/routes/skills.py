@@ -13,6 +13,7 @@ from robot_skill_system.api.contracts import (
     DraftTCPPathRequest,
     RecordingSkillDraftRequest,
     SkillActivateRequest,
+    SkillCommissionRequest,
     SkillCompileRequest,
     SkillInduceRequest,
     SkillRollbackRequest,
@@ -149,6 +150,15 @@ def activate_skill(
     service: ServiceDependency,
 ) -> dict[str, Any]:
     return service.activate_skill(skill_id, request.model_dump())
+
+
+@router.post("/{skill_id}/commission")
+def commission_skill(
+    skill_id: str,
+    request: SkillCommissionRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.commission_skill(skill_id, request.model_dump())
 
 
 @router.post("/{skill_id}/rollback")

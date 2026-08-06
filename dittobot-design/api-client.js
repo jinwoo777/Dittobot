@@ -82,6 +82,10 @@
       return this.request("/health");
     }
 
+    runtimeCapabilities() {
+      return this.request("/runtime/capabilities");
+    }
+
     listSkills() {
       return this.request("/skills");
     }
@@ -131,10 +135,10 @@
       return this.request(`/skills/${encodeURIComponent(skillId)}${suffix}`);
     }
 
-    validateSkill(skillId, version) {
+    validateSkill(skillId, version, mode = "mock") {
       return this.request(`/skills/${encodeURIComponent(skillId)}/validate`, {
         method: "POST",
-        body: { version, mode: "mock" },
+        body: { version, mode },
       });
     }
 
@@ -142,6 +146,21 @@
       return this.request(`/skills/${encodeURIComponent(skillId)}/activate`, {
         method: "POST",
         body: { version },
+      });
+    }
+
+    commissionSkill(skillId, version) {
+      return this.request(`/skills/${encodeURIComponent(skillId)}/commission`, {
+        method: "POST",
+        body: {
+          version,
+          operator_id: "ui_operator",
+          operator_confirmed: true,
+          workspace_cleared: true,
+          estop_ready: true,
+          path_reviewed: true,
+        },
+        timeoutMs: 60000,
       });
     }
 
@@ -243,7 +262,13 @@
       return this.request("/skills/draft-from-recording/capabilities");
     }
 
-    createRecordingSkillDraft({ recordingId, nameHint, operatorInstruction, keyframeCount }) {
+    createRecordingSkillDraft({
+      recordingId,
+      nameHint,
+      operatorInstruction,
+      keyframeCount,
+      tcpLandmarkConfidenceThreshold,
+    }) {
       return this.request("/skills/draft-from-recording", {
         method: "POST",
         body: {
@@ -251,6 +276,7 @@
           name_hint: nameHint,
           operator_instruction: operatorInstruction,
           keyframe_count: keyframeCount,
+          tcp_landmark_confidence_threshold: tcpLandmarkConfidenceThreshold,
         },
         timeoutMs: 360000,
       });
@@ -268,7 +294,7 @@
       });
     }
 
-    preflightRuntime(skillId, version, sceneId, bindings) {
+    preflightRuntime(skillId, version, sceneId, bindings, mode = "mock") {
       return this.request("/runtime/preflight", {
         method: "POST",
         body: {
@@ -276,12 +302,12 @@
           version,
           scene_id: sceneId,
           bindings,
-          mode: "mock",
+          mode,
         },
       });
     }
 
-    executeRuntime({ skillId, version, sceneId, bindings, runId }) {
+    executeRuntime({ skillId, version, sceneId, bindings, runId, mode = "mock" }) {
       return this.request("/runtime/execute", {
         method: "POST",
         body: {
@@ -289,7 +315,7 @@
           version,
           scene_id: sceneId,
           bindings,
-          mode: "mock",
+          mode,
           text: `UI에서 ${skillId} 실행`,
           run_id: runId,
         },

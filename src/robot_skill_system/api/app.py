@@ -19,6 +19,7 @@ def create_app(service: Any | None = None) -> Any:
     from robot_skill_system.api.routes import calibration, camera, runtime, scenes, skills, teaching
     from robot_skill_system.capture.rgbd_recording import CameraStateError
     from robot_skill_system.exceptions import HardwareExecutionDenied, NotConfiguredError
+    from robot_skill_system.runtime.errors import RuntimeErrorBase
 
     if service is None:
         from robot_skill_system.application import create_application
@@ -32,8 +33,16 @@ def create_app(service: Any | None = None) -> Any:
     app.state.service = service
 
     @app.get("/health", tags=["system"])
-    def health() -> dict[str, str]:
-        return {"status": "ok", "default_execution_mode": "mock"}
+    def health() -> dict[str, Any]:
+        settings = getattr(service, "settings", None)
+        configured_mode = getattr(
+            getattr(settings, "robot_execution_mode", None), "value", "mock"
+        )
+        return {
+            "status": "ok",
+            "default_execution_mode": configured_mode,
+            "hardware_enabled": bool(getattr(settings, "hardware_enabled", False)),
+        }
 
     app.include_router(teaching.router)
     app.include_router(scenes.router)
@@ -76,6 +85,15 @@ def create_app(service: Any | None = None) -> Any:
         _request: Request, exc: HardwareExecutionDenied
     ) -> JSONResponse:
         return JSONResponse(status_code=403, content={"detail": str(exc)})
+
+    @app.exception_handler(RuntimeErrorBase)
+    async def runtime_rejected(
+        _request: Request, exc: RuntimeErrorBase
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": str(exc), "code": exc.code},
+        )
 
     # Retain FastAPI's type in the generated OpenAPI graph without importing it in core modules.
     _ = HTTPException

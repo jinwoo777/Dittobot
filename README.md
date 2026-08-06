@@ -1,59 +1,42 @@
 # Robot Skill System MVP
 
-## 실제 장치 실행: 터미널 2개
+## 실행 스크립트
 
-아래 명령은 이 워크스테이션의 Doosan M0609(`192.168.1.100`), ROS namespace `dsr01`,
-로봇망 인터페이스 `enp3s0`, ROS domain `78` 기준입니다. 먼저 **터미널 1**에서 bringup을
-실행하고 그대로 둡니다.
-
-### 터미널 1 — Doosan bringup
+TF/로봇 연결 없이 RGB-D 녹화와 Semantic Candidate 생성을 먼저 사용할 때는 터미널 하나에서
+안전 모드 API/UI만 실행합니다.
 
 ```bash
-source /opt/ros/humble/setup.bash
-source /home/rokey/cobot_ws/install/setup.bash
-
-export ROS_DOMAIN_ID=78
-export ROS_LOCALHOST_ONLY=0
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
-
-ros2 launch dsr_bringup2 dsr_bringup2_rviz.launch.py \
-  name:=dsr01 mode:=real host:=192.168.1.100 port:=12345 model:=m0609
+./scripts/run_dittobot_api.sh
 ```
 
-bringup이 완료되면 새 **터미널 2**에서 API/UI를 실행합니다. 아래 calibration gate는 실제
-로봇 이동을 허용하므로 작업공간, Chessboard 고정, E-stop 및 21개 pose 계획을 확인한 경우에만
-사용해야 합니다. `NPY TF 복사·검증`은 이동 명령을 보내지 않지만 같은 명시적 gate를 요구합니다.
+이 스크립트는 선택한 포트에 같은 저장소의 기존 Dittobot Uvicorn이 있으면 먼저 정상 종료하고
+새 프로세스로 교체합니다. 다른 프로그램이 포트를 점유한 경우에는 그 프로세스를 종료하지 않고
+PID와 명령을 표시한 뒤 중단합니다.
 
-### 터미널 2 — Dittobot API/UI (8001)
+인자 없이 Doosan M0609 가상 컨트롤러와 RViz를 실행할 수 있습니다.
 
 ```bash
-cd /home/rokey/Dittobot
-source /opt/ros/humble/setup.bash
-source /home/rokey/cobot_ws/install/setup.bash
-
-export ROS_DOMAIN_ID=78
-export ROS_LOCALHOST_ONLY=0
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
-export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
-
-export ROBOT_EXECUTION_MODE=hardware
-export ENABLE_HARDWARE_EXECUTION=true
-export ROBOT_BACKEND=doosan
-export ENABLE_REAL_ROBOT=true
-export DRY_RUN=false
-export ENABLE_HANDEYE_CALIBRATION=true
-export CALIBRATION_POSE_PLAN_APPROVED=true
-export CALIBRATION_CELL_SAFETY_VERIFIED=true
-export DOOSAN_ROBOT_ID=dsr01
-export DOOSAN_ROBOT_MODEL=m0609
-export HANDEYE_LEGACY_NPY_PATH="$PWD/T_gripper2camera.npy"
-export HANDEYE_LEGACY_EXPECTED_TCP=2FG_TCP
-
-python3 -m uvicorn robot_skill_system.api.app:create_app \
-  --factory --env-file .env --host 127.0.0.1 --port 8001
+./scripts/run_doosan_bringup.sh
 ```
+
+실제 Doosan M0609 bringup과 hand-eye calibration을 사용할 때만 터미널 두 개를 엽니다. 아래
+명시적 확인 옵션은 실제 장치 연결/이동 가능성을 운영자가 확인했다는 뜻입니다.
+
+```bash
+# 터미널 1 — Doosan bringup
+./scripts/run_doosan_bringup.sh --real --confirm-real-robot
+```
+
+```bash
+# 터미널 2 — Dittobot API/UI + hardware calibration gate
+./scripts/run_dittobot_api.sh --hardware-calibration --confirm-real-robot
+```
+
+무인자 bringup 기본값은 Doosan M0609 가상 컨트롤러(`127.0.0.1:12345`)이며, 실제 모드의
+기본 주소는 `192.168.1.100:12345`입니다. ROS namespace는 `dsr01`, 로봇망 인터페이스는
+`enp3s0`, ROS domain은 `78`, API port는 `8001`입니다. 다른 장치에서는 스크립트 `--help`에
+표시되는 환경 변수로 덮어쓸 수 있습니다. 하드웨어 모드는 작업공간, Chessboard 고정, E-stop 및
+승인된 pose 계획을 확인한 경우에만 사용합니다.
 
 실행 후 UI는 `http://127.0.0.1:8001/ui/`, API 문서는
 `http://127.0.0.1:8001/docs`에서 확인합니다. `.env`, 장치별 설정과 calibration artifact는
@@ -238,10 +221,13 @@ semantic 이미지 힌트일 뿐 camera/robot 좌표나 metric pose가 아닙니
 초안 상세의 승격 체크리스트는 RGB-D 증거, 두 손가락 TCP 프록시, 보정 TF, 신뢰 가능한 pose
 trajectory, Mock 검증 상태를 보여 줍니다. `Depth 평면 자동 추출`은 GPT의 작업대 ROI를 힌트로만
 사용하고 원본 aligned Depth와 저장된 카메라 intrinsics에 deterministic RANSAC/SVD를 적용해
-`T_camera_surface`를 계산합니다. 3점 수동 보정도 그대로 사용할 수 있습니다. `GPT TCP 경로 적용`은
+`스킬 목록에 우선 등록`은 TF와 TCP 경로 없이도 GPT semantic draft를 비실행
+`Semantic Candidate`로 SQLite 스킬 목록에 등록합니다. 이 단계에는 생성 코드가 없으며 컴파일,
+Mock 검증, 활성화, 실행이 모두 차단됩니다. 이후 필요할 때 `Depth 평면 자동 추출`로
+`T_camera_surface`를 계산할 수 있습니다. 3점 수동 보정도 그대로 사용할 수 있습니다. `GPT TCP 경로 적용`은
 GPT의 정규화 fingertip 위치를 원본 Depth로 다시 deproject하며, 4개 이상 유효한 3D 샘플이 없으면
-누락 원인과 함께 실패합니다. `경로 티칭 시작`의 수동 방식도 유지됩니다. 증거 검증 뒤에만
-`Candidate로 등록`이 활성화되고 컴파일·Mock 검증이 실행됩니다. 이 Candidate는 비활성·실기
+누락 원인과 함께 실패합니다. `경로 티칭 시작`의 수동 방식도 유지됩니다. TF와 경로 증거가 준비된
+뒤 같은 초안을 실행 Candidate로 구체화할 때만 컴파일·Mock 검증이 실행됩니다. 이 Candidate는 비활성·실기
 호환 불가 상태이며, 실제 로봇 재생에는 별도로 검증한 `robot_base → camera/surface` TF와 FK,
 로봇 안전 검증이 필요합니다. Chessboard/관절각 hand-eye 보정 구성은
 [Hardware setup](docs/HARDWARE_SETUP.md#tf-hierarchy-and-chessboard-calibration)을 참고하십시오.

@@ -92,9 +92,11 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/skills/drafts/{draft_id}/candidate",
         "/skills/search",
         "/skills/{skill_id}/validate",
+        "/skills/{skill_id}/commission",
         "/skills/{skill_id}/versions/{version}/promote",
         "/runtime/resolve",
         "/runtime/intent",
+        "/runtime/capabilities",
         "/runtime/bind",
         "/runtime/preflight",
         "/runtime/validate",
@@ -102,6 +104,80 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/runtime/abort",
     }
     assert required <= paths
+
+
+def test_commissioning_route_requires_explicit_hardware_environment(
+    service: MVPApplication,
+) -> None:
+    client = TestClient(create_app(service))
+    response = client.post(
+        "/skills/wipe_surface/commission",
+        json={
+            "version": "1.0.0",
+            "operator_id": "integration_operator",
+            "operator_confirmed": True,
+            "workspace_cleared": True,
+            "estop_ready": True,
+            "path_reviewed": True,
+        },
+    )
+    assert response.status_code == 403
+    assert "hardware environment gates" in response.json()["detail"]
+
+
+def test_health_and_runtime_capabilities_report_safe_mock_default(
+    service: MVPApplication,
+) -> None:
+    client = TestClient(create_app(service))
+
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.json() == {
+        "status": "ok",
+        "default_execution_mode": "mock",
+        "hardware_enabled": False,
+    }
+
+    capabilities = client.get("/runtime/capabilities")
+    assert capabilities.status_code == 200
+    payload = capabilities.json()
+    assert payload["configured_execution_mode"] == "mock"
+    assert payload["hardware_environment_enabled"] is False
+    assert payload["hardware_execution_ready"] is False
+    assert "hardware environment gates are not all enabled" in payload["hardware_blockers"]
+
+
+def test_hardware_configuration_is_visible_without_claiming_runtime_commissioning(
+    tmp_path: Path,
+) -> None:
+    settings = Settings.from_env(
+        {
+            "ARTIFACT_ROOT": str(tmp_path / "artifacts"),
+            "DATABASE_URL": f"sqlite:///{(tmp_path / 'registry.db').as_posix()}",
+            "OPENAI_MODE": "mock",
+            "ROBOT_EXECUTION_MODE": "hardware",
+            "ENABLE_HARDWARE_EXECUTION": "true",
+            "ROBOT_BACKEND": "doosan",
+            "ENABLE_REAL_ROBOT": "true",
+            "DRY_RUN": "false",
+        },
+        root=Path(__file__).resolve().parents[2],
+    )
+    application = MVPApplication(settings)
+    try:
+        client = TestClient(create_app(application))
+        assert client.get("/health").json()["default_execution_mode"] == "hardware"
+        capabilities = client.get("/runtime/capabilities").json()
+        assert capabilities["hardware_environment_enabled"] is True
+        assert capabilities["hardware_execution_ready"] is False
+        assert capabilities["hardware_blockers"] == [
+            "real RGB-D scene reconstruction is not configured",
+            "verified IK/collision validator is not configured",
+            "verified dynamic obstacle monitor is not configured",
+            "verified continuous scene monitor is not configured",
+        ]
+    finally:
+        application.close()
 
 
 def test_handeye_api_exposes_plan_but_refuses_closed_hardware_gates(
@@ -192,6 +268,10 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
         capabilities = client.get("/skills/draft-from-recording/capabilities").json()
         assert capabilities["openai_mode"] == "mock"
         assert capabilities["maximum_keyframes"] == 300
+        assert capabilities["tcp_landmark_confidence_threshold_default"] == 0.20
+        assert capabilities["trusted_trajectory_mean_confidence_threshold"] == 0.60
+        assert capabilities["local_hand_tracking_included_in_prompt"] is True
+        assert capabilities["local_hand_tracking_backend"] == "mediapipe_hands_0_10"
         assert capabilities["uploads_rgb_and_aligned_depth_pairs"] is True
         assert capabilities["provider_video_input_supported"] is False
         assert capabilities["fallback_analysis_transport"] == "pdf_contact_sheet"
@@ -204,6 +284,7 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
                 "name_hint": "table_wipe_recorded",
                 "operator_instruction": "걸레로 테이블 표면을 닦는다",
                 "keyframe_count": 8,
+                "tcp_landmark_confidence_threshold": 0.15,
             },
         )
         assert draft_response.status_code == 200
@@ -213,6 +294,15 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
         assert draft["openai"]["mode"] == "mock"
         assert draft["draft"]["suggested_skill_id"] == "table_wipe_recorded"
         assert draft["draft"]["tcp_proxy_observation"]["detected"] is True
+        assert draft["analysis_parameters"]["tcp_proxy_definition"][
+            "semantic_landmark_confidence_threshold"
+        ] == 0.15
+        local_tracking = draft["analysis_parameters"]["local_hand_tracking"]
+        assert local_tracking["backend"] == "mediapipe_hands_0_10"
+        assert local_tracking["status"] in {"completed", "unavailable"}
+        assert local_tracking["requested_frame_count"] == draft["transport"][
+            "keyframe_pair_count"
+        ]
         assert draft["transport"]["keyframe_pair_count"] >= 1
         assert draft["transport"]["image_count"] == (
             draft["transport"]["keyframe_pair_count"] * 2
@@ -224,8 +314,46 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
         assert draft_catalog.status_code == 200
         [listed_draft] = draft_catalog.json()["drafts"]
         assert listed_draft["draft_id"] == draft["draft_id"]
-        assert listed_draft["promotion_readiness"]["status"] == "needs_calibration"
-        assert listed_draft["promotion_readiness"]["can_register_candidate"] is False
+        assert listed_draft["promotion_readiness"]["status"] == (
+            "ready_for_semantic_candidate"
+        )
+        assert listed_draft["promotion_readiness"]["can_register_candidate"] is True
+        semantic_candidate = client.post(
+            f"/skills/drafts/{draft['draft_id']}/candidate",
+            json={"acknowledge_mock_only": True},
+        )
+        assert semantic_candidate.status_code == 200, semantic_candidate.text
+        registered = semantic_candidate.json()
+        assert registered["candidate_stage"] == "semantic_only"
+        assert registered["status"] == "semantic_candidate_registered"
+        assert registered["execution_blocked"] is True
+        assert registered["mock_validation_passed"] is False
+        skill = client.get(
+            "/skills/table_wipe_recorded",
+            params={"version": registered["version"]},
+        ).json()
+        assert skill["status"] == "candidate"
+        assert skill["validation_status"] == "blocked"
+        assert skill["generated_code_uri"] is None
+        assert skill["skill_graph"]["uncertainty"]["candidate_stage"] == (
+            "semantic_only"
+        )
+        blocked_validation = client.post(
+            "/skills/table_wipe_recorded/validate",
+            json={"version": registered["version"], "mode": "mock"},
+        ).json()
+        assert blocked_validation["passed"] is False
+        assert blocked_validation["mock_validation"] is False
+        blocked_compile = client.post(
+            "/skills/table_wipe_recorded/compile",
+            json={"version": registered["version"]},
+        )
+        assert blocked_compile.status_code == 422
+        promoted_draft = client.get(f"/skills/drafts/{draft['draft_id']}").json()
+        assert promoted_draft["promotion_readiness"]["status"] == (
+            "semantic_candidate_registered"
+        )
+        assert promoted_draft["promotion_readiness"]["can_register_candidate"] is False
         draft_detail = client.get(f"/skills/drafts/{draft['draft_id']}")
         assert draft_detail.status_code == 200
         assert draft_detail.json()["source_recording_id"] == recording_id
@@ -305,7 +433,7 @@ def test_auto_depth_plane_and_gpt_tcp_path_register_candidate_without_valid_npy(
             },
         )
         ready = client.get(f"/skills/drafts/{draft['draft_id']}").json()
-        assert ready["promotion_readiness"]["status"] == "ready_for_candidate"
+        assert ready["promotion_readiness"]["status"] == "ready_for_materialization"
         assert ready["promotion_readiness"]["can_register_candidate"] is True
         handeye_check = next(
             item
@@ -441,10 +569,23 @@ def test_ui_registry_api_and_static_console_are_connected(
     ui_redirect = client.get("/ui", follow_redirects=False)
     assert ui_redirect.status_code in {302, 307}
     assert ui_redirect.headers["location"] == "/ui/"
-    assert "Dittobot Operator Console" in client.get("/ui/").text
-    assert "분석 초안" in client.get("/ui/").text
-    assert "두 손가락" in client.get("/ui/").text
-    assert "DittobotApiClient" in client.get("/ui/api-client.js").text
+    ui_html = client.get("/ui/").text
+    ui_script = client.get("/ui/app.js").text
+    api_client_script = client.get("/ui/api-client.js").text
+    assert "Dittobot Operator Console" in ui_html
+    assert "분석 초안" in ui_html
+    assert "엄지와 검지" in ui_html
+    assert 'id="execution-mode"' in ui_html
+    assert {"mock", "dry_run", "simulation", "hardware"} <= {
+        value.split('"', 1)[0]
+        for value in ui_html.split('<option value="')[1:]
+    }
+    assert 'id="run-detail-skill"' in ui_html
+    assert "MOCK API" not in ui_html
+    assert "state.runtime.selectedMode" in ui_script
+    assert "runDetailSkill" in ui_script
+    assert "DittobotApiClient" in api_client_script
+    assert 'body: { version, mode }' in api_client_script
 
 
 def test_persisted_teaching_runtime_update_promotion_and_rollback(

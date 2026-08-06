@@ -5,6 +5,12 @@
     page: "skills",
     filter: "all",
     apiStatus: "connecting",
+    runtime: {
+      configuredMode: "mock",
+      selectedMode: "mock",
+      hardwareExecutionReady: false,
+      hardwareBlockers: [],
+    },
     skills: [],
     drafts: [],
     selectedKey: null,
@@ -61,8 +67,10 @@
 
   const dom = {
     banner: element("api-banner"),
+    apiMode: element("api-mode"),
     connectionDot: element("connection-dot"),
     connectionLabel: element("connection-label"),
+    registrySubtitle: element("registry-subtitle"),
     skillList: element("skill-list"),
     skillEmpty: element("skill-empty"),
     draftInspector: element("draft-inspector"),
@@ -84,13 +92,17 @@
     detailSubtitle: element("detail-subtitle"),
     detailNodes: element("detail-nodes"),
     validateSkill: element("validate-skill"),
+    executionMode: element("execution-mode"),
     activateSkill: element("activate-skill"),
+    runDetailSkill: element("run-detail-skill"),
     runStatus: element("run-status"),
     runTitle: element("run-title"),
     runSteps: element("run-steps"),
     estopChip: element("estop-chip"),
     forceChip: element("force-chip"),
     workspaceChip: element("workspace-chip"),
+    runtimeModeChip: element("runtime-mode-chip"),
+    runtimeSubtitle: element("runtime-subtitle"),
     rgbStream: element("rgb-stream"),
     depthStream: element("depth-stream"),
     rgbPlaceholder: element("rgb-placeholder"),
@@ -134,6 +146,7 @@
     draftSkillName: element("draft-skill-name"),
     draftInstruction: element("draft-instruction"),
     draftKeyframeCount: element("draft-keyframe-count"),
+    draftTcpThreshold: element("draft-tcp-threshold"),
     analyzeRecording: element("analyze-recording"),
     draftStatus: element("draft-status"),
     draftResult: element("draft-result"),
@@ -170,12 +183,14 @@
       uiState,
       validationStatus: row.validation_status,
       status: row.status,
+      hardwareCompatible: Boolean(row.hardware_compatible),
       description: row.description || graph.description || "",
       nodes: nodes.map((node) => ({
         operation: node.operation || node.node_id || "unknown",
         arguments: node.arguments || {},
         status: "idle",
       })),
+      semanticOnly: graph.uncertainty?.candidate_stage === "semantic_only",
     };
   }
 
@@ -185,6 +200,7 @@
     const readiness = row.promotion_readiness || {};
     const tcp = draft.tcp_proxy_observation || null;
     const sceneObservation = draft.scene_observation || null;
+    const tcpDefinition = row.analysis_parameters?.tcp_proxy_definition || null;
     return {
       draftId: row.draft_id,
       sourceRecordingId: row.source_recording_id,
@@ -199,6 +215,7 @@
       pairCount: Number(transport.keyframe_pair_count || 0),
       transport,
       tcp,
+      tcpDefinition,
       sceneObservation,
       readiness,
       promotionEvidence: row.promotion_evidence || {},
@@ -231,8 +248,29 @@
     return "미검증";
   }
 
+  function runtimeModeLabel(mode = state.runtime.selectedMode) {
+    const labels = {
+      mock: "MOCK",
+      dry_run: "DRY RUN",
+      simulation: "SIMULATION",
+      hardware: "HARDWARE",
+    };
+    return labels[mode] || mode.toUpperCase();
+  }
+
+  function runButtonText(skill) {
+    if (state.runtime.selectedMode !== "hardware") {
+      return `${runtimeModeLabel()} 실행`;
+    }
+    if (!skill?.hardwareCompatible) return "커미셔닝 시작";
+    return state.runtime.hardwareExecutionReady ? "실제 실행" : "실제 실행 불가";
+  }
+
   function renderConnection() {
     dom.connectionDot.className = "dot";
+    dom.apiMode.className = `mode ${state.runtime.configuredMode}`;
+    dom.apiMode.textContent = `${runtimeModeLabel(state.runtime.configuredMode)} API`;
+    dom.registrySubtitle.textContent = `분석 초안과 SQLite 스킬을 관리하고, 활성 스킬을 ${runtimeModeLabel()} 모드로 실행합니다.`;
     if (state.apiStatus === "connected") {
       dom.connectionDot.classList.add("ok");
       dom.connectionLabel.textContent = "FastAPI · SQLite 연결됨";
@@ -323,10 +361,21 @@
       });
       actions.append(detail);
       if (skill.uiState === "active") {
-        const run = create("button", { className: "button primary", text: "Mock 실행" });
+        const hardwareMode = state.runtime.selectedMode === "hardware";
+        const run = create("button", { className: "button primary", text: runButtonText(skill) });
         run.type = "button";
         run.disabled = state.apiStatus !== "connected";
-        run.addEventListener("click", () => startRun(skill.key));
+        if (hardwareMode && (!state.runtime.hardwareExecutionReady || !skill.hardwareCompatible)) {
+          const reasons = [
+            ...state.runtime.hardwareBlockers,
+            ...(skill.hardwareCompatible ? [] : ["스킬 하드웨어 커미셔닝 미승인"]),
+          ];
+          run.title = `실제 이동 전 사전점검에서 차단됩니다: ${reasons.join(", ")}`;
+        }
+        run.addEventListener("click", () => {
+          if (hardwareMode && !skill.hardwareCompatible) commissionSkill(skill.key);
+          else startRun(skill.key);
+        });
         actions.append(run);
       }
       card.append(summary, actions);
@@ -342,16 +391,25 @@
     dom.draftInspectorTitle.textContent = draft.suggestedSkillId;
     dom.draftInspectorSummary.textContent = draft.taskDescription || draft.observedSummary;
     dom.draftEvidence.replaceChildren();
+    const tcpDetected = Boolean(draft.tcp?.detected);
+    const tcpDepthUsable = Boolean(draft.tcp?.usable_for_local_depth_path);
+    const tcpConfidence = Number(draft.tcp?.confidence || 0);
+    const tcpEvidenceLabel = draft.tcp?.trajectory_status
+      ? [
+        `GPT TCP ${draft.tcp.trajectory_status}`,
+        `유효 ${draft.tcp.valid_landmark_frame_count || 0}프레임`,
+        `confidence ${tcpConfidence.toFixed(2)}`,
+        tcpDepthUsable ? "" : "Depth 적용 보류",
+      ].filter(Boolean).join(" · ")
+      : tcpDetected ? "두 손가락 TCP 프록시 관찰됨" : "TCP 재분석 필요";
     const evidence = [
       {
         label: draft.pairCount > 0 ? `RGB-D ${draft.pairCount}쌍` : "RGB-D 재분석 필요",
         passed: draft.pairCount > 0,
       },
       {
-        label: draft.tcp?.trajectory_status
-          ? `GPT TCP ${draft.tcp.trajectory_status} · 유효 ${draft.tcp.valid_landmark_frame_count || 0}프레임`
-          : draft.tcp?.detected ? "두 손가락 TCP 프록시 관찰됨" : "TCP 재분석 필요",
-        passed: Boolean(draft.tcp?.usable_for_local_depth_path),
+        label: tcpEvidenceLabel,
+        passed: tcpDetected,
       },
       {
         label: draft.sceneObservation?.person_hand
@@ -418,28 +476,38 @@
     const calibrationReady = Boolean(checkById.get("calibrated_transform")?.passed);
     const trajectoryReady = Boolean(checkById.get("trusted_pose_trajectory")?.passed);
     const candidateReady = Boolean(checkById.get("mock_validation")?.passed);
+    const candidateStage = draft.readiness.candidate_stage || "not_registered";
     dom.autoSurfaceCalibration.disabled = false;
     dom.autoSurfaceCalibration.textContent = calibrationReady
-      ? "Depth 평면 다시 추출" : "Depth 평면 자동 추출";
+      ? "나중에: Depth 평면 다시 추출" : "나중에: Depth 평면 추출";
     dom.startSurfaceCalibration.disabled = false;
-    dom.startSurfaceCalibration.textContent = calibrationReady ? "표면 TF 다시 보정" : "표면 TF 보정";
+    dom.startSurfaceCalibration.textContent = calibrationReady
+      ? "나중에: 3점 TF 다시 보정" : "나중에: 3점 TF 보정";
     dom.startPathTeaching.disabled = !calibrationReady;
     dom.startPathTeaching.title = calibrationReady
       ? "녹화 프레임에서 두 fingertip을 직접 지정"
       : "먼저 camera → surface TF를 보정하세요.";
-    dom.autoTcpPath.disabled = !calibrationReady;
-    dom.autoTcpPath.title = calibrationReady
-      ? "GPT 정규화 fingertip 좌표를 로컬 aligned depth로 3D 복원"
-      : "먼저 camera → surface TF를 보정하세요.";
+    dom.autoTcpPath.disabled = !calibrationReady || !tcpDepthUsable;
+    dom.autoTcpPath.title = !calibrationReady
+      ? "먼저 camera → surface TF를 보정하세요."
+      : tcpDepthUsable
+        ? "GPT 정규화 fingertip 좌표를 로컬 aligned depth로 3D 복원"
+        : draft.tcp?.failure_reason || "Semantic TCP는 검출됐지만 Depth 경로 품질이 부족합니다.";
     dom.registerDraftCandidate.disabled = !draft.readiness.can_register_candidate;
     dom.registerDraftCandidate.textContent = candidateReady
       ? "Candidate 등록 완료"
-      : trajectoryReady
-        ? "Candidate로 등록"
-        : "Candidate로 등록";
+      : candidateStage === "semantic_only" && trajectoryReady
+        ? "실행 Candidate로 구체화"
+        : candidateStage === "semantic_only"
+          ? "Semantic Candidate 등록 완료"
+          : "스킬 목록에 우선 등록";
     dom.registerDraftCandidate.title = draft.readiness.can_register_candidate
-      ? "Candidate SkillGraph로 등록"
-      : "승격 체크리스트의 필수 증거가 아직 부족합니다.";
+      ? candidateStage === "semantic_only"
+        ? "TF/TCP 증거를 연결한 실행 Candidate로 구체화"
+        : "TF 없이 비실행 Semantic Candidate로 먼저 등록"
+      : candidateStage === "semantic_only"
+        ? "이미 스킬 목록에 등록되었습니다. TF/TCP 연결은 선택 후속 단계입니다."
+        : "등록 가능한 RGB-D semantic draft가 필요합니다.";
   }
 
   function nodeArgumentsText(argumentsValue) {
@@ -454,16 +522,31 @@
   function renderDetail() {
     const skill = selectedSkill();
     dom.detailNodes.replaceChildren();
-    dom.validateSkill.disabled = !skill || state.apiStatus !== "connected";
-    dom.activateSkill.disabled = !skill || state.apiStatus !== "connected" || skill.uiState === "active";
+    dom.executionMode.value = state.runtime.selectedMode;
+    dom.executionMode.disabled = state.apiStatus !== "connected";
+    dom.validateSkill.disabled = !skill || state.apiStatus !== "connected" || skill.semanticOnly;
+    dom.activateSkill.disabled = !skill || state.apiStatus !== "connected"
+      || skill.uiState === "active" || skill.semanticOnly;
+    dom.runDetailSkill.disabled = !skill || state.apiStatus !== "connected"
+      || skill.uiState !== "active" || skill.semanticOnly;
     if (!skill) {
       dom.detailTitle.textContent = "스킬을 선택하세요";
       dom.detailSubtitle.textContent = "스킬 관리 화면에서 버전을 선택해 주세요.";
+      dom.validateSkill.textContent = "레지스트리 전체 검증";
+      dom.activateSkill.textContent = "검증 후 활성화";
+      dom.runDetailSkill.textContent = "현재 모드로 실행";
       return;
     }
 
     dom.detailTitle.textContent = skill.id;
-    dom.detailSubtitle.textContent = `v${skill.version} · 노드 ${skill.nodes.length}개 · API는 스킬 전체 Mock 회귀 검증을 수행합니다.`;
+    dom.validateSkill.textContent = skill.validationStatus === "passed"
+      ? "레지스트리 재검증"
+      : "레지스트리 전체 검증";
+    dom.activateSkill.textContent = skill.uiState === "active" ? "활성 상태" : "검증 후 활성화";
+    dom.runDetailSkill.textContent = runButtonText(skill);
+    dom.detailSubtitle.textContent = skill.semanticOnly
+      ? `v${skill.version} · Semantic Candidate · TF/TCP 연결 전이라 컴파일·검증·활성화가 차단됩니다.`
+      : `v${skill.version} · 노드 ${skill.nodes.length}개 · 레지스트리 검증은 컴파일과 결정론적 회귀 검증을 수행하고, 실행은 ${runtimeModeLabel()} 모드의 별도 preflight를 적용합니다.`;
     skill.nodes.forEach((skillNode) => {
       const node = create("div", { className: `node ${skillNode.status}`.trim() });
       const description = create("div");
@@ -488,6 +571,13 @@
       estop: "안전정지됨",
     };
     dom.runStatus.textContent = labels[state.run.status] || state.run.status;
+    const monitoredMode = state.run.mode || state.runtime.selectedMode;
+    dom.runtimeModeChip.textContent = `● ${runtimeModeLabel(monitoredMode)} MODE`;
+    dom.runtimeSubtitle.textContent = monitoredMode === "hardware"
+      ? state.runtime.hardwareExecutionReady
+        ? "Doosan 하드웨어 실행은 운영자 확인과 모든 preflight를 통과한 경우에만 시작됩니다."
+        : `Doosan 하드웨어 설정은 활성화됐지만 실행 준비가 차단됐습니다: ${state.runtime.hardwareBlockers.join(", ")}`
+      : `Scene binding과 runtime을 ${runtimeModeLabel()} 모드로 실행하며 실제 로봇 이동은 발생하지 않습니다.`;
     dom.runTitle.textContent = skill?.id || "실행 중인 스킬 없음";
     dom.runSteps.replaceChildren();
 
@@ -747,7 +837,7 @@
     const ready = !live || capabilities.api_key_configured;
     dom.openaiCapability.textContent = live
       ? ready
-        ? `GPT LIVE 준비됨 · ${capabilities.model} · RGB-D 최대 ${capabilities.maximum_keyframes}쌍 · 두 손가락 TCP 프록시 · 실패 시 PDF 재전송/ZIP 보관`
+        ? `GPT LIVE 준비됨 · ${capabilities.model} · RGB-D 최대 ${capabilities.maximum_keyframes}쌍 · 손 TCP threshold ${Number(capabilities.tcp_landmark_confidence_threshold_default || 0.20).toFixed(2)} · 실패 시 PDF 재전송/ZIP 보관`
         : "OPENAI_MODE=live이지만 서버에 OPENAI_API_KEY가 없습니다."
       : `현재 MOCK 분석 모드 · 실제 GPT 전송은 OPENAI_MODE=live에서만 수행됩니다. · ${capabilities.model}`;
     dom.openaiCapability.style.color = ready ? "" : "var(--danger)";
@@ -756,6 +846,12 @@
     if (Number(dom.draftKeyframeCount.value) > configuredMaximum) {
       dom.draftKeyframeCount.value = String(configuredMaximum);
     }
+    dom.draftTcpThreshold.min = String(
+      Number(capabilities.tcp_landmark_confidence_threshold_minimum || 0.10),
+    );
+    dom.draftTcpThreshold.max = String(
+      Number(capabilities.tcp_landmark_confidence_threshold_maximum || 0.90),
+    );
   }
 
   function renderRecordingReview() {
@@ -771,7 +867,7 @@
       || !recording
       || !liveReady;
     if (review.loading) {
-      dom.draftStatus.textContent = "대표 RGB-D 쌍과 두 손가락 TCP 프록시 프롬프트를 준비하는 중…";
+      dom.draftStatus.textContent = "대표 RGB-D 쌍과 엄지–검지 핀치 TCP 프록시 프롬프트를 준비하는 중…";
     } else if (!recording) {
       dom.draftStatus.textContent = "녹화를 선택해 주세요.";
     }
@@ -868,6 +964,7 @@
         nameHint: dom.draftSkillName.value.trim(),
         operatorInstruction: dom.draftInstruction.value.trim(),
         keyframeCount: Number(dom.draftKeyframeCount.value),
+        tcpLandmarkConfidenceThreshold: Number(dom.draftTcpThreshold.value),
       });
       review.draft = {
         draft_id: result.draft_id,
@@ -1099,11 +1196,18 @@
     renderConnection();
     setBanner("FastAPI 연결 확인 중…");
     try {
-      const [, registry, draftCatalog] = await Promise.all([
+      const [health, runtimeCapabilities, registry, draftCatalog] = await Promise.all([
         api.health(),
+        api.runtimeCapabilities(),
         api.listSkills(),
         api.listSkillDrafts(),
       ]);
+      state.runtime.configuredMode = runtimeCapabilities.configured_execution_mode
+        || health.default_execution_mode
+        || "mock";
+      state.runtime.selectedMode = state.runtime.configuredMode;
+      state.runtime.hardwareExecutionReady = Boolean(runtimeCapabilities.hardware_execution_ready);
+      state.runtime.hardwareBlockers = runtimeCapabilities.hardware_blockers || [];
       state.skills = (registry.skills || []).map(normalizeSkill);
       state.drafts = (draftCatalog.drafts || []).map(normalizeDraft);
       state.selectedKey = state.skills.some((skill) => skill.key === state.selectedKey)
@@ -1111,7 +1215,7 @@
         : state.skills[0]?.key || null;
       state.apiStatus = "connected";
       setBanner(
-        message || `FastAPI 연결됨 · 등록 버전 ${state.skills.length}개 · 분석 초안 ${state.drafts.length}개`,
+        message || `FastAPI 연결됨 · 실행 모드 ${state.runtime.configuredMode} · 등록 버전 ${state.skills.length}개 · 분석 초안 ${state.drafts.length}개`,
         "ok",
       );
     } catch (error) {
@@ -1131,7 +1235,19 @@
     state.recordingReview.selectedId = draft.sourceRecordingId;
     state.recordingReview.loaded = false;
     state.recordingReview.draft = null;
+    dom.draftSkillName.value = draft.suggestedSkillId;
+    dom.draftInstruction.value = draft.taskDescription || draft.observedSummary;
+    if (draft.keyframeCount > 0) {
+      const configuredMaximum = Number(state.recordingReview.capabilities?.maximum_keyframes || 300);
+      dom.draftKeyframeCount.value = String(Math.min(draft.keyframeCount, configuredMaximum));
+    }
+    dom.draftTcpThreshold.value = String(
+      Number(draft.tcpDefinition?.semantic_landmark_confidence_threshold || 0.20),
+    );
     showPage("create");
+    setBanner(
+      "기존 녹화와 초안 정보를 불러왔습니다. RGB 프레임에서 엄지·검지가 각각 보이는지 확인한 뒤 GPT 분석 버튼을 누르세요.",
+    );
   }
 
   function beginDraftGeometryTeaching(mode) {
@@ -1272,16 +1388,17 @@
     const draft = selectedDraft();
     if (!draft) return;
     const confirmed = window.confirm(
-      "GPT가 모든 대표 프레임에 표시한 두 fingertip 좌표를 원본 aligned Depth로 3D 복원합니다. 결과는 Candidate/Mock 전용이며 실제 로봇 궤적으로 승인되지 않습니다. 계속할까요?",
+      "GPT가 표시한 엄지–검지 끝점의 중점을 사람 시연 TCP로 확정하고, 원본 aligned Depth로 3D 복원합니다. 이 중점 경로를 로봇 그리퍼 TCP 위치 경로로 사용할까요?",
     );
     if (!confirmed) return;
     setBanner("GPT fingertip audit + 로컬 aligned Depth로 TCP 경로 복원 중…");
     dom.autoTcpPath.disabled = true;
     try {
       const result = await api.createDraftTcpTrajectory(draft.draftId, {
-        method: "openai_rgbd",
+        method: "openai_rgbd_operator_confirmed",
         annotations: [],
         operator_confirmed: true,
+        acknowledge_two_fingertip_tcp_proxy: true,
       });
       await loadRegistry(`자동 TCP 경로 ${result.quality?.sample_count || 0}개 생성 완료`);
     } catch (error) {
@@ -1293,16 +1410,25 @@
   async function registerSelectedDraftCandidate() {
     const draft = selectedDraft();
     if (!draft?.readiness.can_register_candidate) return;
+    const materializing = draft.readiness.candidate_stage === "semantic_only";
     const confirmed = window.confirm(
-      "이 Candidate는 surface-relative 경로의 컴파일/Mock 검증만 수행하며 실제 로봇 하드웨어 검증은 포함하지 않습니다. 등록할까요?",
+      materializing
+        ? "TF와 TCP 경로를 연결한 실행 Candidate를 만들고 Mock 검증합니다. 실제 로봇 하드웨어 검증은 포함하지 않습니다. 계속할까요?"
+        : "TF 없이 스킬 이름, 설명, primitive 제안만 Semantic Candidate로 먼저 등록합니다. 컴파일·활성화·실행은 차단됩니다. 계속할까요?",
     );
     if (!confirmed) return;
     dom.registerDraftCandidate.disabled = true;
-    setBanner(`${draft.suggestedSkillId} Candidate 생성 및 Mock 회귀 검증 중…`);
+    setBanner(
+      materializing
+        ? `${draft.suggestedSkillId} 실행 Candidate 생성 및 Mock 검증 중…`
+        : `${draft.suggestedSkillId} Semantic Candidate를 스킬 목록에 등록 중…`,
+    );
     try {
       const result = await api.registerDraftCandidate(draft.draftId);
       await loadRegistry(
-        result.mock_validation_passed
+        result.candidate_stage === "semantic_only"
+          ? `${result.skill_id}@${result.version} 스킬 목록 등록 완료 · TF/TCP는 나중에 연결`
+          : result.mock_validation_passed
           ? `${result.skill_id}@${result.version} Candidate Mock 검증 통과`
           : `${result.skill_id}@${result.version} Candidate Mock 검증 실패`,
       );
@@ -1316,10 +1442,11 @@
     const skill = selectedSkill();
     if (!skill || state.apiStatus !== "connected") return false;
     skill.nodes.forEach((node) => { node.status = "running"; });
-    setBanner(`${skill.id} 전체 Mock 회귀 검증 중…`);
+    const validationMode = state.runtime.configuredMode === "simulation" ? "simulation" : "mock";
+    setBanner(`${skill.id} 레지스트리 회귀 검증 중…`);
     renderDetail();
     try {
-      const result = await api.validateSkill(skill.id, skill.version);
+      const result = await api.validateSkill(skill.id, skill.version, validationMode);
       skill.nodes.forEach((node) => { node.status = result.passed ? "ok" : "error"; });
       if (result.passed) {
         skill.validationStatus = "passed";
@@ -1363,20 +1490,47 @@
   async function startRun(skillKey) {
     const skill = state.skills.find((item) => item.key === skillKey);
     if (!skill || skill.uiState !== "active" || state.apiStatus !== "connected") return;
+    const mode = state.runtime.selectedMode || state.runtime.configuredMode || "mock";
+    if (mode === "hardware") {
+      if (!state.runtime.hardwareExecutionReady) {
+        setBanner(
+          `실제 실행 불가: ${state.runtime.hardwareBlockers.join(", ")}`,
+          "danger",
+        );
+        return;
+      }
+      if (!skill.hardwareCompatible) {
+        await commissionSkill(skillKey);
+        return;
+      }
+      const confirmed = window.confirm(
+        "실제 Doosan 로봇 실행을 요청합니다. 작업공간이 비어 있고 E-stop을 즉시 사용할 수 있으며, 사전점검 실패 시 이동하지 않는 것을 확인했습니까?",
+      );
+      if (!confirmed) {
+        setBanner("실제 로봇 실행 요청을 취소했습니다.");
+        return;
+      }
+    }
     const runId = newRunId();
-    state.run = { skillKey, runId, status: "starting", completedSteps: 0 };
+    state.run = { skillKey, runId, mode, status: "starting", completedSteps: 0 };
     setBanner(`${skill.id} Scene 캡처 및 preflight 준비 중…`);
     showPage("monitor");
     renderMonitor();
     try {
       const scene = await api.captureScene();
       const binding = await api.bindRuntime(skill.id, skill.version, scene.scene_id);
-      const preflight = await api.preflightRuntime(skill.id, skill.version, scene.scene_id, binding.bindings);
+      const preflight = await api.preflightRuntime(
+        skill.id,
+        skill.version,
+        scene.scene_id,
+        binding.bindings,
+        mode,
+      );
       if (!preflight.passed) {
         throw new Error(`preflight 거부: ${(preflight.errors || []).join(", ")}`);
       }
       state.run.status = "running";
-      setBanner(`${skill.id} Mock 실행 중…`);
+      setBanner(`${skill.id} ${mode} 실행 중…`);
       renderMonitor();
       const result = await api.executeRuntime({
         skillId: skill.id,
@@ -1384,7 +1538,11 @@
         sceneId: scene.scene_id,
         bindings: binding.bindings,
         runId,
+        mode,
       });
+      if (result.mode !== mode) {
+        throw new Error(`실행 모드 불일치: 요청=${mode}, 응답=${result.mode || "없음"}`);
+      }
       state.run.runId = result.run_id;
       state.run.status = "succeeded";
       state.run.completedSteps = skill.nodes.length;
@@ -1394,6 +1552,34 @@
       setBanner(`실행 실패: ${errorText(error)}`, "danger");
     }
     renderMonitor();
+  }
+
+  async function commissionSkill(skillKey) {
+    const skill = state.skills.find((item) => item.key === skillKey);
+    if (!skill || skill.uiState !== "active" || state.apiStatus !== "connected") return;
+    const confirmed = window.confirm(
+      "하드웨어 커미셔닝을 시작합니다. 이 단계는 로봇을 움직이지 않지만 실제 Doosan 상태와 RealSense, 보정 증거를 확인합니다. 작업공간이 비어 있고 E-stop을 즉시 사용할 수 있으며 경로를 검토했습니까?",
+    );
+    if (!confirmed) return;
+    setBanner(`${skill.id} 하드웨어 커미셔닝 점검 중…`);
+    try {
+      const result = await api.commissionSkill(skill.id, skill.version);
+      const failed = (result.checks || []).filter((check) => !check.passed);
+      if (!result.passed) {
+        setBanner(
+          `커미셔닝 차단: ${failed.map((check) => `${check.name}: ${check.detail}`).join(" · ")}`,
+          "danger",
+        );
+        return;
+      }
+      await loadRegistry(`${skill.id} 스킬 커미셔닝 통과`, "ok");
+      if (!result.runtime_ready) {
+        setBanner(`스킬 커미셔닝 통과 · Runtime 준비 필요: ${result.runtime_blockers.join(", ")}`, "danger");
+      }
+    } catch (error) {
+      setBanner(`커미셔닝 요청 실패: ${errorText(error)}`, "danger");
+    }
+    renderAll();
   }
 
   async function abortRun(reason) {
@@ -1425,7 +1611,20 @@
     });
   });
   dom.validateSkill.addEventListener("click", validateSelected);
+  dom.executionMode.addEventListener("change", () => {
+    state.runtime.selectedMode = dom.executionMode.value;
+    renderAll();
+  });
   dom.activateSkill.addEventListener("click", activateSelected);
+  dom.runDetailSkill.addEventListener("click", () => {
+    const skill = selectedSkill();
+    if (!skill) return;
+    if (state.runtime.selectedMode === "hardware" && !skill.hardwareCompatible) {
+      commissionSkill(skill.key);
+    } else {
+      startRun(skill.key);
+    }
+  });
   dom.closeDraftInspector.addEventListener("click", () => {
     state.selectedDraftId = null;
     renderRegistry();

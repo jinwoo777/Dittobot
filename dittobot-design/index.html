@@ -40,6 +40,8 @@
     .nav button[aria-current="page"] { color: #5736aa; background: var(--accent-soft); font-weight: 650; }
     .connection { margin-top: auto; display: grid; gap: 10px; }
     .mode { width: fit-content; padding: 7px 10px; border-radius: 9px; color: var(--warn); background: var(--warn-soft); font: 700 11px ui-monospace, monospace; letter-spacing: .04em; }
+    .mode.hardware { color: var(--danger); background: var(--danger-soft); }
+    .mode.simulation, .mode.dry_run { color: #3d669f; background: #e7f0fb; }
     .mini-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: 0 0 auto; }
     .dot.ok { background: var(--ok); }
@@ -72,13 +74,16 @@
     .button:disabled { opacity: .45; cursor: not-allowed; }
     .empty { padding: 42px 18px; border: 1px dashed var(--border); border-radius: 15px; color: var(--muted); text-align: center; }
     .detail-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+    .detail-controls { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+    .execution-mode-picker { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
+    .execution-mode-picker select { min-width: 142px; padding: 9px 30px 9px 10px; border: 1px solid var(--border); border-radius: 10px; color: var(--text); background: var(--panel); font: 700 12px ui-monospace, monospace; }
     .nodes { display: grid; gap: 8px; margin-bottom: 24px; }
     .node { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; padding: 15px 18px; border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 0 13px 13px 0; background: var(--panel); }
     .node.running { border-left-color: var(--accent); }
     .node.ok { border-left-color: var(--ok); }
     .node.error { border-left-color: var(--danger); }
     .node strong { font: 650 14px ui-monospace, monospace; }
-    .node p { margin: 5px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .node p { max-height: 180px; margin: 5px 0 0; padding-right: 4px; overflow: auto; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; word-break: break-word; }
     .node-state { align-self: center; color: var(--muted); font: 700 11px ui-monospace, monospace; }
     .actions { display: flex; gap: 10px; flex-wrap: wrap; }
     .safety { display: flex; gap: 9px; flex-wrap: wrap; margin: 24px 0; }
@@ -174,7 +179,7 @@
         <button type="button" data-page="monitor">실시간 모니터링</button>
       </nav>
       <div class="connection">
-        <span class="mode">MOCK API</span>
+        <span id="api-mode" class="mode">API MODE 확인 중</span>
         <div class="mini-status"><span id="connection-dot" class="dot"></span><span id="connection-label">FastAPI 연결 확인 중</span></div>
       </div>
     </aside>
@@ -182,7 +187,7 @@
     <main>
       <section id="page-skills" class="page">
         <div class="toolbar">
-          <header><p class="eyebrow">01 · REGISTRY</p><h1>스킬 관리</h1><p class="subtitle">분석 초안의 승격 준비도를 확인하고, SQLite에 등록된 스킬 버전을 검증·활성화하거나 Mock으로 실행합니다.</p></header>
+          <header><p class="eyebrow">01 · REGISTRY</p><h1>스킬 관리</h1><p id="registry-subtitle" class="subtitle">분석 초안과 등록된 스킬 버전을 불러오는 중입니다.</p></header>
           <div class="filters" aria-label="스킬 필터">
             <button type="button" class="chip" data-filter="all" aria-pressed="true">전체</button>
             <button type="button" class="chip" data-filter="draft" aria-pressed="false">분석 초안</button>
@@ -207,12 +212,12 @@
           <ul id="draft-readiness-list" class="readiness-list"></ul>
           <p id="draft-next-action" class="draft-next-action"></p>
           <div class="actions">
-            <button id="review-draft-recording" type="button" class="button">녹화 다시 보기</button>
+            <button id="review-draft-recording" type="button" class="button">녹화 확인·재분석</button>
             <button id="auto-surface-calibration" type="button" class="button">Depth 평면 자동 추출</button>
             <button id="start-surface-calibration" type="button" class="button">표면 TF 보정</button>
             <button id="start-path-teaching" type="button" class="button">경로 티칭 시작</button>
             <button id="auto-tcp-path" type="button" class="button">GPT TCP 경로 적용</button>
-            <button id="register-draft-candidate" type="button" class="button primary" disabled>Candidate로 등록</button>
+            <button id="register-draft-candidate" type="button" class="button primary" disabled>스킬 목록에 우선 등록</button>
           </div>
         </section>
       </section>
@@ -265,9 +270,13 @@
             <label>GPT에 보낼 대표 RGB-D 프레임 쌍 수
               <input id="draft-keyframe-count" type="number" min="1" max="300" step="1" value="100" required>
             </label>
+            <label>손 TCP 인식 confidence threshold
+              <input id="draft-tcp-threshold" type="number" min="0.10" max="0.90" step="0.05" value="0.20" required>
+            </label>
             <button id="analyze-recording" type="submit" class="button primary" disabled>GPT로 분석해 스킬 초안 만들기</button>
             <p class="notice">현재 모델은 video input을 지원하지 않아 최대 300쌍의 RGB → 정렬 Depth 컬러맵 이미지를 시간순으로 보냅니다. 이미지 입력이 거부되면 RGB-D ZIP을 로컬에 보관하고 PDF 콘택트시트로 자동 재전송합니다.</p>
-            <p class="notice">TCP 티칭: 엄지와 검지 등 두 손가락을 집게 jaw처럼 의도적으로 펴고, 두 fingertip이 함께 보이도록 움직여 주세요. 분석은 두 끝점의 중점을 정성적 TCP 프록시로 추적하지만 로봇 좌표로 사용하지 않습니다.</p>
+            <p class="notice">TCP 티칭: 빈손 집게 동작 또는 도구를 집은 상태에서 엄지와 검지의 끝/접촉 부위가 카메라에 각각 보이게 해 주세요. 운영자가 자동 TCP 경로 적용을 확인하면 두 손끝의 3D 중점을 사람 시연 TCP로 확정하고 로봇 그리퍼 TCP 위치 경로로 사용합니다. 실제 이동 전에는 surface→base 변환과 하드웨어 preflight를 별도로 통과해야 합니다.</p>
+            <p class="notice">기본 threshold 0.20은 저신뢰 좌표도 Semantic 관찰에 포함합니다. 0.10까지 낮출 수 있지만, 실행 경로 승격에는 별도의 평균 confidence 0.60 기준과 로컬 Depth·운영자 확인이 계속 적용됩니다.</p>
             <p class="notice">이 단계의 결과는 실행 불가 semantic draft입니다. 실제 스킬 승격에는 로컬 robot/tool pose, TF 및 안전 검증이 추가로 필요합니다.</p>
             <p id="draft-status" class="recording-status" role="status" aria-live="polite">녹화를 선택해 주세요.</p>
             <pre id="draft-result" class="draft-result" hidden></pre>
@@ -278,18 +287,29 @@
       <section id="page-detail" class="page" hidden>
         <div class="detail-head">
           <header><p class="eyebrow">03 · SKILLGRAPH</p><h1 id="detail-title">스킬을 선택하세요</h1><p id="detail-subtitle" class="subtitle">스킬 관리 화면에서 버전을 선택해 주세요.</p></header>
-          <button id="validate-skill" type="button" class="button primary">전체 Mock 검증</button>
+          <div class="detail-controls">
+            <label class="execution-mode-picker">실행 모드
+              <select id="execution-mode">
+                <option value="mock">Mock</option>
+                <option value="dry_run">Dry run</option>
+                <option value="simulation">Simulation</option>
+                <option value="hardware">Hardware</option>
+              </select>
+            </label>
+            <button id="validate-skill" type="button" class="button primary">레지스트리 전체 검증</button>
+          </div>
         </div>
         <div id="detail-nodes" class="nodes"></div>
         <div class="actions">
           <button id="activate-skill" type="button" class="button primary">검증 후 활성화</button>
+          <button id="run-detail-skill" type="button" class="button primary">현재 모드로 실행</button>
           <button type="button" class="button" data-page="skills">목록으로</button>
         </div>
       </section>
 
       <section id="page-monitor" class="page" hidden>
-        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">Scene/binding/runtime은 Mock 전용입니다. 별도 gate가 적용된 eye-in-hand calibration만 제한된 DSR 이동 경계를 사용합니다.</p></header>
-        <div class="safety"><span id="estop-chip">● E-STOP READY</span><span id="force-chip">○ FORCE SUPERVISOR IDLE</span><span id="workspace-chip">○ WORKSPACE MONITOR IDLE</span><span>● MOCK MODE</span></div>
+        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p id="runtime-subtitle" class="subtitle">실행 모드와 안전 구성 확인 중입니다.</p></header>
+        <div class="safety"><span id="estop-chip">● E-STOP READY</span><span id="force-chip">○ FORCE SUPERVISOR IDLE</span><span id="workspace-chip">○ WORKSPACE MONITOR IDLE</span><span id="runtime-mode-chip">● MODE 확인 중</span></div>
         <div class="monitor-grid">
           <div class="panel">
             <p class="eyebrow">REALSENSE RGB-D</p>

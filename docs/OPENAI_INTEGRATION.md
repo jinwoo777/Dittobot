@@ -17,10 +17,22 @@ result reaches graph or runtime code. `RecordingSkillDraftAnalyzer` receives onl
 checksum-verified chronological RGB frames paired with locally rendered aligned-depth colormaps as
 base64 data URLs. Each pair is RGB then depth. The active GPT-5.6 Luna configuration accepts images
 but not video input, so raw video containers are not sent. Raw depth NPZ remains local. The strict
-prompt treats two intentionally extended fingertips as gripper jaw tips and their midpoint as a
-qualitative TCP proxy; the output schema forbids robot pose availability and contains no
+prompt treats visible thumb/index fingertip or contact regions as gripper jaw tips and their
+midpoint as a qualitative TCP proxy. It accepts an empty-hand gesture or a thumb-index pinch around
+a tool without requiring straight fingers, while forbidding substitution of a tool shaft or tip for
+a hand landmark. The UI-configurable semantic landmark threshold defaults to `0.20` and is bounded
+to `0.10..0.90`; low-confidence points remain semantic evidence only. Materialized trajectory
+readiness retains the separate mean-confidence threshold of `0.60`. The output schema forbids robot
+pose availability and contains no metric
 coordinates. It never receives client-selected paths, API keys, force values, or execution
 permission. `TranscriptionService`
+
+`detected` and `usable_for_local_depth_path` intentionally have different meanings. A relaxed
+threshold may preserve four or more normalized hand landmarks while GPT still recommends against a
+local depth reconstruction because of overlap, blur, or ambiguous depth. That response is retained
+as a valid semantic draft with its `failure_reason`; it is not rejected as a schema contradiction,
+and the UI shows `Depth 적용 보류`. Local trajectory extraction remains disabled until the provider
+recommendation and local quality checks both pass.
 calls Audio Transcriptions with a Korean hint, domain
 prompt, verbose JSON, and segment timestamps. In mock mode, `robot-skill transcribe AUDIO_PATH`
 uses a sibling `.txt` sidecar when present and never constructs a live client.
@@ -61,8 +73,11 @@ local evidence through:
 - `POST /skills/drafts/{draft_id}/tcp-trajectory`
 - `POST /skills/drafts/{draft_id}/candidate`
 
-Candidate registration remains disabled until the first two artifacts pass local validation. The
-result stays a non-active, hardware-incompatible Candidate even after Mock validation. Real replay
+Candidate registration first creates a registry-visible, semantic-only version without requiring
+TF or trajectory evidence. It has no generated code and compile, validation, activation, and
+execution remain blocked. Once both local geometry artifacts pass, the same draft may create a
+materialized Candidate and run Mock validation. The result stays non-active and hardware-
+incompatible. Real replay
 still requires an independently calibrated robot-base TF chain, robot FK/trajectory evidence, and
 the existing hardware safety path. A failed or absent legacy hand-eye NPY is advisory for this Mock
 candidate path and is never attached as transform provenance.

@@ -31,13 +31,21 @@ from robot_skill_system.openai_integration.schemas import (
     APICallMetadata,
     DemonstrationAnalysis,
     DemonstrationAnalysisInput,
+    NormalizedImagePoint,
     RecordingSkillDraft,
     RecordingSkillDraftInput,
     RuntimeIntent,
     SkillGraphProposal,
+    TCPProxyFrameState,
+    TCPProxyObservation,
+    TCPProxyTeachingDefinition,
 )
 from robot_skill_system.openai_integration.skill_composer import SkillGraphComposer
 from robot_skill_system.openai_integration.transcription import TranscriptionService
+from robot_skill_system.perception.hand_tracking import (
+    LocalHandTrackingFrame,
+    LocalHandTrackingSummary,
+)
 from robot_skill_system.settings import Settings
 
 
@@ -148,6 +156,63 @@ def test_responses_parse_rejects_wrong_schema() -> None:
         )
 
 
+def test_tcp_observation_keeps_low_quality_landmarks_without_schema_failure() -> None:
+    point_a = NormalizedImagePoint(x=0.40, y=0.50)
+    point_b = NormalizedImagePoint(x=0.50, y=0.50)
+    midpoint = NormalizedImagePoint(x=0.45, y=0.50)
+    states = [
+        TCPProxyFrameState(
+            frame_index=index,
+            gripper_state="pinching",
+            landmarks_detected=True,
+            jaw_tip_a_normalized=point_a,
+            jaw_tip_b_normalized=point_b,
+            midpoint_normalized=midpoint,
+            confidence=0.15,
+        )
+        for index in range(4)
+    ]
+
+    observation = TCPProxyObservation(
+        detected=True,
+        observed_states=states,
+        trajectory_status="complete",
+        valid_landmark_frame_count=4,
+        usable_for_local_depth_path=False,
+        failure_reason="Landmarks pass the semantic threshold but remain too uncertain for depth.",
+        depth_consistency="ambiguous",
+        motion_summary="Four low-confidence thumb-index contact centers were observed.",
+        confidence=0.15,
+    )
+
+    assert observation.detected is True
+    assert observation.valid_landmark_frame_count == 4
+    assert observation.usable_for_local_depth_path is False
+
+
+def test_recording_input_rejects_hand_tracking_from_different_keyframes() -> None:
+    tracking = LocalHandTrackingSummary(
+        status="completed",
+        requested_frame_count=1,
+        processed_frame_count=1,
+        detected_frame_count=0,
+        frames=[LocalHandTrackingFrame(frame_index=9)],
+    )
+
+    with pytest.raises(ValidationError, match="keyframe order and indices"):
+        RecordingSkillDraftInput(
+            recording_id="rgbd_0123456789abcdef0123456789abcdef",
+            name_hint="recorded_wipe",
+            operator_instruction="걸레로 표면을 닦는다",
+            recording_summary={"frame_count": 10},
+            local_hand_tracking=tracking,
+            primitive_catalog=["motion.move_l"],
+            entity_role_catalog=["target_surface"],
+            keyframe_indices=[5],
+            limitations=["No trusted robot geometry."],
+        )
+
+
 def test_live_recording_draft_sends_bounded_rgb_depth_pairs_with_store_disabled(
     tmp_path: Path,
 ) -> None:
@@ -160,9 +225,19 @@ def test_live_recording_draft_sends_bounded_rgb_depth_pairs_with_store_disabled(
         name_hint="recorded_wipe",
         operator_instruction="걸레로 표면을 닦는다",
         recording_summary={"frame_count": 10, "recording_fps": 10},
+        local_hand_tracking=LocalHandTrackingSummary(
+            status="completed",
+            requested_frame_count=1,
+            processed_frame_count=1,
+            detected_frame_count=0,
+            frames=[LocalHandTrackingFrame(frame_index=5)],
+        ),
         primitive_catalog=["motion.move_l"],
         entity_role_catalog=["tool", "target_surface"],
         keyframe_indices=[5],
+        tcp_proxy_definition=TCPProxyTeachingDefinition(
+            semantic_landmark_confidence_threshold=0.15
+        ),
         limitations=["No trusted robot-base pose trajectory."],
     )
     expected = MockOpenAIClient().analyze_recording_skill_draft(request, "trace")[0]
@@ -204,6 +279,17 @@ def test_live_recording_draft_sends_bounded_rgb_depth_pairs_with_store_disabled(
     assert "midpoint_between_fingertips" in message["content"][0]["text"]
     assert "EVERY supplied keyframe" in captured["instructions"]
     assert "scene_observation" in captured["instructions"]
+    assert "need not be straight or fully extended" in captured["instructions"]
+    assert "thumb-index pinch/grasp around a visible tool" in captured["instructions"]
+    assert "never substitute the tool shaft, tool tip" in captured["instructions"]
+    assert "semantic_landmark_confidence_threshold" in captured["instructions"]
+    assert "local_hand_tracking" in captured["instructions"]
+    assert '"semantic_landmark_confidence_threshold":0.15' in message["content"][0][
+        "text"
+    ]
+    assert '"local_hand_tracking":{"backend":"mediapipe_hands_0_10"' in message[
+        "content"
+    ][0]["text"]
     assert "test-secret" not in repr(captured)
 
 

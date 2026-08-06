@@ -1,6 +1,15 @@
 """Local perception interfaces, deterministic mocks, and optional adapters."""
 
 from .hand_pose import MediaPipeHandPoseEstimator
+from .hand_tracking import (
+    LocalHandLandmark,
+    LocalHandTrackingFrame,
+    LocalHandTrackingSummary,
+    LocalTrackedHand,
+    MediaPipeHandLandmarkTracker,
+    NormalizedHandPoint,
+    unavailable_hand_tracking_summary,
+)
 from .interfaces import (
     HandPoseEstimate,
     HandPoseEstimator,
@@ -38,11 +47,16 @@ __all__ = [
     "DepthCentroidObjectPoseEstimator",
     "HandPoseEstimate",
     "HandPoseEstimator",
+    "LocalHandLandmark",
+    "LocalHandTrackingFrame",
+    "LocalHandTrackingSummary",
+    "LocalTrackedHand",
     "MarkerDetection",
     "MarkerPoseEstimator",
     "MarkerToolPoseEstimator",
     "MarkerToolDefinition",
     "MediaPipeHandPoseEstimator",
+    "MediaPipeHandLandmarkTracker",
     "MockMarkerPoseEstimator",
     "MockObjectDetector",
     "MockObjectPoseEstimator",
@@ -54,8 +68,10 @@ __all__ = [
     "ObjectDetection2D",
     "ObjectDetector",
     "ObjectPoseEstimator",
+    "NormalizedHandPoint",
     "PerceptionPipeline",
     "PerceptionResult",
     "SurfaceEstimator",
     "WorkspaceBuilder",
+    "unavailable_hand_tracking_summary",
 ]
