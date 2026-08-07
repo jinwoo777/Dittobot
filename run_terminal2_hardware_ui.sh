@@ -12,6 +12,7 @@ DITTOBOT_ROBOT_INTERFACE="${DITTOBOT_ROBOT_INTERFACE:-enp2s0}"
 DITTOBOT_ROS_DOMAIN_ID="${DITTOBOT_ROS_DOMAIN_ID:-78}"
 DITTOBOT_API_HOST="${DITTOBOT_API_HOST:-127.0.0.1}"
 DITTOBOT_API_PORT="${DITTOBOT_API_PORT:-8001}"
+DITTOBOT_UI_URL="${DITTOBOT_UI_URL:-http://127.0.0.1:${DITTOBOT_API_PORT}/ui/}"
 DITTOBOT_FIXED_REFERENCE_NPZ="${DITTOBOT_REPO_ROOT}/aruco/fixed_workspace_reference.npz"
 DITTOBOT_RUNTIME_WORKSPACE_NPZ="${DITTOBOT_REPO_ROOT}/aruco/runtime/runtime_workspace.npz"
 
@@ -101,7 +102,7 @@ export RGBD_MAX_TIMESTAMP_DELTA_MS=50
 echo "Terminal 2 환경 확인 완료"
 echo "  ROS domain : ${ROS_DOMAIN_ID}"
 echo "  Robot NIC  : ${DITTOBOT_ROBOT_INTERFACE}"
-echo "  API/UI     : http://${DITTOBOT_API_HOST}:${DITTOBOT_API_PORT}/ui/"
+echo "  API/UI     : ${DITTOBOT_UI_URL}"
 echo "  ArUco ref  : ${ARUCO_FIXED_REFERENCE_NPZ}"
 
 if [[ "$DITTOBOT_CHECK_ONLY" == true ]]; then
@@ -110,11 +111,30 @@ fi
 
 echo
 echo "주의: 서버 실행 후 UI에서 안전 항목을 확인하면 실제 M0609가 움직일 수 있습니다."
-read -r -p "작업공간이 비어 있고 E-stop을 즉시 사용할 수 있으면 RUN을 입력하세요: " DITTOBOT_START_CONFIRMATION
-if [[ "$DITTOBOT_START_CONFIRMATION" != "RUN" ]]; then
-  echo "실행을 취소했습니다."
-  exit 1
-fi
+echo "UI 서버를 시작하고 준비되면 브라우저를 자동으로 엽니다."
+
+open_dittobot_ui_when_ready() {
+  local DITTOBOT_UI_OPEN_ATTEMPT
+
+  if ! command -v curl >/dev/null 2>&1 || ! command -v xdg-open >/dev/null 2>&1; then
+    echo "브라우저 자동 열기를 사용할 수 없습니다. 직접 접속하세요: ${DITTOBOT_UI_URL}" >&2
+    return 0
+  fi
+
+  for ((DITTOBOT_UI_OPEN_ATTEMPT = 1; DITTOBOT_UI_OPEN_ATTEMPT <= 100; DITTOBOT_UI_OPEN_ATTEMPT++)); do
+    if curl --fail --silent --show-error --max-time 1 --output /dev/null "$DITTOBOT_UI_URL" 2>/dev/null; then
+      if ! xdg-open "$DITTOBOT_UI_URL" >/dev/null 2>&1; then
+        echo "브라우저를 열지 못했습니다. 직접 접속하세요: ${DITTOBOT_UI_URL}" >&2
+      fi
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "UI 준비를 기다리는 시간이 초과되었습니다: ${DITTOBOT_UI_URL}" >&2
+}
+
+open_dittobot_ui_when_ready &
 
 python3 -m uvicorn robot_skill_system.api.app:create_app \
   --factory \
