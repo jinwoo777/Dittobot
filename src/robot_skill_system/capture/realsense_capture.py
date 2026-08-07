@@ -132,7 +132,11 @@ class RealSenseCaptureConfig:
     default_mode: CaptureMode = CaptureMode.BURST
     default_burst_frame_count: int = 5
     wait_timeout_ms: int = 5000
-    maximum_timestamp_skew_ms: float = 20.0
+    # librealsense synchronizes a frameset using the nearest stream frames.  At
+    # 30 FPS their source timestamps can differ by roughly one 33.3 ms frame
+    # period, so the default admits one period plus scheduling margin while
+    # still rejecting stale/mismatched RGB-D pairs.
+    maximum_timestamp_skew_ms: float = 50.0
     synchronization_retry_count: int = 15
     enable_spatial_filter: bool = True
     enable_temporal_filter: bool = True
@@ -232,6 +236,7 @@ class RealSenseCapture:
             raise NotConfiguredError("RealSense capture has not been started")
         try:
             maximum_skew_ns = int(round(self.config.maximum_timestamp_skew_ms * 1.0e6))
+            observed_skews_ns: list[int] = []
             for attempt in range(self.config.synchronization_retry_count):
                 frames = self._pipeline.wait_for_frames(self.config.wait_timeout_ms)
                 observed_host_unix_epoch_ns = self._epoch_clock_ns()
@@ -250,14 +255,21 @@ class RealSenseCapture:
                 )
                 raw_color_clock_domain = _normalise_timestamp_clock_domain(color_frame)
                 raw_depth_clock_domain = _normalise_timestamp_clock_domain(depth_frame)
+                raw_skew_ns = abs(raw_color_timestamp_ns - raw_depth_timestamp_ns)
                 if (
                     raw_color_clock_domain == raw_depth_clock_domain
-                    and abs(raw_color_timestamp_ns - raw_depth_timestamp_ns)
-                    > maximum_skew_ns
+                    and raw_skew_ns > maximum_skew_ns
                 ):
+                    observed_skews_ns.append(raw_skew_ns)
                     if attempt + 1 == self.config.synchronization_retry_count:
+                        minimum_skew_ms = min(observed_skews_ns) / 1.0e6
+                        maximum_observed_skew_ms = max(observed_skews_ns) / 1.0e6
                         raise CaptureError(
-                            "RealSense RGB/depth frames did not synchronize within the limit"
+                            "RealSense RGB/depth frames did not synchronize within "
+                            f"the {self.config.maximum_timestamp_skew_ms:g} ms limit "
+                            f"(observed {minimum_skew_ms:.3f}.."
+                            f"{maximum_observed_skew_ms:.3f} ms across "
+                            f"{len(observed_skews_ns)} framesets)"
                         )
                     continue
                 for filter_object in self._filters:

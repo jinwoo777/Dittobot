@@ -1,4 +1,4 @@
-"""Fail-closed, discrete joint jog routes."""
+"""Fail-closed joint jog and complete-target MoveJ routes."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from fastapi import APIRouter
 from robot_skill_system.api.contracts import (
     JogEnableRequest,
     JogJointMoveRequest,
+    JogMoveJRequest,
     JogStopRequest,
 )
 from robot_skill_system.api.dependencies import ServiceDependency
@@ -32,6 +33,14 @@ def move_joint(
     service: ServiceDependency,
 ) -> dict[str, Any]:
     return service.move_jog_joint(request.model_dump())
+
+
+@router.post("/movej")
+def move_joints(
+    request: JogMoveJRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.move_jog_joints(request.model_dump())
 
 
 @router.post("/stop")

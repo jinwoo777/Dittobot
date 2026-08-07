@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from robot_skill_system.skills.models import BindingSpec, SkillType
 
@@ -93,6 +94,19 @@ class JogJointMoveRequest(APIModel):
         if self.delta_deg == 0.0:
             raise ValueError("jog delta must be non-zero")
         return self
+
+
+class JogMoveJRequest(APIModel):
+    target_joint_positions_deg: list[float] = Field(min_length=6, max_length=6)
+
+    @field_validator("target_joint_positions_deg")
+    @classmethod
+    def validate_target_joint_positions(cls, value: list[float]) -> list[float]:
+        if any(not math.isfinite(position) for position in value):
+            raise ValueError("movej target must contain six finite joint angles")
+        if any(abs(position) > 360.0 for position in value):
+            raise ValueError("movej target exceeds the +/-360 degree schema envelope")
+        return value
 
 
 class JogStopRequest(APIModel):

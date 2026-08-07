@@ -66,3 +66,23 @@ def test_aruco_experiment_ui_exposes_only_ordered_reference_and_z_test() -> None
     assert 'payload?.z_test_completed' in app_source
     assert '"/aruco-experiment/move-reference"' in api_source
     assert '"/aruco-experiment/move-plane-z-test"' in api_source
+
+
+def test_jog_ui_builds_one_validated_six_axis_movej_target() -> None:
+    app_source = (REPOSITORY_ROOT / "dittobot-design/app.js").read_text(
+        encoding="utf-8"
+    )
+    api_source = (REPOSITORY_ROOT / "dittobot-design/api-client.js").read_text(
+        encoding="utf-8"
+    )
+    html_source = (REPOSITORY_ROOT / "dittobot-design/index.html").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'id="jog-movej"' in html_source
+    assert 'id="jog-load-current"' in html_source
+    assert "executeJogMoveJ" in app_source
+    assert "targets.length !== 6" in app_source
+    assert "api.moveJogJoints(targets)" in app_source
+    assert '"/jog/movej"' in api_source
+    assert "target_joint_positions_deg" in api_source

@@ -3,9 +3,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from robot_skill_system.capture import (
     HOST_UNIX_EPOCH_CLOCK_DOMAIN,
+    CaptureError,
     CaptureMode,
     CaptureRequest,
     RealSenseCapture,
@@ -201,3 +203,64 @@ def test_realsense_capture_skips_unsynchronized_startup_pairs() -> None:
 
     assert frame.frame_number == 2
     assert abs(frame.color_timestamp_ns - frame.depth_timestamp_ns) == 400_000
+
+
+def test_realsense_default_accepts_one_30_fps_frame_period_of_skew() -> None:
+    color = np.full((2, 2, 3), 7, dtype=np.uint8)
+    depth = np.full((2, 2), 1000, dtype=np.uint16)
+    nearest_frameset_pair = _FakeFrameSet(
+        _FakeFrame(color, timestamp_ms=1_000.0, frame_number=1),
+        _FakeFrame(depth, timestamp_ms=1_033.4, frame_number=1),
+    )
+    capture = RealSenseCapture(
+        RealSenseCaptureConfig(
+            width_px=2,
+            height_px=2,
+            enable_spatial_filter=False,
+            enable_temporal_filter=False,
+        ),
+        epoch_clock_ns=lambda: 1_700_000_000_000_000_000,
+    )
+    capture._pipeline = _FakePipeline(  # noqa: SLF001 - injected hardware boundary
+        [nearest_frameset_pair]
+    )
+    capture._align = _FakeAlign()  # noqa: SLF001 - injected hardware boundary
+    capture._depth_scale_m = 0.001  # noqa: SLF001 - injected hardware boundary
+
+    frame = capture.capture(CaptureRequest(mode=CaptureMode.SINGLE)).representative_frame
+
+    assert frame.maximum_timestamp_skew_ns == 50_000_000
+    assert abs(frame.color_timestamp_ns - frame.depth_timestamp_ns) == 33_400_000
+
+
+def test_realsense_sync_error_reports_limit_and_observed_skew() -> None:
+    color = np.full((2, 2, 3), 7, dtype=np.uint8)
+    depth = np.full((2, 2), 1000, dtype=np.uint16)
+    stale_pairs = [
+        _FakeFrameSet(
+            _FakeFrame(color, timestamp_ms=1_000.0, frame_number=1),
+            _FakeFrame(depth, timestamp_ms=1_080.0, frame_number=1),
+        ),
+        _FakeFrameSet(
+            _FakeFrame(color, timestamp_ms=1_033.0, frame_number=2),
+            _FakeFrame(depth, timestamp_ms=1_123.0, frame_number=2),
+        ),
+    ]
+    capture = RealSenseCapture(
+        RealSenseCaptureConfig(
+            width_px=2,
+            height_px=2,
+            synchronization_retry_count=2,
+            enable_spatial_filter=False,
+            enable_temporal_filter=False,
+        ),
+        epoch_clock_ns=lambda: 1_700_000_000_000_000_000,
+    )
+    capture._pipeline = _FakePipeline(  # noqa: SLF001 - injected hardware boundary
+        stale_pairs
+    )
+    capture._align = _FakeAlign()  # noqa: SLF001 - injected hardware boundary
+    capture._depth_scale_m = 0.001  # noqa: SLF001 - injected hardware boundary
+
+    with pytest.raises(CaptureError, match=r"50 ms limit .*80\.000\.\.90\.000 ms"):
+        capture.capture(CaptureRequest(mode=CaptureMode.SINGLE))

@@ -520,7 +520,11 @@ class MVPApplication:
         return self._scene(scene_id).model_dump(mode="json")
 
     def get_camera_status(self) -> dict[str, Any]:
-        return self.camera_controller.status()
+        status = self.camera_controller.status()
+        status["maximum_timestamp_skew_ms"] = (
+            self.settings.rgbd_max_timestamp_delta_ms
+        )
+        return status
 
     def get_handeye_calibration_status(self) -> dict[str, Any]:
         return self.calibration_controller.status()
@@ -549,6 +553,16 @@ class MVPApplication:
             joint_index=int(request["joint_index"]),
             delta_deg=float(request["delta_deg"]),
         )
+
+    def move_jog_joints(self, request: dict[str, Any]) -> dict[str, Any]:
+        target = request["target_joint_positions_deg"]
+        if not isinstance(target, (list, tuple)):
+            raise ValueError("movej target must be a six-angle sequence")
+        with self._robot_motion_transition_lock:
+            self._ensure_no_other_robot_motion("movej")
+            return self.jog_controller.move_to_joint_positions(
+                target_joint_positions_deg=tuple(float(value) for value in target)
+            )
 
     def stop_jog(self, request: dict[str, Any]) -> dict[str, Any]:
         return self.jog_controller.stop(

@@ -114,6 +114,9 @@
     .actions { display: flex; gap: 10px; flex-wrap: wrap; }
     .safety { display: flex; gap: 9px; flex-wrap: wrap; margin: 24px 0; }
     .safety span { padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--muted); font: 11px ui-monospace, monospace; }
+    .safety span.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+    .safety span.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+    .safety span.danger { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
     .monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .8fr); gap: 18px; }
     .panel { padding: 22px; border: 1px solid var(--border); border-radius: 17px; background: var(--panel); }
     .camera-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -140,15 +143,17 @@
     .jog-safety-list label { display: flex; align-items: flex-start; gap: 9px; color: var(--muted); font-size: 13px; line-height: 1.5; }
     .jog-safety-list input[type="checkbox"] { margin-top: 3px; accent-color: var(--accent); }
     .jog-operator { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
-    .jog-operator input, .jog-step input { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .jog-operator input, .jog-step input, .jog-target-angle { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
     .jog-operator select { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
     .jog-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
     .jog-step { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
     .jog-step input { width: 100px; }
     .jog-joints { display: grid; gap: 9px; }
-    .jog-joint { display: grid; grid-template-columns: 76px minmax(90px, 1fr) 80px 80px; align-items: center; gap: 9px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+    .jog-joint { display: grid; grid-template-columns: 44px minmax(118px, 1fr) 108px 76px 76px; align-items: center; gap: 9px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
     .jog-joint strong { font: 700 14px ui-monospace, monospace; }
     .jog-angle { color: var(--muted); text-align: right; font: 13px ui-monospace, monospace; }
+    .jog-target-angle { width: 100%; text-align: right; font: 13px ui-monospace, monospace; }
+    .jog-target-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 14px; }
     .jog-gates { max-height: 150px; margin: 12px 0 0; overflow: auto; color: var(--muted); white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; }
     .create-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 18px; margin-top: 26px; }
     .form-grid { display: grid; gap: 12px; }
@@ -295,7 +300,8 @@
       main { padding: 32px 18px 56px; }
       .monitor-grid { grid-template-columns: 1fr; }
       .jog-layout { grid-template-columns: 1fr; }
-      .jog-joint { grid-template-columns: 58px minmax(80px, 1fr) 68px 68px; }
+      .jog-joint { grid-template-columns: 40px minmax(100px, 1fr) 92px; }
+      .jog-joint .button { grid-column: span 1; }
       .create-layout { grid-template-columns: 1fr; }
       .camera-grid { grid-template-columns: 1fr; }
       .draft-semantic-grid { grid-template-columns: 1fr; }
@@ -1068,8 +1074,8 @@
       </section>
 
       <section id="page-monitor" class="page" hidden>
-        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">Scene/binding/runtime은 Mock 전용입니다. 별도 gate가 적용된 eye-in-hand calibration만 제한된 DSR 이동 경계를 사용합니다.</p></header>
-        <div class="safety"><span id="estop-chip">● E-STOP READY</span><span id="force-chip">○ FORCE SUPERVISOR IDLE</span><span id="workspace-chip">○ WORKSPACE MONITOR IDLE</span><span>● MOCK MODE</span></div>
+        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">상단 표시는 RealSense, frozen ArUco workspace와 현재 실행 세션 상태입니다. E-stop 표시는 물리 신호가 아니라 ArUco 활성화 때 작업자가 확인한 상태입니다.</p></header>
+        <div class="safety"><span id="estop-chip">○ E-STOP CHECK REQUIRED</span><span id="camera-chip">○ REALSENSE STOPPED</span><span id="workspace-chip">○ FIXED WORKSPACE CHECKING</span><span id="mode-chip">○ MODE CHECKING</span></div>
         <div class="monitor-grid">
           <div class="panel">
             <p class="eyebrow">REALSENSE RGB-D</p>
@@ -1087,9 +1093,9 @@
             </div>
             <p id="camera-status" class="recording-status" role="status" aria-live="polite">RealSense 정지됨 · 사용자가 시작할 때만 카메라가 열립니다.</p>
             <div class="calibration-card">
-              <h3>Eye-in-hand Calibration</h3>
-              <p class="muted">고정 10×7 Chessboard · 25mm · J1/J2 고정 · J3–J6 최대 ±5° · 출력 T_flange_camera</p>
-              <p class="notice">J1/J2를 0°에 놓고 보드 고정, 작업공간 비움, E-stop 준비를 확인하세요. Calibrate를 누르면 J1/J2는 고정한 채 J3–J6가 먼저 [90,0,90,0]으로 이동합니다. 실제 이동에는 모든 hardware/calibration gate가 필요합니다.</p>
+              <h3>Eye-in-hand Calibration (선택적 재보정)</h3>
+              <p class="muted">현재 ArUco 실험은 검증 후 freeze한 fixed_workspace_reference.npz를 사용하므로 이 재보정 기능을 실행할 필요가 없습니다.</p>
+              <p class="notice">새 카메라/TCP 조합을 다시 보정할 때만 사용합니다. 고정 10×7 Chessboard · 25mm · J1/J2 고정 · J3–J6 최대 ±5°이며, 실제 이동에는 별도의 calibration gate가 필요합니다.</p>
               <div class="camera-controls">
                 <button id="start-handeye-calibration" type="button" class="button primary" disabled>Calibrate</button>
                 <button id="abort-handeye-calibration" type="button" class="button danger" disabled>Calibration 중단</button>
@@ -1115,7 +1121,7 @@
       </section>
 
       <section id="page-jog" class="page" hidden>
-        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그</h1><p class="subtitle">M0609의 J1–J6를 한 번에 최대 5°씩 직접 이동합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
+        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그 · MOVEJ</h1><p class="subtitle">M0609의 J1–J6 목표각을 degree로 직접 입력한 뒤, MOVEJ 한 번으로 6축을 함께 이동합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
         <div class="jog-layout">
           <section class="panel">
             <p class="eyebrow">SAFETY ENABLE</p>
@@ -1138,12 +1144,17 @@
           </section>
           <section class="panel">
             <div class="jog-toolbar">
-              <div><p class="eyebrow">JOINT JOG · J1–J6</p><p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p></div>
-              <label class="jog-step" for="jog-step-deg">이동 간격 (0.1–5°)
+              <div><p class="eyebrow">JOINT TARGET · J1–J6</p><p class="subtitle">현재각을 참고해 목표각을 직접 입력하세요. ± 설정은 목표값만 바꾸며 로봇을 움직이지 않습니다.</p></div>
+              <label class="jog-step" for="jog-step-deg">± 설정 간격 (0.1–5°)
                 <input id="jog-step-deg" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
               </label>
             </div>
             <div id="jog-joint-list" class="jog-joints"></div>
+            <div class="jog-target-actions">
+              <button id="jog-load-current" type="button" class="button">현재각 불러오기</button>
+              <button id="jog-movej" type="button" class="button primary" disabled>MOVEJ · 6축 이동</button>
+            </div>
+            <p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p>
           </section>
         </div>
       </section>
@@ -1193,7 +1204,7 @@
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js?v=aruco-fixed-plane-1"></script>
-  <script src="./app.js?v=aruco-fixed-plane-1"></script>
+  <script src="./api-client.js?v=ws-def-jog-movej-1"></script>
+  <script src="./app.js?v=ws-def-jog-movej-1"></script>
 </body>
 </html>
