@@ -1,0 +1,195 @@
+# 물체 폭 기반 fixed ArUco workspace
+
+이 폴더의 두 모듈은 기준 자세에서 측정한 ArUco plane을 한 번 고정하고, 물체 폭에 따라
+TCP의 plane-Z 하한만 물체별로 계산합니다. +Z 상한은 frozen reference-camera 원점의 plane-Z로
+고정합니다. 일반 workspace 점의 Z 범위는 `[plane z=0, frozen camera z]`이고, TCP는 gripper
+clearance 때문에 더 엄격한 `[z_min(width), frozen camera z]`를 사용합니다. 두 범위를 섞으면
+안 됩니다. 로봇·ROS·카메라·네트워크를 호출하지 않으며 내부 길이와 translation은 모두 metre입니다.
+
+## 중요한 현재 데이터 상태
+
+`results/d435i_plane_scans/scan_20260807_112154/plane_workspace_result.json`은 지금 바로
+freeze하면 안 됩니다. 유효 workspace marker가 1, 3, 4번뿐이고 거의 일직선이어서 polygon의
+최소 폭이 약 `1.062 mm`입니다. 9번 marker는 영상에서 검출됐지만 유효 depth center가 결과에
+남지 않았습니다. 코드는 이 경계를 임의로 확장하지 않고 `5 mm` data-quality floor에서
+거부합니다.
+
+고정 `T_camera_plane`을 그대로 유지해야 한다면, 9번 등 비공선 marker의 유효 depth 점을 다시
+얻어 기존 `T_plane_camera`로 투영한 승인 polygon을 만들어야 합니다. 아직 reference를 freeze하지
+않았다면 기준 joint를 유지한 재측정도 가능합니다. 어느 경우에도 현재의 얇은 삼각형을 수동으로
+늘려서 사용하면 안 됩니다.
+
+후속 `scan_20260807_123803`은 1, 3, 4, 6, 8번 marker로 만든 4-vertex polygon이며 최소 폭이
+약 `151.988 mm`라 공선성 검사를 통과합니다. 그래도 calibration/TCP identity, 기준 joint,
+reachability와 충돌 검증을 별도로 마치기 전에는 hardware 승인 자료가 아닙니다.
+
+## 1. fixed reference 생성
+
+반드시 Doosan M0609 joint `[0, 0, 90, 0, 90, -90] deg`에서 얻은 결과를 사용합니다. 스크립트는
+joint를 읽지 않으므로 이 조건은 작업자가 확인해야 합니다. 또한 이 저장소의
+`T_gripper2camera_orig.npy`는 현재 문서상 active TCP 불일치와 held-out 검증 실패가 확인된
+candidate이므로 영구 fixed reference의 calibration authority로 사용하면 안 됩니다
+([근거](../docs/HARDWARE_SETUP.md#legacy-t_gripper2cameranpy)). 아래에는
+동일한 `T_tcp_camera`, mm convention으로 별도 승인된 NPY 경로를 넣어야 합니다.
+
+```bash
+cd /home/rokey/Dittobot
+python3 aruco/freeze_fixed_aruco_workspace.py \
+  --plane-result-json /path/to/approved/plane_workspace_result.json \
+  --tcp-camera-npy /path/to/approved_T_tcp_camera.npy \
+  --tcp-camera-direction camera-to-tcp \
+  --tcp-camera-translation-unit mm \
+  --output-npz aruco/fixed_workspace_reference.npz
+```
+
+`fixed_workspace_reference.npz`는 create-only입니다. 이미 있으면 덮어쓰지 않습니다. 원본 JSON과
+calibration NPY도 수정하지 않으며 SHA-256 provenance만 NPZ에 저장합니다.
+
+freeze 단계에서 다음을 거부합니다.
+
+- `+Z toward camera`가 불명확하거나 plane normal/transform과 모순되는 좌표계
+- rigid transform이 아니거나 inverse가 맞지 않는 행렬
+- NaN/Inf, 중복점, self-intersection, concave 또는 거의 공선인 XY polygon
+- raw `boundary_xy_m`만 있고 `safe_boundary_xy_m`가 없는 결과
+- 기존 fixed NPZ 또는 calibration 원본을 덮어쓰려는 경로
+
+## 2. 물체 폭으로 runtime workspace 생성
+
+기본 모델은 `w = R*sin(theta)`, `R=110 mm`입니다.
+
+```bash
+python3 aruco/object_width_workspace.py \
+  --reference-npz aruco/fixed_workspace_reference.npz \
+  --width-mm 80
+```
+
+cm 입력과 legacy 모델도 지원합니다.
+
+```bash
+python3 aruco/object_width_workspace.py \
+  --reference-npz aruco/fixed_workspace_reference.npz \
+  --width-cm 4 \
+  --width-model legacy-half-factor
+```
+
+출력은 기본적으로 `aruco/runtime/runtime_workspace.npz`에 같은 디렉터리의 임시파일을 완전히
+기록한 뒤 atomic replace됩니다. XY polygon과 모든 transform은 fixed reference와 같고,
+`z_min_plane_m`과 폭 관련 metadata만 물체별로 계산됩니다. TCP 하한은 reference TCP Z에서
+계산하고 상한은 frozen camera Z입니다.
+
+80 mm, 기본 모델의 수치는 다음과 같습니다.
+
+- `theta = 46.658 deg`
+- `opening_offset = 34.502 mm`
+- `allowed_down = 184 + 34.502 - 5 = 213.502 mm`
+- `z_min = z_tcp_reference - 213.502 mm`
+- `z_max = z_frozen_reference_camera`
+
+legacy 모델은 `w = R*sin(theta)/2`이므로 허용 최대 폭은 `55 mm`입니다. 기본 모델 최대 폭은
+`110 mm`이며 범위를 넘는 폭은 clamp하지 않고 거부합니다.
+
+폭이 커질수록 허용 하강량도 커지므로 폭 측정에 오차가 있다면 과대값이 아니라 검증된 보수적
+하한을 입력해야 합니다. 실제 gripper opening이 이 값보다 작거나 모델과 다르면 runtime을
+사용하면 안 됩니다.
+
+### 다른 컴퓨터에서 실행
+
+저장소에는 최신 유효 스캔의 JSON/NPY와 create-only
+`aruco/fixed_workspace_reference.npz`를 함께 보관합니다. Clone/pull 후 저장소 루트에서 먼저
+전송 무결성을 확인합니다.
+
+```bash
+sha256sum -c aruco/PORTABLE_ARTIFACTS.sha256
+```
+
+`T_gripper2camera_orig.npy`도 이미 저장소에서 추적됩니다. 물체별
+`runtime/runtime_workspace.npz`는 폭을 잘못 재사용하지 않도록 커밋하지 않고 각 컴퓨터에서
+실제 물체 폭으로 다시 생성합니다.
+
+```bash
+python3 aruco/object_width_workspace.py \
+  --reference-npz aruco/fixed_workspace_reference.npz \
+  --width-mm 80
+```
+
+fixed NPZ는 geometry reference이며 실제 로봇용 hardware 승인이나 현재 TCP 일치 검증을
+대신하지 않습니다.
+
+## 3. target 검사와 reject
+
+아래 TCP 옵션은 점을 보정하지 않습니다. XY 또는 동적 TCP Z가 범위를 벗어나면 usable runtime을
+publish하지 않고 종료 코드 `2`를 반환합니다. 기존 runtime을 잘못 재사용하지 않도록 표준 출력
+경로는 Z bound가 없는 `unsafe_target_rejected` NPZ marker로 atomic replace됩니다.
+폭 범위 오류나 reference 손상처럼 runtime 생성 자체가 실패한 경우도 가능한 한 같은 경로를
+`runtime_generation_failed` marker로 바꿉니다. 소비자는 `artifact_kind`, `status`,
+`usable_for_target_validation`, reference checksum/generation을 확인한 뒤에만 Z bound를 사용해야 합니다.
+숫자가 아닌 폭, 필수 폭 누락 등 CLI parsing 실패도 같은 marker로 기존 정상 runtime을
+무효화합니다. 단, `--help`는 읽기 전용이라 runtime을 바꾸지 않습니다.
+
+기존 출력 파일은 이 모듈이 만든 schema 2.0 runtime 또는 rejection marker로 식별될 때만
+교체합니다. 손상됐거나 정체를 확인할 수 없는 NPZ는 fixed reference일 가능성을 배제할 수 없어
+자동으로 덮어쓰지 않습니다. 이 경우 파일을 보존한 채 nonzero로 실패하므로 운영자가 출처를
+확인한 후 별도 경로를 사용하거나 수동으로 격리해야 합니다.
+
+```bash
+python3 aruco/object_width_workspace.py \
+  --reference-npz aruco/fixed_workspace_reference.npz \
+  --width-mm 80 \
+  --check-plane-xyz X_M Y_M Z_M
+```
+
+TCP/gripper clearance가 아닌 일반 workspace 점을 `plane z=0`부터 frozen camera Z까지 검사하려면
+별도 옵션을 사용합니다.
+
+```bash
+python3 aruco/object_width_workspace.py \
+  --reference-npz aruco/fixed_workspace_reference.npz \
+  --width-mm 80 \
+  --check-workspace-plane-xyz X_M Y_M Z_M
+```
+
+`check_workspace_point_plane()`은 위 일반 기하 범위만 검사하며 TCP 실행 허가로 사용하면 안 됩니다.
+TCP에는 반드시 `check_tcp_point_plane()` 또는 raising API를 사용합니다.
+
+frozen reference-camera 좌표의 점은 다음과 같이 검사합니다.
+
+```bash
+python3 aruco/object_width_workspace.py \
+  --reference-npz aruco/fixed_workspace_reference.npz \
+  --width-mm 80 \
+  --check-camera-ref-xyz X_M Y_M Z_M
+```
+
+이 camera 좌표는 기준 자세에서 고정한 가상 reference-camera frame입니다. eye-in-hand 카메라가
+이동한 뒤의 live camera XYZ를 외부 TF 없이 직접 넣으면 안 됩니다. Python 호출부에서는
+`require_tcp_point_plane()` 또는 `require_tcp_point_camera_ref()`를 사용하면 unsafe 입력에서
+`UnsafeWorkspaceTargetError`가 발생합니다.
+
+## 검사
+
+```bash
+python3 -m py_compile \
+  aruco/freeze_fixed_aruco_workspace.py \
+  aruco/object_width_workspace.py \
+  aruco/test_object_width_workspace.py
+
+PYTHONDONTWRITEBYTECODE=1 python3 aruco/test_object_width_workspace.py
+
+# 시스템 pytest plugin 충돌이 있을 때
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 \
+  python3 -m pytest -q aruco/test_object_width_workspace.py
+```
+
+## 안전 경계
+
+이 모듈은 고정 gripper orientation/TCP 정의에서 endpoint TCP의 fixed-plane XYZ만 검사합니다.
+다음 항목을 승인하지 않습니다.
+
+- 실제 Doosan hardware 실행, joint/reachability/특이점/self-collision
+- tool body와 swept path, MoveJ/MoveC 중간 경로, fixture/obstacle collision
+- 실제 gripper opening/state가 입력 폭과 일치하는지 여부
+- `DR_BASE <-> fixed plane`의 hardware-verified TF
+
+따라서 runtime NPZ 생성만으로 기존 로봇 실행 안전 gate에 연결되지는 않습니다. 실제 실행기는
+모든 target과 경로에서 검사 결과를 강제하고, 현재 gripper state와 검증된 base/plane TF를 같은
+snapshot으로 묶어야 합니다.
