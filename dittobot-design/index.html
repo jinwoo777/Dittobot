@@ -141,6 +141,7 @@
     .jog-safety-list input[type="checkbox"] { margin-top: 3px; accent-color: var(--accent); }
     .jog-operator { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
     .jog-operator input, .jog-step input { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .jog-operator select { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
     .jog-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
     .jog-step { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
     .jog-step input { width: 100px; }
@@ -880,6 +881,7 @@
         <button type="button" data-page="detail">스킬 상세</button>
         <button type="button" data-page="monitor">실시간 모니터링</button>
         <button type="button" data-page="jog">조그</button>
+        <button type="button" data-page="aruco-experiment">ArUco 실험</button>
       </nav>
       <div class="connection">
         <span id="execution-mode" class="mode">MOCK API</span>
@@ -1145,10 +1147,53 @@
           </section>
         </div>
       </section>
+
+      <section id="page-aruco-experiment" class="page" hidden>
+        <header><p class="eyebrow">06 · FIXED PLANE EXPERIMENT</p><h1>ArUco 안전 범위 실험</h1><p class="subtitle">고정된 기준 자세 [0, 0, 90, 0, 90, -90]°와 frozen ArUco plane을 사용합니다. 물체 폭은 TCP의 동적 Z 하한만 바꾸며, 상한은 평면에서 기준 카메라 위치까지입니다.</p></header>
+        <div class="jog-layout">
+          <section class="panel">
+            <p class="eyebrow">SAFETY ENABLE</p>
+            <p id="aruco-experiment-mode-notice" class="notice">실험 상태 확인 중…</p>
+            <label class="jog-operator" for="aruco-experiment-operator-id">작업자 ID
+              <input id="aruco-experiment-operator-id" type="text" value="ui_operator" maxlength="64" autocomplete="off">
+            </label>
+            <label class="jog-operator" for="aruco-object-width-mm">물체 폭 (mm)
+              <input id="aruco-object-width-mm" type="number" min="0" max="110" step="0.1" value="80" inputmode="decimal">
+            </label>
+            <label class="jog-operator" for="aruco-width-model">폭 모델
+              <select id="aruco-width-model">
+                <option value="full-opening">w = R·sin(θ)</option>
+                <option value="legacy-half-factor">w = R·sin(θ)/2 (legacy)</option>
+              </select>
+            </label>
+            <div class="jog-safety-list">
+              <label><input id="aruco-workspace-cleared" type="checkbox"> Joint 1 기준 1 m 안의 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
+              <label><input id="aruco-estop-ready" type="checkbox"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
+              <label><input id="aruco-direct-motion-ack" type="checkbox"> 기준 자세 MoveJ와 plane +Z 20 mm MoveL이 즉시 실행될 수 있음을 이해했습니다.</label>
+            </div>
+            <div class="actions">
+              <button id="aruco-experiment-enable" type="button" class="button primary">폭 적용 · 실험 활성화</button>
+              <button id="aruco-experiment-refresh" type="button" class="button">상태 새로고침</button>
+              <button id="aruco-experiment-stop" type="button" class="button danger" disabled>정지 · 비활성화</button>
+            </div>
+            <p id="aruco-experiment-status" class="recording-status" role="status" aria-live="polite">비활성</p>
+            <pre id="aruco-experiment-gates" class="jog-gates"></pre>
+          </section>
+          <section class="panel">
+            <p class="eyebrow">TWO-STEP DEMO</p>
+            <p class="notice">순서를 바꿀 수 없습니다. 먼저 기준 자세에 도달하여 현장 T_base_plane을 고정한 뒤, 같은 TCP 자세로 plane +Z 방향 20 mm를 한 번만 이동합니다. 범위를 벗어난 목표는 자동 보정하지 않고 거절합니다.</p>
+            <div class="actions" style="margin-top: 18px">
+              <button id="aruco-move-reference" type="button" class="button primary" disabled>1. 기준 자세 [0,0,90,0,90,-90]°</button>
+              <button id="aruco-move-z-test" type="button" class="button primary" disabled>2. Plane +Z 20 mm 검증</button>
+            </div>
+            <pre id="aruco-workspace-summary" class="draft-result">frozen workspace 확인 중…</pre>
+          </section>
+        </div>
+      </section>
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js?v=hs01-web-jog-5"></script>
-  <script src="./app.js?v=hs01-web-jog-5"></script>
+  <script src="./api-client.js?v=aruco-fixed-plane-1"></script>
+  <script src="./app.js?v=aruco-fixed-plane-1"></script>
 </body>
 </html>

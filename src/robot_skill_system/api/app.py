@@ -17,6 +17,7 @@ def create_app(service: Any | None = None) -> Any:
         raise RuntimeError("Install the 'api' optional dependencies to run FastAPI") from exc
 
     from robot_skill_system.api.routes import (
+        aruco_experiment,
         calibration,
         camera,
         catalog,
@@ -53,6 +54,7 @@ def create_app(service: Any | None = None) -> Any:
     app.include_router(camera.router)
     app.include_router(calibration.router)
     app.include_router(jog.router)
+    app.include_router(aruco_experiment.router)
     app.include_router(task_planes.router)
 
     settings = getattr(service, "settings", None)

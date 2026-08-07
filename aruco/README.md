@@ -190,6 +190,41 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 \
 - 실제 gripper opening/state가 입력 폭과 일치하는지 여부
 - `DR_BASE <-> fixed plane`의 hardware-verified TF
 
-따라서 runtime NPZ 생성만으로 기존 로봇 실행 안전 gate에 연결되지는 않습니다. 실제 실행기는
-모든 target과 경로에서 검사 결과를 강제하고, 현재 gripper state와 검증된 base/plane TF를 같은
-snapshot으로 묶어야 합니다.
+`src/robot_skill_system/aruco_experiment/controller.py`와 `/ui/`의 `ArUco 실험` 화면은 첫 실험용
+좁은 실행 경계를 제공합니다. 정확한 기준 joint에서 현재 `T_base_tcp`와 frozen
+`T_tcp_plane`을 합성하여 `T_base_plane`을 한 세션 동안 고정하고, active TCP 일치, fixed NPZ
+checksum/schema, 폭별 TCP Z, plane-to-camera Z 상한, XY polygon, Joint 1 기준 1 m TCP 반경,
+IK/관절 한계와 2 mm 간격의 전체 +Z 20 mm 선분을 검사합니다. 실패한 target은 보정하지 않고
+MoveL 전에 거절합니다.
+
+이 전용 경계도 runtime NPZ 하나만으로 hardware를 승인하지 않습니다. 실제 모드에는 저장소의
+5개 공통 hardware gate와 `ENABLE_ARUCO_EXPERIMENT=true`,
+`ARUCO_EXPERIMENT_CELL_SAFETY_VERIFIED=true`, UI의 작업공간/E-stop/직접 이동 확인이 모두
+필요합니다. 실제 gripper 폭 feedback과 일반 SkillGraph hardware 실행은 이 첫 실험 범위에
+포함하지 않습니다.
+
+Doosan bringup과 같은 ROS 2/DSR workspace가 source된 별도 터미널에서 다음처럼 API를
+시작합니다. 현재 장치의 실제 TCP 이름이 다르면 임의로 맞추지 말고, frozen calibration을 만든
+TCP와 일치하는 검증된 이름으로 `ARUCO_EXPERIMENT_EXPECTED_TCP`를 설정해야 합니다.
+
+```bash
+cd /home/rokey/Dittobot
+source /opt/ros/humble/setup.bash
+source /path/to/built_doosan_workspace/install/setup.bash
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+export ROBOT_EXECUTION_MODE=hardware
+export ENABLE_HARDWARE_EXECUTION=true
+export ROBOT_BACKEND=doosan
+export ENABLE_REAL_ROBOT=true
+export DRY_RUN=false
+export ENABLE_ARUCO_EXPERIMENT=true
+export ARUCO_EXPERIMENT_CELL_SAFETY_VERIFIED=true
+export ARUCO_EXPERIMENT_EXPECTED_TCP=GripperDA_v1
+export ARUCO_FIXED_REFERENCE_NPZ="$PWD/aruco/fixed_workspace_reference.npz"
+export ARUCO_RUNTIME_WORKSPACE_NPZ="$PWD/aruco/runtime/runtime_workspace.npz"
+python3 -m uvicorn robot_skill_system.api.app:create_app \
+  --factory --host 127.0.0.1 --port 8001
+```
+
+브라우저에서 `http://127.0.0.1:8001/ui/`의 `ArUco 실험`을 엽니다. gate 또는 DSR 서비스가
+하나라도 준비되지 않으면 hardware 동작을 시도하지 않고 상태/API 오류로 거절합니다.

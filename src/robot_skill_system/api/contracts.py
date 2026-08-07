@@ -99,6 +99,29 @@ class JogStopRequest(APIModel):
     reason: str = Field(default="operator_request", min_length=1, max_length=128)
 
 
+class ArucoExperimentEnableRequest(APIModel):
+    operator_id: str = Field(default="ui_operator", min_length=1, max_length=64)
+    workspace_cleared: bool
+    estop_ready: bool
+    acknowledge_direct_motion: bool
+    object_width_mm: float = Field(ge=0.0, le=110.0)
+    width_model: Literal["full-opening", "legacy-half-factor"] = "full-opening"
+
+    @model_validator(mode="after")
+    def validate_safety_acknowledgements(self) -> ArucoExperimentEnableRequest:
+        if not all(
+            (self.workspace_cleared, self.estop_ready, self.acknowledge_direct_motion)
+        ):
+            raise ValueError("all ArUco experiment safety acknowledgements are required")
+        if self.width_model == "legacy-half-factor" and self.object_width_mm > 55.0:
+            raise ValueError("legacy-half-factor width cannot exceed 55 mm")
+        return self
+
+
+class ArucoExperimentStopRequest(APIModel):
+    reason: str = Field(default="operator_request", min_length=1, max_length=128)
+
+
 class HandEyeLegacyImportRequest(APIModel):
     operator_id: str = Field(default="operator", min_length=1, max_length=64)
     operator_confirmed: bool

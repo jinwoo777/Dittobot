@@ -247,6 +247,41 @@
       });
     }
 
+    arucoExperimentStatus() {
+      return this.request("/aruco-experiment/status");
+    }
+
+    enableArucoExperiment(payload) {
+      return this.request("/aruco-experiment/enable", {
+        method: "POST",
+        body: payload,
+        timeoutMs: 30000,
+      });
+    }
+
+    moveArucoReference() {
+      return this.request("/aruco-experiment/move-reference", {
+        method: "POST",
+        body: {},
+        timeoutMs: 120000,
+      });
+    }
+
+    moveArucoPlaneZTest() {
+      return this.request("/aruco-experiment/move-plane-z-test", {
+        method: "POST",
+        body: {},
+        timeoutMs: 60000,
+      });
+    }
+
+    stopArucoExperiment(reason = "operator_request") {
+      return this.request("/aruco-experiment/stop", {
+        method: "POST",
+        body: { reason },
+      });
+    }
+
     importLegacyHandeyeNpy(operatorId = "ui_operator") {
       return this.request("/calibration/hand-eye/import-legacy-npy", {
         method: "POST",

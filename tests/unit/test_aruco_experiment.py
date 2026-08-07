@@ -1,0 +1,117 @@
+from __future__ import annotations
+
+import math
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from robot_skill_system.aruco_experiment.controller import (
+    ArucoExperimentController,
+    MockArucoExperimentRobot,
+    PLANE_Z_TEST_DISTANCE_M,
+    REFERENCE_JOINT_DEG,
+)
+
+
+def _controller(
+    tmp_path: Path,
+    *,
+    robot: MockArucoExperimentRobot | None = None,
+    expected_tcp_name: str = "GripperDA_v1",
+) -> ArucoExperimentController:
+    instance = robot or MockArucoExperimentRobot(active_tcp_name=expected_tcp_name)
+    return ArucoExperimentController(
+        robot_factory=lambda: instance,
+        mode="mock",
+        hardware_authorized=False,
+        gate_summary={"ROBOT_EXECUTION_MODE=hardware": False},
+        reference_npz=Path("aruco/fixed_workspace_reference.npz").resolve(),
+        runtime_npz=tmp_path / "runtime_workspace.npz",
+        expected_tcp_name=expected_tcp_name,
+        joint_velocity_rad_s=0.175,
+        joint_acceleration_rad_s2=0.25,
+        linear_velocity_m_s=0.0135,
+        linear_acceleration_m_s2=0.036,
+        angular_velocity_rad_s=0.09,
+        angular_acceleration_rad_s2=0.18,
+    )
+
+
+def _enable(controller: ArucoExperimentController, *, width_mm: float = 80.0) -> None:
+    controller.enable(
+        operator_id="test_operator",
+        workspace_cleared=True,
+        estop_ready=True,
+        acknowledge_direct_motion=True,
+        object_width_mm=width_mm,
+        width_model="full-opening",
+    )
+
+
+def test_mock_two_step_experiment_uses_camera_z_upper_bound(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    _enable(controller)
+
+    enabled = controller.status()
+    runtime = enabled["runtime_workspace"]
+    camera_z = enabled["capabilities"]["reference"]["plane_to_camera_z_range_m"][1]
+    assert runtime["z_max_plane_m"] == pytest.approx(camera_z)
+    assert (tmp_path / "runtime_workspace.npz").is_file()
+    with np.load(tmp_path / "runtime_workspace.npz", allow_pickle=False) as artifact:
+        assert artifact["workspace_point_z_bounds_plane_m"].tolist() == pytest.approx(
+            [0.0, camera_z]
+        )
+        assert artifact["tcp_z_bounds_plane_m"].tolist() == pytest.approx(
+            [runtime["z_min_plane_m"], camera_z]
+        )
+
+    referenced = controller.move_to_reference()
+    assert referenced["reference_captured"] is True
+    assert referenced["joint_positions_deg"] == pytest.approx(REFERENCE_JOINT_DEG)
+    before = np.asarray(referenced["tcp_base_xyz_m"], dtype=np.float64)
+
+    completed = controller.move_plane_z_test()
+    after = np.asarray(completed["tcp_base_xyz_m"], dtype=np.float64)
+    assert completed["z_test_completed"] is True
+    assert np.linalg.norm(after - before) == pytest.approx(PLANE_Z_TEST_DISTANCE_M)
+
+
+def test_z_test_rejects_wrong_order_and_duplicate(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    _enable(controller)
+    with pytest.raises(ValueError, match="reference pose first"):
+        controller.move_plane_z_test()
+    controller.move_to_reference()
+    controller.move_plane_z_test()
+    with pytest.raises(ValueError, match="already completed"):
+        controller.move_plane_z_test()
+
+
+def test_enable_rejects_active_tcp_mismatch(tmp_path: Path) -> None:
+    robot = MockArucoExperimentRobot(active_tcp_name="wrong_tcp")
+    controller = _controller(
+        tmp_path,
+        robot=robot,
+        expected_tcp_name="GripperDA_v1",
+    )
+    with pytest.raises(ValueError, match="does not match frozen workspace TCP"):
+        _enable(controller)
+    assert robot.connected is False
+
+
+def test_enable_rejects_tcp_outside_one_metre_base_radius(tmp_path: Path) -> None:
+    robot = MockArucoExperimentRobot()
+    robot.base_to_tcp[:3, 3] = [1.01, 0.0, 0.0]
+    controller = _controller(tmp_path, robot=robot)
+    with pytest.raises(ValueError, match="exceeds the approved 1.0 m"):
+        _enable(controller)
+
+
+def test_width_runtime_matches_requested_model(tmp_path: Path) -> None:
+    controller = _controller(tmp_path)
+    _enable(controller, width_mm=80.0)
+    runtime = controller.status()["runtime_workspace"]
+    assert runtime["theta_deg"] == pytest.approx(math.degrees(math.asin(80.0 / 110.0)))
+    assert runtime["z_min_plane_m"] < runtime["z_max_plane_m"]
+

@@ -37,6 +37,11 @@
       loading: false,
       lastError: null,
     },
+    arucoExperiment: {
+      status: null,
+      loading: false,
+      lastError: null,
+    },
     recordingReview: {
       recordings: [],
       selectedId: null,
@@ -146,6 +151,21 @@
     jogGates: element("jog-gates"),
     jogStepDeg: element("jog-step-deg"),
     jogJointList: element("jog-joint-list"),
+    arucoExperimentModeNotice: element("aruco-experiment-mode-notice"),
+    arucoExperimentOperatorId: element("aruco-experiment-operator-id"),
+    arucoObjectWidthMm: element("aruco-object-width-mm"),
+    arucoWidthModel: element("aruco-width-model"),
+    arucoWorkspaceCleared: element("aruco-workspace-cleared"),
+    arucoEstopReady: element("aruco-estop-ready"),
+    arucoDirectMotionAck: element("aruco-direct-motion-ack"),
+    arucoExperimentEnable: element("aruco-experiment-enable"),
+    arucoExperimentRefresh: element("aruco-experiment-refresh"),
+    arucoExperimentStop: element("aruco-experiment-stop"),
+    arucoExperimentStatus: element("aruco-experiment-status"),
+    arucoExperimentGates: element("aruco-experiment-gates"),
+    arucoMoveReference: element("aruco-move-reference"),
+    arucoMoveZTest: element("aruco-move-z-test"),
+    arucoWorkspaceSummary: element("aruco-workspace-summary"),
     recordingSelect: element("recording-select"),
     refreshRecordings: element("refresh-recordings"),
     recordedRgbFrame: element("recorded-rgb-frame"),
@@ -301,9 +321,13 @@
 
   function renderConnection() {
     const hardwareJog = state.jog.status?.capabilities?.mode === "hardware";
-    dom.executionMode.textContent = hardwareJog ? "HARDWARE JOG" : "MOCK API";
-    dom.executionMode.style.color = hardwareJog ? "var(--danger)" : "";
-    dom.executionMode.style.background = hardwareJog ? "var(--danger-soft)" : "";
+    const hardwareAruco = state.arucoExperiment.status?.capabilities?.mode === "hardware";
+    const hardware = hardwareJog || hardwareAruco;
+    dom.executionMode.textContent = hardwareAruco
+      ? "HARDWARE ARUCO"
+      : hardwareJog ? "HARDWARE JOG" : "MOCK API";
+    dom.executionMode.style.color = hardware ? "var(--danger)" : "";
+    dom.executionMode.style.background = hardware ? "var(--danger-soft)" : "";
     dom.connectionDot.className = "dot";
     if (state.apiStatus === "connected") {
       dom.connectionDot.classList.add("ok");
@@ -332,6 +356,10 @@
     if (page === "jog") {
       renderJog();
       refreshJogStatus({ quiet: true });
+    }
+    if (page === "aruco-experiment") {
+      renderArucoExperiment();
+      refreshArucoExperimentStatus({ quiet: true });
     }
     if (page === "create") {
       renderCreateMode();
@@ -1562,6 +1590,209 @@
     }
   }
 
+  function renderArucoExperiment() {
+    const payload = state.arucoExperiment.status;
+    const capabilities = payload?.capabilities || {};
+    const enabled = payload?.enabled === true;
+    const hardware = capabilities.mode === "hardware";
+    const busy = state.arucoExperiment.loading;
+    const reference = capabilities.reference || null;
+    const runtime = payload?.runtime_workspace || null;
+    const failedGates = Array.isArray(capabilities.failed_gates)
+      ? capabilities.failed_gates
+      : [];
+
+    dom.arucoExperimentModeNotice.textContent = capabilities.reference_error
+      ? `Frozen reference 오류: ${capabilities.reference_error}`
+      : hardware
+        ? "실제 M0609 ArUco 실험 모드입니다. 두 이동 버튼은 로봇을 즉시 움직입니다."
+        : "MOCK ArUco 실험 모드입니다. 계산과 runtime NPZ는 실제와 같지만 로봇은 움직이지 않습니다.";
+    dom.arucoExperimentModeNotice.style.color = (
+      hardware || capabilities.reference_error
+    ) ? "var(--danger)" : "";
+    dom.arucoExperimentStatus.textContent = state.arucoExperiment.lastError
+      ? `오류 · ${state.arucoExperiment.lastError}`
+      : enabled
+        ? `● 활성 · ${payload.operator_id || "operator"} · ${payload.last_action || "대기"}`
+        : "○ 비활성 · 물체 폭과 안전 확인 후 활성화하세요.";
+    dom.arucoExperimentStatus.style.color = state.arucoExperiment.lastError
+      ? "var(--danger)"
+      : enabled ? "var(--ok)" : "";
+    dom.arucoExperimentGates.textContent = hardware
+      ? `실제 로봇 gate: 모두 통과\nactive TCP: ${capabilities.expected_tcp_name}\nbase 반경: ${capabilities.maximum_base_radius_m} m 이하`
+      : `실제 로봇은 비활성화됨${failedGates.length ? `\n닫힌 gate:\n- ${failedGates.join("\n- ")}` : ""}\n현재 이동은 MOCK 전용`;
+
+    const legacyModel = dom.arucoWidthModel.value === "legacy-half-factor";
+    dom.arucoObjectWidthMm.max = legacyModel ? "55" : "110";
+    dom.arucoExperimentEnable.disabled = busy || enabled || state.apiStatus !== "connected"
+      || Boolean(capabilities.reference_error);
+    dom.arucoExperimentRefresh.disabled = busy || state.apiStatus !== "connected";
+    dom.arucoExperimentStop.disabled = busy || !enabled;
+    dom.arucoMoveReference.disabled = busy || !enabled;
+    dom.arucoMoveZTest.disabled = busy || !enabled || !payload?.reference_captured
+      || payload?.z_test_completed;
+    for (const input of [
+      dom.arucoExperimentOperatorId,
+      dom.arucoObjectWidthMm,
+      dom.arucoWidthModel,
+      dom.arucoWorkspaceCleared,
+      dom.arucoEstopReady,
+      dom.arucoDirectMotionAck,
+    ]) input.disabled = enabled || busy;
+
+    dom.arucoWorkspaceSummary.textContent = JSON.stringify({
+      frame: reference?.frame_name || null,
+      fixed_reference_sha256: reference?.checksum_sha256 || null,
+      reference_joint_deg: reference?.reference_joint_deg || null,
+      plane_to_camera_z_range_m: reference?.plane_to_camera_z_range_m || null,
+      reference_tcp_plane_xyz_m: reference?.reference_tcp_plane_xyz_m || null,
+      active_tcp_name: payload?.active_tcp_name || null,
+      object_width_mm: runtime?.object_width_mm ?? null,
+      theta_deg: runtime ? Number(runtime.theta_deg).toFixed(3) : null,
+      opening_offset_mm: runtime ? (Number(runtime.opening_offset_m) * 1000).toFixed(3) : null,
+      tcp_z_bounds_plane_m: runtime
+        ? [runtime.z_min_plane_m, runtime.z_max_plane_m]
+        : null,
+      reference_captured: payload?.reference_captured || false,
+      z_test_completed: payload?.z_test_completed || false,
+      tcp_base_xyz_m: payload?.tcp_base_xyz_m || null,
+      unsafe_targets_are_clamped: capabilities.unsafe_targets_are_clamped ?? false,
+    }, null, 2);
+    renderConnection();
+  }
+
+  async function refreshArucoExperimentStatus({ quiet = false } = {}) {
+    if (state.apiStatus !== "connected") return;
+    try {
+      const wasEnabled = state.arucoExperiment.status?.enabled === true;
+      state.arucoExperiment.status = await api.arucoExperimentStatus();
+      if (wasEnabled && state.arucoExperiment.status?.enabled !== true) {
+        dom.arucoWorkspaceCleared.checked = false;
+        dom.arucoEstopReady.checked = false;
+        dom.arucoDirectMotionAck.checked = false;
+      }
+      state.arucoExperiment.lastError = null;
+    } catch (error) {
+      state.arucoExperiment.lastError = errorText(error);
+      if (!quiet) setBanner(`ArUco 실험 상태 확인 실패: ${errorText(error)}`, "danger");
+    }
+    renderArucoExperiment();
+  }
+
+  async function enableArucoExperiment() {
+    if (
+      !dom.arucoWorkspaceCleared.checked
+      || !dom.arucoEstopReady.checked
+      || !dom.arucoDirectMotionAck.checked
+    ) {
+      setBanner("ArUco 실험 활성화 전에 세 가지 안전 항목을 모두 확인하세요.", "danger");
+      return;
+    }
+    const widthMm = Number(dom.arucoObjectWidthMm.value);
+    const maximumWidthMm = dom.arucoWidthModel.value === "legacy-half-factor" ? 55 : 110;
+    if (!Number.isFinite(widthMm) || widthMm < 0 || widthMm > maximumWidthMm) {
+      setBanner(`현재 폭 모델에서 물체 폭은 0–${maximumWidthMm} mm여야 합니다.`, "danger");
+      return;
+    }
+    const hardware = state.arucoExperiment.status?.capabilities?.mode === "hardware";
+    if (hardware && !window.confirm(
+      "실제 M0609 실험 세션을 활성화합니다.\n\n"
+      + `물체 폭: ${widthMm} mm\n`
+      + "다음 단계에서 기준 자세 MoveJ와 plane +Z 20 mm MoveL이 실행됩니다.\n"
+      + "작업공간 비움과 E-stop 준비를 다시 확인했습니까?",
+    )) return;
+    state.arucoExperiment.loading = true;
+    state.arucoExperiment.lastError = null;
+    renderArucoExperiment();
+    try {
+      state.arucoExperiment.status = await api.enableArucoExperiment({
+        operator_id: dom.arucoExperimentOperatorId.value.trim() || "ui_operator",
+        workspace_cleared: true,
+        estop_ready: true,
+        acknowledge_direct_motion: true,
+        object_width_mm: widthMm,
+        width_model: dom.arucoWidthModel.value,
+      });
+      setBanner(
+        hardware
+          ? "실제 ArUco 실험 활성화 완료 · 기준 자세 버튼을 누르세요."
+          : "MOCK ArUco 실험 활성화 및 runtime workspace 생성 완료",
+        hardware ? "danger" : "ok",
+      );
+    } catch (error) {
+      state.arucoExperiment.lastError = errorText(error);
+      setBanner(`ArUco 실험 활성화 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.arucoExperiment.loading = false;
+      renderArucoExperiment();
+    }
+  }
+
+  async function moveArucoReference() {
+    const hardware = state.arucoExperiment.status?.capabilities?.mode === "hardware";
+    if (hardware && !window.confirm(
+      "M0609를 [0, 0, 90, 0, 90, -90]° 기준 자세로 이동합니다.\n"
+      + "로봇 주변이 비어 있고 E-stop을 잡고 있습니까?",
+    )) return;
+    state.arucoExperiment.loading = true;
+    renderArucoExperiment();
+    try {
+      state.arucoExperiment.status = await api.moveArucoReference();
+      state.arucoExperiment.lastError = null;
+      setBanner("기준 자세 도달 및 frozen plane의 base 결합 완료", "ok");
+    } catch (error) {
+      state.arucoExperiment.lastError = errorText(error);
+      setBanner(`기준 자세 이동 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.arucoExperiment.loading = false;
+      renderArucoExperiment();
+    }
+  }
+
+  async function moveArucoPlaneZTest() {
+    const hardware = state.arucoExperiment.status?.capabilities?.mode === "hardware";
+    if (hardware && !window.confirm(
+      "TCP를 frozen plane +Z(카메라/테이블 반대 방향)로 정확히 20 mm MoveL 합니다.\n"
+      + "이 동작은 한 번만 허용됩니다. 실행할까요?",
+    )) return;
+    state.arucoExperiment.loading = true;
+    renderArucoExperiment();
+    try {
+      state.arucoExperiment.status = await api.moveArucoPlaneZTest();
+      state.arucoExperiment.lastError = null;
+      setBanner("Plane +Z 20 mm 검증 동작 완료", "ok");
+    } catch (error) {
+      state.arucoExperiment.lastError = errorText(error);
+      setBanner(`Plane +Z 검증 거절/실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.arucoExperiment.loading = false;
+      renderArucoExperiment();
+    }
+  }
+
+  async function stopArucoExperiment() {
+    const hardware = state.arucoExperiment.status?.capabilities?.mode === "hardware";
+    if (hardware && !window.confirm("로봇 quick stop을 요청하고 실험을 비활성화할까요?")) return;
+    state.arucoExperiment.loading = true;
+    renderArucoExperiment();
+    try {
+      state.arucoExperiment.status = await api.stopArucoExperiment(
+        "ui_operator_request",
+      );
+      state.arucoExperiment.lastError = null;
+      dom.arucoWorkspaceCleared.checked = false;
+      dom.arucoEstopReady.checked = false;
+      dom.arucoDirectMotionAck.checked = false;
+      setBanner("ArUco 실험 정지 및 비활성화 완료", "ok");
+    } catch (error) {
+      state.arucoExperiment.lastError = errorText(error);
+      setBanner(`ArUco 실험 정지 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.arucoExperiment.loading = false;
+      renderArucoExperiment();
+    }
+  }
+
   function renderCamera() {
     const camera = state.camera;
     const streaming = camera.state === "streaming";
@@ -2133,6 +2364,7 @@
     if (state.page === "detail") renderDetail();
     if (state.page === "monitor") renderMonitor();
     if (state.page === "jog") renderJog();
+    if (state.page === "aruco-experiment") renderArucoExperiment();
     if (state.page === "create") {
       renderCreateMode();
       if (state.editor.createMode === "recording") renderRecordingReview();
@@ -2737,6 +2969,15 @@
   dom.jogEnable.addEventListener("click", enableJog);
   dom.jogRefresh.addEventListener("click", () => refreshJogStatus({ quiet: false }));
   dom.jogStop.addEventListener("click", stopJog);
+  dom.arucoExperimentEnable.addEventListener("click", enableArucoExperiment);
+  dom.arucoExperimentRefresh.addEventListener(
+    "click",
+    () => refreshArucoExperimentStatus({ quiet: false }),
+  );
+  dom.arucoExperimentStop.addEventListener("click", stopArucoExperiment);
+  dom.arucoMoveReference.addEventListener("click", moveArucoReference);
+  dom.arucoMoveZTest.addEventListener("click", moveArucoPlaneZTest);
+  dom.arucoWidthModel.addEventListener("change", renderArucoExperiment);
   dom.recordingSelect.addEventListener("change", () => {
     stopRecordingPlayback();
     cancelGeometryTeaching();
@@ -2835,6 +3076,7 @@
     refreshCameraStatus(),
     refreshHandeyeCalibrationStatus(),
     refreshJogStatus({ quiet: true }),
+    refreshArucoExperimentStatus({ quiet: true }),
   ])).catch(() => undefined);
   window.setInterval(() => {
     if (state.camera.state === "streaming" || state.camera.recordingId) {
@@ -2846,6 +3088,9 @@
     }
     if (state.page === "jog" || state.jog.status?.enabled) {
       refreshJogStatus({ quiet: true });
+    }
+    if (state.page === "aruco-experiment" || state.arucoExperiment.status?.enabled) {
+      refreshArucoExperimentStatus({ quiet: true });
     }
   }, 1000);
 })();

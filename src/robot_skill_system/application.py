@@ -18,6 +18,11 @@ from typing import Any, Literal
 from sqlalchemy import select
 
 from robot_skill_system.adapters.mock_robot import MockGripperAdapter, MockRobotAdapter
+from robot_skill_system.aruco_experiment.controller import (
+    ArucoExperimentController,
+    DoosanArucoExperimentRobot,
+    MockArucoExperimentRobot,
+)
 from robot_skill_system.calibration.controller import HandEyeCalibrationController
 from robot_skill_system.calibration.robot import DoosanHandEyeCalibrationRobot
 from robot_skill_system.calibration.task_plane import (
@@ -227,6 +232,7 @@ class MVPApplication:
         camera_controller: RGBDCameraController | None = None,
         calibration_controller: HandEyeCalibrationController | None = None,
         jog_controller: JogController | None = None,
+        aruco_experiment_controller: ArucoExperimentController | None = None,
     ) -> None:
         self.settings = settings
         self.store = LocalArtifactStore(settings.artifact_root)
@@ -328,10 +334,78 @@ class MVPApplication:
                 jog_profile.joint_acceleration_rad_s2 * jog_profile.safety_scale
             ),
         )
+        aruco_gates = {
+            "ROBOT_EXECUTION_MODE=hardware": (
+                settings.robot_execution_mode is SettingsExecutionMode.HARDWARE
+            ),
+            "ENABLE_HARDWARE_EXECUTION=true": settings.enable_hardware_execution,
+            "ROBOT_BACKEND=doosan": settings.robot_backend == "doosan",
+            "ENABLE_REAL_ROBOT=true": settings.enable_real_robot,
+            "DRY_RUN=false": not settings.dry_run,
+            "ENABLE_ARUCO_EXPERIMENT=true": settings.enable_aruco_experiment,
+            "ARUCO_EXPERIMENT_CELL_SAFETY_VERIFIED=true": (
+                settings.aruco_experiment_cell_safety_verified
+            ),
+        }
+        linear_profile = load_motion_profiles(
+            settings.repo_root / "configs/motion_profiles/default.json"
+        )["linear_slow"]
+        if (
+            linear_profile.linear_velocity_m_s is None
+            or linear_profile.linear_acceleration_m_s2 is None
+            or linear_profile.angular_velocity_rad_s is None
+            or linear_profile.angular_acceleration_rad_s2 is None
+        ):
+            raise ValueError("linear_slow must define linear and angular limits")
+        use_hardware_aruco = settings.aruco_experiment_hardware_enabled
+        self.aruco_experiment_controller = (
+            aruco_experiment_controller
+            or ArucoExperimentController(
+                robot_factory=(
+                    lambda: DoosanArucoExperimentRobot(
+                        robot_id=settings.doosan_robot_id,
+                        robot_model=settings.doosan_robot_model,
+                        execution_mode=settings.robot_execution_mode.value,
+                        hardware_enabled=settings.aruco_experiment_hardware_enabled,
+                    )
+                    if use_hardware_aruco
+                    else MockArucoExperimentRobot(
+                        active_tcp_name=settings.aruco_experiment_expected_tcp
+                    )
+                ),
+                mode="hardware" if use_hardware_aruco else "mock",
+                hardware_authorized=use_hardware_aruco,
+                gate_summary=aruco_gates,
+                reference_npz=settings.aruco_fixed_reference_npz,
+                runtime_npz=settings.aruco_runtime_workspace_npz,
+                expected_tcp_name=settings.aruco_experiment_expected_tcp,
+                joint_velocity_rad_s=(
+                    jog_profile.joint_velocity_rad_s * jog_profile.safety_scale
+                ),
+                joint_acceleration_rad_s2=(
+                    jog_profile.joint_acceleration_rad_s2 * jog_profile.safety_scale
+                ),
+                linear_velocity_m_s=(
+                    linear_profile.linear_velocity_m_s * linear_profile.safety_scale
+                ),
+                linear_acceleration_m_s2=(
+                    linear_profile.linear_acceleration_m_s2
+                    * linear_profile.safety_scale
+                ),
+                angular_velocity_rad_s=(
+                    linear_profile.angular_velocity_rad_s * linear_profile.safety_scale
+                ),
+                angular_acceleration_rad_s2=(
+                    linear_profile.angular_acceleration_rad_s2
+                    * linear_profile.safety_scale
+                ),
+            )
+        )
 
     def close(self) -> None:
         """Release database resources."""
 
+        self.aruco_experiment_controller.close()
         self.jog_controller.close()
         self.calibration_controller.close()
         self.camera_controller.close()
@@ -454,6 +528,9 @@ class MVPApplication:
     def get_jog_status(self) -> dict[str, Any]:
         return self.jog_controller.status()
 
+    def get_aruco_experiment_status(self) -> dict[str, Any]:
+        return self.aruco_experiment_controller.status()
+
     def enable_jog(self, request: dict[str, Any]) -> dict[str, Any]:
         with self._robot_motion_transition_lock:
             self._ensure_no_other_robot_motion("enable jog")
@@ -478,6 +555,48 @@ class MVPApplication:
             reason=str(request.get("reason") or "operator_request")
         )
 
+    def enable_aruco_experiment(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self._robot_motion_transition_lock:
+            self._ensure_aruco_motion_available("enable ArUco experiment")
+            return self.aruco_experiment_controller.enable(
+                operator_id=str(request.get("operator_id") or ""),
+                workspace_cleared=request.get("workspace_cleared") is True,
+                estop_ready=request.get("estop_ready") is True,
+                acknowledge_direct_motion=(
+                    request.get("acknowledge_direct_motion") is True
+                ),
+                object_width_mm=float(request["object_width_mm"]),
+                width_model=str(request.get("width_model") or "full-opening"),
+            )
+
+    def move_aruco_reference(self) -> dict[str, Any]:
+        self._ensure_aruco_motion_available("move ArUco reference")
+        return self.aruco_experiment_controller.move_to_reference()
+
+    def move_aruco_plane_z_test(self) -> dict[str, Any]:
+        self._ensure_aruco_motion_available("run ArUco +Z test")
+        return self.aruco_experiment_controller.move_plane_z_test()
+
+    def stop_aruco_experiment(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self.aruco_experiment_controller.stop(
+            reason=str(request.get("reason") or "operator_request")
+        )
+
+    def _ensure_aruco_motion_available(self, action: str) -> None:
+        with self._active_execution_lock:
+            if self._active_executions:
+                raise ValueError(f"cannot {action} while a skill execution is active")
+        if self.jog_controller.enabled:
+            raise ValueError(f"cannot {action} while web jog is enabled")
+        calibration = self.calibration_controller.status().get("session")
+        if isinstance(calibration, dict) and calibration.get("status") in {
+            "starting",
+            "moving_to_reference",
+            "running",
+            "aborting",
+        }:
+            raise ValueError(f"cannot {action} while hand-eye calibration is active")
+
     def _ensure_no_other_robot_motion(self, action: str) -> None:
         with self._active_execution_lock:
             if self._active_executions:
@@ -490,6 +609,8 @@ class MVPApplication:
             "aborting",
         }:
             raise ValueError(f"cannot {action} while hand-eye calibration is active")
+        if self.aruco_experiment_controller.enabled:
+            raise ValueError(f"cannot {action} while the ArUco experiment is enabled")
 
     def list_task_planes(self) -> dict[str, Any]:
         """List operator-confirmed task-plane revisions and their base-chain status."""
@@ -530,6 +651,10 @@ class MVPApplication:
         with self._robot_motion_transition_lock:
             if self.jog_controller.enabled:
                 raise ValueError("stop and disable jog before starting hand-eye calibration")
+            if self.aruco_experiment_controller.enabled:
+                raise ValueError(
+                    "stop and disable the ArUco experiment before hand-eye calibration"
+                )
             required = (
                 "operator_confirmed",
                 "board_secured",

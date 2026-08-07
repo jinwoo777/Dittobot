@@ -83,6 +83,13 @@ class Settings(BaseModel):
     calibration_cell_safety_verified: bool = False
     enable_web_jog: bool = False
     jog_cell_safety_verified: bool = False
+    enable_aruco_experiment: bool = False
+    aruco_experiment_cell_safety_verified: bool = False
+    aruco_experiment_expected_tcp: str = Field(
+        default="GripperDA_v1", min_length=1, max_length=64
+    )
+    aruco_fixed_reference_npz: Path
+    aruco_runtime_workspace_npz: Path
     doosan_robot_id: str = Field(default="dsr01", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
     doosan_robot_model: Literal["m0609"] = "m0609"
     handeye_legacy_npy_path: Path | None = None
@@ -106,7 +113,12 @@ class Settings(BaseModel):
     artifact_root: Path
     log_level: str = "INFO"
 
-    @field_validator("repo_root", "artifact_root")
+    @field_validator(
+        "repo_root",
+        "artifact_root",
+        "aruco_fixed_reference_npz",
+        "aruco_runtime_workspace_npz",
+    )
     @classmethod
     def _absolute_path(cls, value: Path) -> Path:
         if not value.is_absolute():
@@ -151,6 +163,23 @@ class Settings(BaseModel):
             raise ValueError("HANDEYE_LEGACY_NPY_PATH must stay under repo or artifact root")
         return self
 
+    @model_validator(mode="after")
+    def _aruco_artifacts_stay_within_managed_roots(self) -> Settings:
+        for path in (
+            self.aruco_fixed_reference_npz,
+            self.aruco_runtime_workspace_npz,
+        ):
+            if not (
+                path == self.repo_root
+                or path.is_relative_to(self.repo_root)
+                or path == self.artifact_root
+                or path.is_relative_to(self.artifact_root)
+            ):
+                raise ValueError("ArUco workspace paths must stay under repo or artifact root")
+        if self.aruco_fixed_reference_npz == self.aruco_runtime_workspace_npz:
+            raise ValueError("ArUco fixed reference and runtime workspace paths must differ")
+        return self
+
     @classmethod
     def from_env(
         cls,
@@ -177,6 +206,19 @@ class Settings(BaseModel):
         legacy_npy_path = Path(legacy_npy_text).expanduser() if legacy_npy_text else None
         if legacy_npy_path is not None and not legacy_npy_path.is_absolute():
             legacy_npy_path = resolved_root / legacy_npy_path
+        aruco_reference_path = Path(
+            env.get("ARUCO_FIXED_REFERENCE_NPZ", "aruco/fixed_workspace_reference.npz")
+        ).expanduser()
+        if not aruco_reference_path.is_absolute():
+            aruco_reference_path = resolved_root / aruco_reference_path
+        aruco_runtime_path = Path(
+            env.get(
+                "ARUCO_RUNTIME_WORKSPACE_NPZ",
+                "aruco/runtime/runtime_workspace.npz",
+            )
+        ).expanduser()
+        if not aruco_runtime_path.is_absolute():
+            aruco_runtime_path = resolved_root / aruco_runtime_path
         raw_key = env.get("OPENAI_API_KEY", "").strip()
         image_detail = env.get("OPENAI_IMAGE_DETAIL", "auto").lower()
         if image_detail not in {"auto", "low", "high"}:
@@ -235,6 +277,17 @@ class Settings(BaseModel):
             jog_cell_safety_verified=_bool_value(
                 env.get("JOG_CELL_SAFETY_VERIFIED"), default=False
             ),
+            enable_aruco_experiment=_bool_value(
+                env.get("ENABLE_ARUCO_EXPERIMENT"), default=False
+            ),
+            aruco_experiment_cell_safety_verified=_bool_value(
+                env.get("ARUCO_EXPERIMENT_CELL_SAFETY_VERIFIED"), default=False
+            ),
+            aruco_experiment_expected_tcp=env.get(
+                "ARUCO_EXPERIMENT_EXPECTED_TCP", "GripperDA_v1"
+            ),
+            aruco_fixed_reference_npz=aruco_reference_path.resolve(),
+            aruco_runtime_workspace_npz=aruco_runtime_path.resolve(),
             doosan_robot_id=env.get("DOOSAN_ROBOT_ID", "dsr01"),
             doosan_robot_model=cast(
                 Literal["m0609"], env.get("DOOSAN_ROBOT_MODEL", "m0609").lower()
@@ -300,6 +353,13 @@ class Settings(BaseModel):
             "calibration_cell_safety_verified": self.calibration_cell_safety_verified,
             "enable_web_jog": self.enable_web_jog,
             "jog_cell_safety_verified": self.jog_cell_safety_verified,
+            "enable_aruco_experiment": self.enable_aruco_experiment,
+            "aruco_experiment_cell_safety_verified": (
+                self.aruco_experiment_cell_safety_verified
+            ),
+            "aruco_experiment_expected_tcp": self.aruco_experiment_expected_tcp,
+            "aruco_fixed_reference_npz": str(self.aruco_fixed_reference_npz),
+            "aruco_runtime_workspace_npz": str(self.aruco_runtime_workspace_npz),
             "doosan_robot_id": self.doosan_robot_id,
             "doosan_robot_model": self.doosan_robot_model,
             "handeye_legacy_npy_configured": self.handeye_legacy_npy_path is not None,
@@ -361,4 +421,14 @@ class Settings(BaseModel):
             and not self.dry_run
             and self.enable_web_jog
             and self.jog_cell_safety_verified
+        )
+
+    @property
+    def aruco_experiment_hardware_enabled(self) -> bool:
+        """Require the dedicated experiment and cleared-cell gates."""
+
+        return (
+            self.hardware_enabled
+            and self.enable_aruco_experiment
+            and self.aruco_experiment_cell_safety_verified
         )
