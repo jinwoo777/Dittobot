@@ -20,6 +20,7 @@ def create_app(service: Any | None = None) -> Any:
         calibration,
         camera,
         catalog,
+        jog,
         runtime,
         scenes,
         skills,
@@ -51,6 +52,7 @@ def create_app(service: Any | None = None) -> Any:
     app.include_router(catalog.router)
     app.include_router(camera.router)
     app.include_router(calibration.router)
+    app.include_router(jog.router)
     app.include_router(task_planes.router)
 
     settings = getattr(service, "settings", None)

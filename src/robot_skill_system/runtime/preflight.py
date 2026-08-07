@@ -130,16 +130,18 @@ class MockGeometryValidator:
                         )
                     )
                 continue
-            if operation in {
-                "motion.move_j",
+            if operation == "motion.move_j":
+                # Joint targets have no Cartesian anchor to inspect here. The closed
+                # primitive schema validates six bounded finite angles, while runtime
+                # execution remains Mock-only until a hardware collision checker exists.
+                previous_cartesian_target = None
+            elif operation in {
                 "workspace.validate_target",
                 "workspace.check_target",
                 "workspace.request_replan",
             }:
                 target = _get(arguments, "target", "target_pose")
                 assessments.append(self.geometry.validate_target(target=target, scene=scene))
-                if operation == "motion.move_j":
-                    previous_cartesian_target = None
             elif operation == "motion.move_l":
                 target = _get(arguments, "target", "target_pose")
                 if previous_cartesian_target is None:
@@ -209,7 +211,6 @@ class MockGeometryValidator:
     @staticmethod
     def _is_geometry_relevant(operation: str) -> bool:
         return operation in {
-            "motion.move_j",
             "motion.move_l",
             "motion.move_c",
             "motion.move_spline",

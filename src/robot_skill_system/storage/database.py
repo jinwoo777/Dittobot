@@ -1718,6 +1718,38 @@ class StorageRepository:
             result = version
         return result
 
+    def deactivate_skill(self, skill_id: str) -> SkillVersionRecord:
+        """Retire the active version and clear the skill's active pointer."""
+
+        with self.database.session() as session:
+            skill = session.get(SkillRecord, skill_id)
+            if skill is None:
+                skill = session.scalar(
+                    select(SkillRecord).where(SkillRecord.name == skill_id)
+                )
+            if skill is None:
+                versions = list(session.scalars(select(SkillVersionRecord)))
+                matched = next(
+                    (
+                        version
+                        for version in versions
+                        if (version.graph_json or {}).get("skill_id") == skill_id
+                    ),
+                    None,
+                )
+                skill = matched.skill if matched is not None else None
+            if skill is None:
+                raise KeyError(f"unknown skill {skill_id!r}")
+            if skill.active_version_id is None:
+                raise ValueError("skill is already inactive")
+            active = session.get(SkillVersionRecord, skill.active_version_id)
+            if active is None:
+                raise KeyError(skill.active_version_id)
+            active.status = "retired"
+            skill.active_version_id = None
+            result = active
+        return result
+
     def rollback_skill(self, *, skill_id: str, target_version_id: str) -> SkillVersionRecord:
         with self.database.session() as session:
             target = session.get(SkillVersionRecord, target_version_id)

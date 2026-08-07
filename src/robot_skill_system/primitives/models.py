@@ -7,6 +7,7 @@ locally approved configuration profiles and are injected by the runtime.
 
 from __future__ import annotations
 
+import math
 import re
 from enum import Enum
 from typing import Any
@@ -54,8 +55,24 @@ class MotionTargetArguments(PrimitiveArguments):
     _validate_profile = field_validator("motion_profile_id")(validate_profile_id)
 
 
-class MoveJArguments(MotionTargetArguments):
-    """Anchor-relative Cartesian goal resolved to a safe joint path locally."""
+class MoveJArguments(PrimitiveArguments):
+    """Six-axis joint goal in radians with profile-owned motion limits."""
+
+    target_joint_positions_rad: list[float] = Field(min_length=6, max_length=6)
+    motion_profile_id: str = Field(
+        validation_alias=AliasChoices("motion_profile_id", "profile_id")
+    )
+
+    _validate_profile = field_validator("motion_profile_id")(validate_profile_id)
+
+    @field_validator("target_joint_positions_rad")
+    @classmethod
+    def validate_joint_positions(cls, value: list[float]) -> list[float]:
+        if any(not math.isfinite(position_rad) for position_rad in value):
+            raise ValueError("move_j joint positions must be finite")
+        if any(abs(position_rad) > 2.0 * math.pi for position_rad in value):
+            raise ValueError("move_j joint positions exceed the ±360 degree schema envelope")
+        return value
 
 
 class MoveLArguments(MotionTargetArguments):
