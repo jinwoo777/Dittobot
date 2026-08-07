@@ -92,6 +92,12 @@
       });
     }
 
+    deactivateSkill(skillId) {
+      return this.request(`/skills/${encodeURIComponent(skillId)}/deactivate`, {
+        method: "POST",
+      });
+    }
+
     skillEditorCatalog() {
       return this.request("/skills/editor/catalog");
     }
@@ -211,6 +217,31 @@
 
     abortHandeyeCalibration(reason = "operator_request") {
       return this.request("/calibration/hand-eye/abort", {
+        method: "POST",
+        body: { reason },
+      });
+    }
+
+    jogStatus() {
+      return this.request("/jog/status");
+    }
+
+    enableJog(payload) {
+      return this.request("/jog/enable", {
+        method: "POST",
+        body: payload,
+      });
+    }
+
+    moveJogJoint(jointIndex, deltaDeg) {
+      return this.request("/jog/joints", {
+        method: "POST",
+        body: { joint_index: jointIndex, delta_deg: deltaDeg },
+      });
+    }
+
+    stopJog(reason = "operator_request") {
+      return this.request("/jog/stop", {
         method: "POST",
         body: { reason },
       });

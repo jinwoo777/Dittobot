@@ -32,16 +32,37 @@
     .shell { display: grid; grid-template-columns: 270px minmax(0, 1fr); min-height: 100vh; }
     .sidebar { position: sticky; top: 0; height: 100vh; padding: 30px 22px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--panel); }
     .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
     .brand-logo {
       height: 50px;
       width: 50px;
       object-fit: contain;
       transform: translateY(-10px);
+    }
+    .sparkle {
+      position: absolute;
+      pointer-events: none;
+      opacity: 0;
+      z-index: 100;
+      animation: sparkleAnim var(--duration) ease-out forwards;
+    }
+
+    @keyframes sparkleAnim {
+      0% {
+        opacity: 0;
+        transform: translate(0,0) scale(0.2) rotate(0deg);
+      }
+
+      20% {
+        opacity: 1;
+      }
+
+      100% {
+        opacity: 0;
+        transform:
+          translate(var(--dx), var(--dy))
+          scale(1.3)
+          rotate(var(--rot));
+      }
     }
     .brand strong { display: block; font-size: 19px; }
     .brand small { display: block; margin-top: 3px; color: var(--muted); font: 12px ui-monospace, monospace; }
@@ -114,6 +135,20 @@
     .run-steps .done { color: var(--ok); }
     .run-steps .current { color: var(--accent); font-weight: 700; }
     .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .jog-layout { display: grid; grid-template-columns: minmax(280px, .75fr) minmax(420px, 1.25fr); gap: 18px; margin-top: 22px; }
+    .jog-safety-list { display: grid; gap: 11px; margin: 18px 0; }
+    .jog-safety-list label { display: flex; align-items: flex-start; gap: 9px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .jog-safety-list input[type="checkbox"] { margin-top: 3px; accent-color: var(--accent); }
+    .jog-operator { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+    .jog-operator input, .jog-step input { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .jog-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+    .jog-step { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .jog-step input { width: 100px; }
+    .jog-joints { display: grid; gap: 9px; }
+    .jog-joint { display: grid; grid-template-columns: 76px minmax(90px, 1fr) 80px 80px; align-items: center; gap: 9px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+    .jog-joint strong { font: 700 14px ui-monospace, monospace; }
+    .jog-angle { color: var(--muted); text-align: right; font: 13px ui-monospace, monospace; }
+    .jog-gates { max-height: 150px; margin: 12px 0 0; overflow: auto; color: var(--muted); white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; }
     .create-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 18px; margin-top: 26px; }
     .form-grid { display: grid; gap: 12px; }
     .form-grid label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
@@ -258,6 +293,8 @@
       .connection { margin-top: 18px; }
       main { padding: 32px 18px 56px; }
       .monitor-grid { grid-template-columns: 1fr; }
+      .jog-layout { grid-template-columns: 1fr; }
+      .jog-joint { grid-template-columns: 58px minmax(80px, 1fr) 68px 68px; }
       .create-layout { grid-template-columns: 1fr; }
       .camera-grid { grid-template-columns: 1fr; }
       .draft-semantic-grid { grid-template-columns: 1fr; }
@@ -759,6 +796,7 @@
     .block-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
     .block-card-head strong { font: 650 13px ui-monospace, monospace; }
     .block-parameters { display: grid; gap: 9px; }
+    .joint-angle-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
     .binding-editor { display: grid; gap: 9px; padding-top: 10px; border-top: 1px solid var(--border); }
     .binding-list { display: grid; gap: 9px; }
     .binding-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
@@ -820,6 +858,7 @@
       }
 
       .block-layout,
+      .joint-angle-grid,
       .binding-grid {
         grid-template-columns: 1fr;
       }
@@ -830,7 +869,8 @@
   <div class="shell">
     <aside class="sidebar">
       <div class="brand">
-        <img src="assets/ditto.png" alt="Dittobot Logo" class="brand-logo">
+        <img id="normal-logo" src="assets/ditto.png" alt="Dittobot Logo" class="brand-logo">
+        <img id="shiny-logo" src="assets/shiny_ditto.png" alt="Dittobot Logo" class="brand-logo", hidden>
 
         <div><strong>dittobot</strong><small>M0609 · RG2 · D435i</small></div>
       </div>
@@ -839,9 +879,10 @@
         <button type="button" data-page="create">스킬 만들기</button>
         <button type="button" data-page="detail">스킬 상세</button>
         <button type="button" data-page="monitor">실시간 모니터링</button>
+        <button type="button" data-page="jog">조그</button>
       </nav>
       <div class="connection">
-        <span class="mode">MOCK API</span>
+        <span id="execution-mode" class="mode">MOCK API</span>
         <div class="mini-status"><span id="connection-dot" class="dot"></span><span id="connection-label">FastAPI 연결 확인 중</span></div>
       </div>
     </aside>
@@ -1019,6 +1060,7 @@
         </section>
         <div class="actions">
           <button id="activate-skill" type="button" class="button primary">검증 후 활성화</button>
+          <button id="deactivate-skill" type="button" class="button danger" hidden>스킬 비활성화</button>
           <button type="button" class="button" data-page="skills">목록으로</button>
         </div>
       </section>
@@ -1069,10 +1111,44 @@
           </div>
         </div>
       </section>
+
+      <section id="page-jog" class="page" hidden>
+        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그</h1><p class="subtitle">M0609의 J1–J6를 한 번에 최대 5°씩 직접 이동합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
+        <div class="jog-layout">
+          <section class="panel">
+            <p class="eyebrow">SAFETY ENABLE</p>
+            <p id="jog-mode-notice" class="notice">조그 상태 확인 중…</p>
+            <label class="jog-operator" for="jog-operator-id">작업자 ID
+              <input id="jog-operator-id" type="text" value="ui_operator" maxlength="64" autocomplete="off">
+            </label>
+            <div class="jog-safety-list">
+              <label><input id="jog-workspace-cleared" type="checkbox"> 로봇 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
+              <label><input id="jog-estop-ready" type="checkbox"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
+              <label><input id="jog-direct-motion-ack" type="checkbox"> 아래 버튼을 누르면 로봇 관절이 직접 움직일 수 있음을 이해했습니다.</label>
+            </div>
+            <div class="actions">
+              <button id="jog-enable" type="button" class="button primary">조그 활성화</button>
+              <button id="jog-refresh" type="button" class="button">상태 새로고침</button>
+              <button id="jog-stop" type="button" class="button danger" disabled>정지 · 비활성화</button>
+            </div>
+            <p id="jog-status" class="recording-status" role="status" aria-live="polite">비활성</p>
+            <pre id="jog-gates" class="jog-gates"></pre>
+          </section>
+          <section class="panel">
+            <div class="jog-toolbar">
+              <div><p class="eyebrow">JOINT JOG · J1–J6</p><p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p></div>
+              <label class="jog-step" for="jog-step-deg">이동 간격 (0.1–5°)
+                <input id="jog-step-deg" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
+              </label>
+            </div>
+            <div id="jog-joint-list" class="jog-joints"></div>
+          </section>
+        </div>
+      </section>
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js"></script>
-  <script src="./app.js"></script>
+  <script src="./api-client.js?v=hs01-web-jog-5"></script>
+  <script src="./app.js?v=hs01-web-jog-5"></script>
 </body>
 </html>

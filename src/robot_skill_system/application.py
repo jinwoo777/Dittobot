@@ -87,6 +87,7 @@ from robot_skill_system.demonstrations.trajectory import (
     summarize_trajectory,
 )
 from robot_skill_system.exceptions import NotConfiguredError, RobotSkillError
+from robot_skill_system.jog.controller import DoosanJogRobot, JogController, MockJogRobot
 from robot_skill_system.openai_integration.demonstration_analyzer import DemonstrationAnalyzer
 from robot_skill_system.openai_integration.embeddings import (
     SkillEmbeddingService,
@@ -225,6 +226,7 @@ class MVPApplication:
         *,
         camera_controller: RGBDCameraController | None = None,
         calibration_controller: HandEyeCalibrationController | None = None,
+        jog_controller: JogController | None = None,
     ) -> None:
         self.settings = settings
         self.store = LocalArtifactStore(settings.artifact_root)
@@ -235,6 +237,7 @@ class MVPApplication:
         self._scenes: dict[str, SceneSnapshot] = {}
         self._active_executions: dict[str, ActiveExecution] = {}
         self._active_execution_lock = threading.RLock()
+        self._robot_motion_transition_lock = threading.RLock()
         self._recording_flange_starts: dict[str, dict[str, Any]] = {}
         real_sense_config = RealSenseCaptureConfig(
             width_px=settings.realsense_width_px,
@@ -284,10 +287,52 @@ class MVPApplication:
             legacy_npy_path=settings.handeye_legacy_npy_path,
             legacy_expected_tcp_name=settings.handeye_legacy_expected_tcp,
         )
+        jog_gates = {
+            "ROBOT_EXECUTION_MODE=hardware": (
+                settings.robot_execution_mode is SettingsExecutionMode.HARDWARE
+            ),
+            "ENABLE_HARDWARE_EXECUTION=true": settings.enable_hardware_execution,
+            "ROBOT_BACKEND=doosan": settings.robot_backend == "doosan",
+            "ENABLE_REAL_ROBOT=true": settings.enable_real_robot,
+            "DRY_RUN=false": not settings.dry_run,
+            "ENABLE_WEB_JOG=true": settings.enable_web_jog,
+            "JOG_CELL_SAFETY_VERIFIED=true": settings.jog_cell_safety_verified,
+        }
+        jog_profile = load_motion_profiles(
+            settings.repo_root / "configs/motion_profiles/default.json"
+        )["joint_safe"]
+        if (
+            jog_profile.joint_velocity_rad_s is None
+            or jog_profile.joint_acceleration_rad_s2 is None
+        ):
+            raise ValueError("joint_safe must define joint velocity and acceleration")
+        use_hardware_jog = settings.jog_hardware_enabled
+        self.jog_controller = jog_controller or JogController(
+            robot_factory=(
+                lambda: DoosanJogRobot(
+                    robot_id=settings.doosan_robot_id,
+                    robot_model=settings.doosan_robot_model,
+                    execution_mode=settings.robot_execution_mode.value,
+                    hardware_enabled=settings.jog_hardware_enabled,
+                )
+                if use_hardware_jog
+                else MockJogRobot()
+            ),
+            mode="hardware" if use_hardware_jog else "mock",
+            hardware_authorized=use_hardware_jog,
+            gate_summary=jog_gates,
+            joint_velocity_rad_s=(
+                jog_profile.joint_velocity_rad_s * jog_profile.safety_scale
+            ),
+            joint_acceleration_rad_s2=(
+                jog_profile.joint_acceleration_rad_s2 * jog_profile.safety_scale
+            ),
+        )
 
     def close(self) -> None:
         """Release database resources."""
 
+        self.jog_controller.close()
         self.calibration_controller.close()
         self.camera_controller.close()
         self.database.close()
@@ -406,6 +451,46 @@ class MVPApplication:
     def get_handeye_calibration_status(self) -> dict[str, Any]:
         return self.calibration_controller.status()
 
+    def get_jog_status(self) -> dict[str, Any]:
+        return self.jog_controller.status()
+
+    def enable_jog(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self._robot_motion_transition_lock:
+            self._ensure_no_other_robot_motion("enable jog")
+            return self.jog_controller.enable(
+                operator_id=str(request.get("operator_id") or ""),
+                workspace_cleared=request.get("workspace_cleared") is True,
+                estop_ready=request.get("estop_ready") is True,
+                acknowledge_direct_motion=(
+                    request.get("acknowledge_direct_motion") is True
+                ),
+            )
+
+    def move_jog_joint(self, request: dict[str, Any]) -> dict[str, Any]:
+        self._ensure_no_other_robot_motion("jog")
+        return self.jog_controller.move_joint(
+            joint_index=int(request["joint_index"]),
+            delta_deg=float(request["delta_deg"]),
+        )
+
+    def stop_jog(self, request: dict[str, Any]) -> dict[str, Any]:
+        return self.jog_controller.stop(
+            reason=str(request.get("reason") or "operator_request")
+        )
+
+    def _ensure_no_other_robot_motion(self, action: str) -> None:
+        with self._active_execution_lock:
+            if self._active_executions:
+                raise ValueError(f"cannot {action} while a skill execution is active")
+        calibration = self.calibration_controller.status().get("session")
+        if isinstance(calibration, dict) and calibration.get("status") in {
+            "starting",
+            "moving_to_reference",
+            "running",
+            "aborting",
+        }:
+            raise ValueError(f"cannot {action} while hand-eye calibration is active")
+
     def list_task_planes(self) -> dict[str, Any]:
         """List operator-confirmed task-plane revisions and their base-chain status."""
 
@@ -442,12 +527,22 @@ class MVPApplication:
         }
 
     def start_handeye_calibration(self, request: dict[str, Any]) -> dict[str, Any]:
-        required = ("operator_confirmed", "board_secured", "workspace_cleared", "estop_ready")
-        if not all(request.get(key) is True for key in required):
-            raise ValueError("all hand-eye calibration safety acknowledgements are required")
-        return self.calibration_controller.start(
-            operator_id=str(request.get("operator_id") or "operator")
-        )
+        with self._robot_motion_transition_lock:
+            if self.jog_controller.enabled:
+                raise ValueError("stop and disable jog before starting hand-eye calibration")
+            required = (
+                "operator_confirmed",
+                "board_secured",
+                "workspace_cleared",
+                "estop_ready",
+            )
+            if not all(request.get(key) is True for key in required):
+                raise ValueError(
+                    "all hand-eye calibration safety acknowledgements are required"
+                )
+            return self.calibration_controller.start(
+                operator_id=str(request.get("operator_id") or "operator")
+            )
 
     def abort_handeye_calibration(self, request: dict[str, Any]) -> dict[str, Any]:
         return self.calibration_controller.abort(
@@ -3448,6 +3543,15 @@ class MVPApplication:
             "deleted_artifacts": deleted_artifacts,
         }
 
+    def deactivate_skill(self, skill_id: str) -> dict[str, Any]:
+        """Retire the currently active version without deleting its history."""
+
+        retired = self.repository.deactivate_skill(skill_id)
+        return {
+            "deactivated": True,
+            **self._version_summary(retired, include_graph=False),
+        }
+
     @staticmethod
     def _catalog_entry_summary(entry: SemanticCatalogRecord) -> dict[str, Any]:
         return {
@@ -4461,6 +4565,8 @@ class MVPApplication:
 
         def default_value(item: dict[str, Any], field_name: str) -> Any:
             resolved = resolve(item)
+            if field_name == "target_joint_positions_rad":
+                return [0.0] * 6
             if field_name == "motion_profile_id":
                 options = profile_options["motion_profile_ids"]
                 return options[0] if options else ""
@@ -5136,6 +5242,8 @@ class MVPApplication:
         return report.as_dict()
 
     def execute_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.jog_controller.enabled:
+            raise ValueError("stop and disable jog before executing a skill")
         requested_mode = str(request.get("mode", "mock"))
         mock_override = request.get("mock_override")
         if mock_override is not None:

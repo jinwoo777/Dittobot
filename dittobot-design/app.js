@@ -32,6 +32,11 @@
       loading: false,
       lastError: null,
     },
+    jog: {
+      status: null,
+      loading: false,
+      lastError: null,
+    },
     recordingReview: {
       recordings: [],
       selectedId: null,
@@ -81,6 +86,7 @@
     banner: element("api-banner"),
     connectionDot: element("connection-dot"),
     connectionLabel: element("connection-label"),
+    executionMode: element("execution-mode"),
     skillList: element("skill-list"),
     skillEmpty: element("skill-empty"),
     taskFlowCatalog: element("task-flow-catalog"),
@@ -105,6 +111,7 @@
     detailNodes: element("detail-nodes"),
     validateSkill: element("validate-skill"),
     activateSkill: element("activate-skill"),
+    deactivateSkill: element("deactivate-skill"),
     runStatus: element("run-status"),
     runTitle: element("run-title"),
     runSteps: element("run-steps"),
@@ -127,6 +134,18 @@
     calibrationProgress: element("calibration-progress"),
     calibrationStatus: element("calibration-status"),
     calibrationResult: element("calibration-result"),
+    jogModeNotice: element("jog-mode-notice"),
+    jogOperatorId: element("jog-operator-id"),
+    jogWorkspaceCleared: element("jog-workspace-cleared"),
+    jogEstopReady: element("jog-estop-ready"),
+    jogDirectMotionAck: element("jog-direct-motion-ack"),
+    jogEnable: element("jog-enable"),
+    jogRefresh: element("jog-refresh"),
+    jogStop: element("jog-stop"),
+    jogStatus: element("jog-status"),
+    jogGates: element("jog-gates"),
+    jogStepDeg: element("jog-step-deg"),
+    jogJointList: element("jog-joint-list"),
     recordingSelect: element("recording-select"),
     refreshRecordings: element("refresh-recordings"),
     recordedRgbFrame: element("recorded-rgb-frame"),
@@ -281,6 +300,10 @@
   }
 
   function renderConnection() {
+    const hardwareJog = state.jog.status?.capabilities?.mode === "hardware";
+    dom.executionMode.textContent = hardwareJog ? "HARDWARE JOG" : "MOCK API";
+    dom.executionMode.style.color = hardwareJog ? "var(--danger)" : "";
+    dom.executionMode.style.background = hardwareJog ? "var(--danger-soft)" : "";
     dom.connectionDot.className = "dot";
     if (state.apiStatus === "connected") {
       dom.connectionDot.classList.add("ok");
@@ -306,6 +329,10 @@
     });
     if (page === "detail") renderDetail();
     if (page === "monitor") renderMonitor();
+    if (page === "jog") {
+      renderJog();
+      refreshJogStatus({ quiet: true });
+    }
     if (page === "create") {
       renderCreateMode();
       if (state.editor.createMode === "recording") {
@@ -336,6 +363,27 @@
     } catch (error) {
       button.disabled = false;
       setBanner(`스킬 삭제 실패: ${errorText(error)}`, "danger");
+    }
+  }
+
+  async function deactivateActiveSkill(skill, button) {
+    const confirmed = window.confirm(
+      `${skill.id} v${skill.version}을 비활성화하시겠습니까?\n\n실행 대상에서 제외되고 retired 상태로 보존됩니다.`,
+    );
+    if (!confirmed) return;
+    button.disabled = true;
+    setBanner(`${skill.id} v${skill.version} 비활성화 중…`);
+    try {
+      const result = await api.deactivateSkill(skill.id);
+      if (state.run.skillKey === skill.key) {
+        state.run.skillKey = null;
+        state.run.runId = null;
+        state.run.status = "idle";
+      }
+      await loadRegistry(`${result.skill_id} v${result.version} 비활성화 완료`);
+    } catch (error) {
+      button.disabled = false;
+      setBanner(`스킬 비활성화 실패: ${errorText(error)}`, "danger");
     }
   }
 
@@ -412,6 +460,18 @@
       deleteButton.addEventListener("click", () => {
         deleteInactiveSkill(skill, deleteButton);
       });
+      if (skill.uiState === "active") {
+        const deactivateButton = create("button", {
+          className: "button danger",
+          text: "비활성화",
+        });
+        deactivateButton.type = "button";
+        deactivateButton.disabled = state.apiStatus !== "connected";
+        deactivateButton.addEventListener("click", () => {
+          deactivateActiveSkill(skill, deactivateButton);
+        });
+        actions.append(deactivateButton);
+      }
       actions.append(deleteButton);
       if (skill.uiState === "active") {
         const run = create("button", { className: "button primary", text: "Mock 실행" });
@@ -910,11 +970,62 @@
     parent.append(wrapper);
   }
 
+  function renderMoveJArgumentEditor(parent, primitive, argumentsValue, onChange) {
+    const values = argumentsValue || {};
+    const positionsRad = Array.isArray(values.target_joint_positions_rad)
+      && values.target_joint_positions_rad.length === 6
+      ? values.target_joint_positions_rad.map(Number)
+      : Array(6).fill(0);
+    const jointGrid = create("div", { className: "joint-angle-grid" });
+    positionsRad.forEach((positionRad, index) => {
+      const wrapper = create("label", { className: "schema-field" });
+      wrapper.append(create("span", { text: `joint${index + 1} (deg)` }));
+      const input = create("input");
+      input.type = "number";
+      input.min = "-360";
+      input.max = "360";
+      input.step = "0.1";
+      input.value = String(Number((positionRad * 180 / Math.PI).toFixed(3)));
+      input.addEventListener("change", () => {
+        const degrees = Number(input.value);
+        if (!Number.isFinite(degrees)) return;
+        const nextPositions = positionsRad.slice();
+        nextPositions[index] = degrees * Math.PI / 180;
+        onChange({
+          ...values,
+          target_joint_positions_rad: nextPositions,
+        });
+      });
+      wrapper.append(input);
+      jointGrid.append(wrapper);
+    });
+    parent.append(jointGrid);
+    parent.append(create("p", {
+      className: "notice",
+      text: "입력은 degree로 표시되며 SkillGraph에는 radian으로 저장됩니다.",
+    }));
+    const profileSchema = primitive.typed_parameter_schema.properties?.motion_profile_id;
+    if (profileSchema) {
+      renderEditorControl({
+        parent,
+        schema: profileSchema,
+        value: values.motion_profile_id,
+        fieldName: "motion_profile_id",
+        primitive,
+        setValue: (profileId) => onChange({ ...values, motion_profile_id: profileId }),
+      });
+    }
+  }
+
   function renderArgumentEditor(parent, primitive, argumentsValue, onChange) {
     parent.replaceChildren();
     const schema = primitive?.typed_parameter_schema;
     if (!schema) {
       parent.append(create("p", { className: "notice", text: "primitive schema를 찾을 수 없습니다." }));
+      return;
+    }
+    if (primitive.operation_name === "motion.move_j") {
+      renderMoveJArgumentEditor(parent, primitive, argumentsValue, onChange);
       return;
     }
     const values = argumentsValue || {};
@@ -927,6 +1038,15 @@
         primitive,
         setValue: (fieldValue) => onChange({ ...values, [fieldName]: fieldValue }),
       });
+    });
+  }
+
+  const HIDDEN_BLOCKLY_CATEGORIES = new Set(["grasp", "gripper", "workspace"]);
+
+  function blocklyToolboxPrimitives() {
+    return state.editor.catalog.filter((primitive) => {
+      const category = primitive.operation_name.split(".")[0];
+      return !HIDDEN_BLOCKLY_CATEGORIES.has(category);
     });
   }
 
@@ -950,8 +1070,9 @@
 
   function renderPrimitiveOptions() {
     const selected = dom.blockOperationSelect.value;
+    const toolboxPrimitives = blocklyToolboxPrimitives();
     dom.blockOperationSelect.replaceChildren();
-    state.editor.catalog.forEach((primitive) => {
+    toolboxPrimitives.forEach((primitive) => {
       const option = create("option", {
         text: `${primitive.operation_name} · ${primitive.description}`,
       });
@@ -959,7 +1080,7 @@
       option.selected = primitive.operation_name === selected;
       dom.blockOperationSelect.append(option);
     });
-    dom.addSkillBlock.disabled = !state.editor.catalog.length || !window.Blockly;
+    dom.addSkillBlock.disabled = !toolboxPrimitives.length || !window.Blockly;
   }
 
   function blocklyTypeForOperation(operation) {
@@ -1019,7 +1140,7 @@
 
   function buildBlocklyToolbox() {
     const groups = new Map();
-    state.editor.catalog.forEach((primitive) => {
+    blocklyToolboxPrimitives().forEach((primitive) => {
       const group = primitive.operation_name.split(".")[0] || "primitive";
       if (!groups.has(group)) groups.set(group, []);
       groups.get(group).push({
@@ -1113,13 +1234,18 @@
       zoom: { controls: true, wheel: true, startScale: 0.9, maxScale: 1.4, minScale: 0.5 },
       grid: { spacing: 24, length: 3, colour: "#d7d3e4", snap: true },
     });
-    state.editor.blocklyCatalogSignature = state.editor.catalog
+    state.editor.blocklyCatalogSignature = blocklyToolboxPrimitives()
       .map((primitive) => primitive.operation_name)
       .join("|");
     state.editor.workspace.addChangeListener((event) => {
-      if (event.isUiEvent && event.type !== "selected") return;
       if (event.type === "selected") {
-        state.editor.selectedBlocklyBlockId = event.newElementId || null;
+        // Clicking the parameter panel is outside Blockly, so Blockly emits a
+        // deselection with newElementId=null. Preserve the last real block
+        // selection instead of falling back to the first block in the chain.
+        if (!event.newElementId) return;
+        state.editor.selectedBlocklyBlockId = event.newElementId;
+      } else if (event.isUiEvent) {
+        return;
       }
       syncBlocksFromBlockly();
       renderSkillBlocks();
@@ -1132,7 +1258,7 @@
     if (!window.Blockly) {
       state.editor.blocklyError = "Blockly 라이브러리를 불러오지 못했습니다.";
     } else if (state.editor.workspace && state.editor.catalog.length) {
-      const signature = state.editor.catalog
+      const signature = blocklyToolboxPrimitives()
         .map((primitive) => primitive.operation_name)
         .join("|");
       if (signature !== state.editor.blocklyCatalogSignature) {
@@ -1214,6 +1340,9 @@
     dom.detailNodes.replaceChildren();
     dom.validateSkill.disabled = !skill || state.apiStatus !== "connected";
     dom.activateSkill.disabled = !skill || state.apiStatus !== "connected" || skill.uiState === "active";
+    dom.activateSkill.hidden = Boolean(skill && skill.uiState === "active");
+    dom.deactivateSkill.hidden = !skill || skill.uiState !== "active";
+    dom.deactivateSkill.disabled = !skill || state.apiStatus !== "connected";
     if (!skill) {
       dom.detailTitle.textContent = "스킬을 선택하세요";
       dom.detailSubtitle.textContent = "스킬 관리 화면에서 버전을 선택해 주세요.";
@@ -1276,6 +1405,161 @@
     const canAbort = Boolean(state.run.runId) && ["starting", "running", "aborting"].includes(state.run.status);
     dom.abortRun.disabled = !canAbort;
     dom.estopRun.disabled = !canAbort;
+  }
+
+  function renderJog() {
+    const payload = state.jog.status;
+    const capabilities = payload?.capabilities || {};
+    const enabled = payload?.enabled === true;
+    const hardware = capabilities.mode === "hardware";
+    const busy = state.jog.loading;
+    const positions = Array.isArray(payload?.joint_positions_deg)
+      ? payload.joint_positions_deg
+      : [0, 0, 0, 0, 0, 0];
+
+    dom.jogModeNotice.textContent = hardware
+      ? "실제 M0609 하드웨어 조그 모드입니다. 버튼을 누르면 로봇이 즉시 이동합니다."
+      : "MOCK 조그 모드입니다. 화면의 관절값만 변경되며 실제 로봇은 움직이지 않습니다.";
+    renderConnection();
+    dom.jogModeNotice.style.color = hardware ? "var(--danger)" : "";
+    dom.jogStatus.textContent = state.jog.lastError
+      ? `오류 · ${state.jog.lastError}`
+      : enabled
+        ? `● 활성 · ${payload.operator_id || "operator"} · ${payload.adapter_name || capabilities.mode}`
+        : "○ 비활성 · 안전 확인 후 활성화하세요.";
+    dom.jogStatus.style.color = state.jog.lastError
+      ? "var(--danger)"
+      : enabled ? "var(--ok)" : "";
+
+    const failedGates = Array.isArray(capabilities.failed_gates)
+      ? capabilities.failed_gates
+      : [];
+    dom.jogGates.textContent = hardware
+      ? `실제 로봇 gate: 모두 통과\n최대 이동: ${capabilities.maximum_step_deg || 5}°/요청`
+      : `실제 로봇은 비활성화됨${failedGates.length ? `\n닫힌 gate:\n- ${failedGates.join("\n- ")}` : ""}\n현재 조작은 MOCK 전용`;
+
+    dom.jogEnable.disabled = busy || enabled || state.apiStatus !== "connected";
+    dom.jogRefresh.disabled = busy || state.apiStatus !== "connected";
+    dom.jogStop.disabled = busy || !enabled;
+    dom.jogOperatorId.disabled = enabled || busy;
+    dom.jogWorkspaceCleared.disabled = enabled || busy;
+    dom.jogEstopReady.disabled = enabled || busy;
+    dom.jogDirectMotionAck.disabled = enabled || busy;
+    dom.jogStepDeg.disabled = busy;
+    dom.jogJointList.replaceChildren();
+    for (let jointIndex = 1; jointIndex <= 6; jointIndex += 1) {
+      const row = create("div", { className: "jog-joint" });
+      const limits = capabilities.joint_limits_deg?.[jointIndex - 1];
+      const name = create("strong", { text: `J${jointIndex}` });
+      if (limits) name.title = `허용 범위 ${limits.minimum}° .. ${limits.maximum}°`;
+      const angle = create("span", {
+        className: "jog-angle",
+        text: `${Number(positions[jointIndex - 1] || 0).toFixed(3)}°`,
+      });
+      const minus = create("button", { className: "button", text: "− 이동" });
+      const plus = create("button", { className: "button primary", text: "+ 이동" });
+      minus.type = "button";
+      plus.type = "button";
+      minus.disabled = !enabled || busy;
+      plus.disabled = !enabled || busy;
+      minus.addEventListener("click", () => moveJogJoint(jointIndex, -1));
+      plus.addEventListener("click", () => moveJogJoint(jointIndex, 1));
+      row.append(name, angle, minus, plus);
+      dom.jogJointList.append(row);
+    }
+  }
+
+  async function refreshJogStatus({ quiet = false } = {}) {
+    if (state.apiStatus !== "connected") return;
+    try {
+      const wasEnabled = state.jog.status?.enabled === true;
+      state.jog.status = await api.jogStatus();
+      if (wasEnabled && state.jog.status?.enabled !== true) {
+        dom.jogWorkspaceCleared.checked = false;
+        dom.jogEstopReady.checked = false;
+        dom.jogDirectMotionAck.checked = false;
+      }
+      state.jog.lastError = null;
+    } catch (error) {
+      state.jog.lastError = errorText(error);
+      if (!quiet) setBanner(`조그 상태 확인 실패: ${errorText(error)}`, "danger");
+    }
+    renderJog();
+  }
+
+  async function enableJog() {
+    if (
+      !dom.jogWorkspaceCleared.checked
+      || !dom.jogEstopReady.checked
+      || !dom.jogDirectMotionAck.checked
+    ) {
+      setBanner("조그 활성화 전에 세 가지 안전 항목을 모두 확인하세요.", "danger");
+      return;
+    }
+    state.jog.loading = true;
+    state.jog.lastError = null;
+    renderJog();
+    try {
+      state.jog.status = await api.enableJog({
+        operator_id: dom.jogOperatorId.value.trim() || "ui_operator",
+        workspace_cleared: true,
+        estop_ready: true,
+        acknowledge_direct_motion: true,
+      });
+      const hardware = state.jog.status?.capabilities?.mode === "hardware";
+      setBanner(
+        hardware ? "실제 로봇 조그가 활성화되었습니다. 로봇 주변에 접근하지 마세요." : "MOCK 조그가 활성화되었습니다.",
+        hardware ? "danger" : "ok",
+      );
+    } catch (error) {
+      state.jog.lastError = errorText(error);
+      setBanner(`조그 활성화 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.jog.loading = false;
+      renderJog();
+    }
+  }
+
+  async function moveJogJoint(jointIndex, direction) {
+    const step = Number(dom.jogStepDeg.value);
+    if (!Number.isFinite(step) || step < 0.1 || step > 5) {
+      setBanner("조그 이동 간격은 0.1° 이상 5° 이하여야 합니다.", "danger");
+      return;
+    }
+    state.jog.loading = true;
+    renderJog();
+    try {
+      state.jog.status = await api.moveJogJoint(jointIndex, direction * step);
+      state.jog.lastError = null;
+      setBanner(`J${jointIndex} ${direction > 0 ? "+" : "−"}${step}° 이동 완료`, "ok");
+    } catch (error) {
+      state.jog.lastError = errorText(error);
+      setBanner(`J${jointIndex} 조그 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.jog.loading = false;
+      renderJog();
+    }
+  }
+
+  async function stopJog() {
+    const hardware = state.jog.status?.capabilities?.mode === "hardware";
+    if (hardware && !window.confirm("로봇 stop을 요청하고 조그를 비활성화할까요?")) return;
+    state.jog.loading = true;
+    renderJog();
+    try {
+      state.jog.status = await api.stopJog("ui_operator_request");
+      state.jog.lastError = null;
+      dom.jogWorkspaceCleared.checked = false;
+      dom.jogEstopReady.checked = false;
+      dom.jogDirectMotionAck.checked = false;
+      setBanner("조그 정지 및 비활성화 완료", "ok");
+    } catch (error) {
+      state.jog.lastError = errorText(error);
+      setBanner(`조그 정지 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.jog.loading = false;
+      renderJog();
+    }
   }
 
   function renderCamera() {
@@ -1848,6 +2132,7 @@
     renderRegistry();
     if (state.page === "detail") renderDetail();
     if (state.page === "monitor") renderMonitor();
+    if (state.page === "jog") renderJog();
     if (state.page === "create") {
       renderCreateMode();
       if (state.editor.createMode === "recording") renderRecordingReview();
@@ -2422,6 +2707,10 @@
   });
   dom.validateSkill.addEventListener("click", validateSelected);
   dom.activateSkill.addEventListener("click", activateSelected);
+  dom.deactivateSkill.addEventListener("click", () => {
+    const skill = selectedSkill();
+    if (skill) deactivateActiveSkill(skill, dom.deactivateSkill);
+  });
   dom.closeDraftInspector.addEventListener("click", () => {
     state.selectedDraftId = null;
     renderRegistry();
@@ -2445,6 +2734,9 @@
   dom.startHandeyeCalibration.addEventListener("click", startHandeyeCalibration);
   dom.abortHandeyeCalibration.addEventListener("click", abortHandeyeCalibration);
   dom.importLegacyHandeye.addEventListener("click", importLegacyHandeyeNpy);
+  dom.jogEnable.addEventListener("click", enableJog);
+  dom.jogRefresh.addEventListener("click", () => refreshJogStatus({ quiet: false }));
+  dom.jogStop.addEventListener("click", stopJog);
   dom.recordingSelect.addEventListener("change", () => {
     stopRecordingPlayback();
     cancelGeometryTeaching();
@@ -2478,10 +2770,71 @@
   dom.createParameterCandidate.addEventListener("click", createParameterCandidate);
   window.addEventListener("resize", renderGeometryMarkers);
 
+  const normalLogo = document.getElementById("normal-logo");
+  const shinyLogo = document.getElementById("shiny-logo");
+
+  function spawnSparkle(side) {
+    const sparkle = document.createElement("img");
+
+    sparkle.src = "assets/sparkle.png";
+    sparkle.className = "sparkle";
+
+    // 왼쪽 / 오른쪽 시작 위치
+    const x = side === "left"
+      ? 18 + Math.random() * 8
+      : 62 + Math.random() * 8;
+
+    const y = 25 + Math.random() * 10;
+
+    sparkle.style.left = `${x}px`;
+    sparkle.style.top = `${y}px`;
+
+    // 랜덤 크기
+    const size = 12 + Math.random() * 14;
+    sparkle.style.width = `${size}px`;
+    sparkle.style.height = `${size}px`;
+
+    // 랜덤 이동
+    sparkle.style.setProperty("--dx", `${(Math.random() - 0.5) * 30}px`);
+    sparkle.style.setProperty("--dy", `${-20 - Math.random() * 20}px`);
+
+    // 랜덤 회전
+    sparkle.style.setProperty("--rot", `${Math.random() * 360}deg`);
+
+    // 랜덤 속도
+    sparkle.style.setProperty(
+      "--duration",
+      `${0.5 + Math.random() * 0.4}s`
+    );
+
+    document.querySelector(".brand").appendChild(sparkle);
+
+    sparkle.addEventListener("animationend", () => sparkle.remove());
+  }
+
+  function toggleShinyLogo() {
+    const shiny = shinyLogo.hidden;
+
+    shinyLogo.hidden = !shiny;
+    normalLogo.hidden = shiny;
+
+    // 일반 → Shiny로 바뀔 때만 반짝이 생성
+    if (shiny) {
+      spawnSparkle("left");
+
+      setTimeout(() => {
+        spawnSparkle("right");
+      }, 120);
+    }
+  }
+  normalLogo?.addEventListener("dblclick", toggleShinyLogo);
+  shinyLogo?.addEventListener("dblclick", toggleShinyLogo);
+
   renderAll();
   loadRegistry().then(() => Promise.all([
     refreshCameraStatus(),
     refreshHandeyeCalibrationStatus(),
+    refreshJogStatus({ quiet: true }),
   ])).catch(() => undefined);
   window.setInterval(() => {
     if (state.camera.state === "streaming" || state.camera.recordingId) {
@@ -2490,6 +2843,9 @@
     if (["starting", "moving_to_reference", "running", "aborting"]
       .includes(state.calibration.session?.status)) {
       refreshHandeyeCalibrationStatus();
+    }
+    if (state.page === "jog" || state.jog.status?.enabled) {
+      refreshJogStatus({ quiet: true });
     }
   }, 1000);
 })();

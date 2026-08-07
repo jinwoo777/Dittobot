@@ -88,7 +88,7 @@ def builtin_primitive_definitions() -> tuple[PrimitiveDefinition, ...]:
     return (
         _definition(
             "motion.move_j",
-            "Plan and execute a joint-space path to an anchor-relative TCP goal.",
+            "Execute a joint-space path to six validated joint angles.",
             MoveJArguments,
             allowed_skill_types=motion_types,
             required_preconditions=("workspace_valid", "motion_profile_loaded"),

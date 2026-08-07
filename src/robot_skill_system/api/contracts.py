@@ -69,6 +69,36 @@ class HandEyeCalibrationAbortRequest(APIModel):
     reason: str = Field(default="operator_request", min_length=1, max_length=128)
 
 
+class JogEnableRequest(APIModel):
+    operator_id: str = Field(default="ui_operator", min_length=1, max_length=64)
+    workspace_cleared: bool
+    estop_ready: bool
+    acknowledge_direct_motion: bool
+
+    @model_validator(mode="after")
+    def validate_safety_acknowledgements(self) -> JogEnableRequest:
+        if not all(
+            (self.workspace_cleared, self.estop_ready, self.acknowledge_direct_motion)
+        ):
+            raise ValueError("all jog safety acknowledgements are required")
+        return self
+
+
+class JogJointMoveRequest(APIModel):
+    joint_index: int = Field(ge=1, le=6)
+    delta_deg: float = Field(ge=-5.0, le=5.0)
+
+    @model_validator(mode="after")
+    def validate_non_zero_delta(self) -> JogJointMoveRequest:
+        if self.delta_deg == 0.0:
+            raise ValueError("jog delta must be non-zero")
+        return self
+
+
+class JogStopRequest(APIModel):
+    reason: str = Field(default="operator_request", min_length=1, max_length=128)
+
+
 class HandEyeLegacyImportRequest(APIModel):
     operator_id: str = Field(default="operator", min_length=1, max_length=64)
     operator_confirmed: bool

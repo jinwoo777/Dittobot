@@ -81,6 +81,8 @@ class Settings(BaseModel):
     enable_handeye_calibration: bool = False
     calibration_pose_plan_approved: bool = False
     calibration_cell_safety_verified: bool = False
+    enable_web_jog: bool = False
+    jog_cell_safety_verified: bool = False
     doosan_robot_id: str = Field(default="dsr01", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
     doosan_robot_model: Literal["m0609"] = "m0609"
     handeye_legacy_npy_path: Path | None = None
@@ -229,6 +231,10 @@ class Settings(BaseModel):
             calibration_cell_safety_verified=_bool_value(
                 env.get("CALIBRATION_CELL_SAFETY_VERIFIED"), default=False
             ),
+            enable_web_jog=_bool_value(env.get("ENABLE_WEB_JOG"), default=False),
+            jog_cell_safety_verified=_bool_value(
+                env.get("JOG_CELL_SAFETY_VERIFIED"), default=False
+            ),
             doosan_robot_id=env.get("DOOSAN_ROBOT_ID", "dsr01"),
             doosan_robot_model=cast(
                 Literal["m0609"], env.get("DOOSAN_ROBOT_MODEL", "m0609").lower()
@@ -292,6 +298,8 @@ class Settings(BaseModel):
             "enable_handeye_calibration": self.enable_handeye_calibration,
             "calibration_pose_plan_approved": self.calibration_pose_plan_approved,
             "calibration_cell_safety_verified": self.calibration_cell_safety_verified,
+            "enable_web_jog": self.enable_web_jog,
+            "jog_cell_safety_verified": self.jog_cell_safety_verified,
             "doosan_robot_id": self.doosan_robot_id,
             "doosan_robot_model": self.doosan_robot_model,
             "handeye_legacy_npy_configured": self.handeye_legacy_npy_path is not None,
@@ -341,4 +349,16 @@ class Settings(BaseModel):
             and self.enable_handeye_calibration
             and self.calibration_pose_plan_approved
             and self.calibration_cell_safety_verified
+        )
+
+    @property
+    def jog_hardware_enabled(self) -> bool:
+        """Require explicit web-jog and cell acknowledgements on top of hardware gates."""
+
+        return (
+            self.hardware_enabled
+            and self.enable_real_robot
+            and not self.dry_run
+            and self.enable_web_jog
+            and self.jog_cell_safety_verified
         )

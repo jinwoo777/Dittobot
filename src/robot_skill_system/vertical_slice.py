@@ -192,8 +192,8 @@ def build_wipe_skill_graph() -> tuple[SkillGraph, list[str]]:
                 ),
                 SkillNode(
                     node_id="approach_joint",
-                    operation="motion.move_j",
-                    arguments={"target": pre_approach, "motion_profile_id": "joint_safe"},
+                    operation="motion.move_l",
+                    arguments={"target": pre_approach, "motion_profile_id": "linear_slow"},
                     on_success="approach_linear",
                     checkpoint="pre_approach",
                 ),
