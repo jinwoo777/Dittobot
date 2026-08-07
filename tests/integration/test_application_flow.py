@@ -75,6 +75,7 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/calibration/hand-eye/abort",
         "/calibration/hand-eye/import-legacy-npy",
         "/calibration/task-planes",
+        "/jog/movej",
         "/aruco-experiment/status",
         "/aruco-experiment/enable",
         "/aruco-experiment/move-reference",

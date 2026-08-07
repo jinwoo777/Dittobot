@@ -89,7 +89,7 @@ class DoosanJogRobot(DoosanHandEyeCalibrationRobot):
 
 
 class JogController:
-    """Own one acknowledged jog session and execute bounded joint increments."""
+    """Own one acknowledged jog session and execute validated joint targets."""
 
     def __init__(
         self,
@@ -226,6 +226,35 @@ class JogController:
             target[joint_index - 1] += math.radians(delta_deg)
             target_vector = cast(JointVector, tuple(target))
             self._validate_joint_limits(target_vector)
+            self._robot.move_joints(
+                target_vector,
+                velocity_rad_s=self.joint_velocity_rad_s,
+                acceleration_rad_s2=self.joint_acceleration_rad_s2,
+            )
+            self._joint_positions_rad = self._robot.get_joint_positions_rad()
+            self._last_move_at_ns = time.time_ns()
+            self._last_error = None
+            return self.status()
+
+    def move_to_joint_positions(
+        self, *, target_joint_positions_deg: tuple[float, ...]
+    ) -> dict[str, Any]:
+        """Execute one MoveJ for a complete operator-entered six-axis target."""
+
+        if len(target_joint_positions_deg) != 6 or any(
+            not math.isfinite(value) for value in target_joint_positions_deg
+        ):
+            raise ValueError("movej target must contain six finite joint angles")
+        target_vector = cast(
+            JointVector,
+            tuple(math.radians(value) for value in target_joint_positions_deg),
+        )
+        self._validate_joint_limits(target_vector)
+        with self._lock:
+            if not self._enabled or self._robot is None:
+                raise ValueError("enable jog and acknowledge safety before moving")
+            current = self._robot.get_joint_positions_rad()
+            self._validate_joint_vector(current)
             self._robot.move_joints(
                 target_vector,
                 velocity_rad_s=self.joint_velocity_rad_s,

@@ -37,6 +37,8 @@
       status: null,
       loading: false,
       lastError: null,
+      targetPositionsDeg: null,
+      targetDirty: false,
     },
     arucoExperiment: {
       status: null,
@@ -153,6 +155,8 @@
     jogGates: element("jog-gates"),
     jogStepDeg: element("jog-step-deg"),
     jogJointList: element("jog-joint-list"),
+    jogLoadCurrent: element("jog-load-current"),
+    jogMoveJ: element("jog-movej"),
     arucoExperimentModeNotice: element("aruco-experiment-mode-notice"),
     arucoExperimentOperatorId: element("aruco-experiment-operator-id"),
     arucoObjectWidthMm: element("aruco-object-width-mm"),
@@ -1497,9 +1501,14 @@
     const positions = Array.isArray(payload?.joint_positions_deg)
       ? payload.joint_positions_deg
       : [0, 0, 0, 0, 0, 0];
+    if (!Array.isArray(state.jog.targetPositionsDeg)
+      || state.jog.targetPositionsDeg.length !== 6) {
+      state.jog.targetPositionsDeg = positions.map((value) => Number(value));
+      state.jog.targetDirty = false;
+    }
 
     dom.jogModeNotice.textContent = hardware
-      ? "실제 M0609 하드웨어 조그 모드입니다. 버튼을 누르면 로봇이 즉시 이동합니다."
+      ? "실제 M0609 하드웨어 조그 모드입니다. MOVEJ를 누르면 입력한 6축 목표로 즉시 이동합니다."
       : "MOCK 조그 모드입니다. 화면의 관절값만 변경되며 실제 로봇은 움직이지 않습니다.";
     renderConnection();
     dom.jogModeNotice.style.color = hardware ? "var(--danger)" : "";
@@ -1516,7 +1525,7 @@
       ? capabilities.failed_gates
       : [];
     dom.jogGates.textContent = hardware
-      ? `실제 로봇 gate: 모두 통과\n최대 이동: ${capabilities.maximum_step_deg || 5}°/요청`
+      ? `실제 로봇 gate: 모두 통과\nMOVEJ 속도/가속도: 승인된 ${capabilities.motion_profile_id || "joint_safe"} 프로파일`
       : `실제 로봇은 비활성화됨${failedGates.length ? `\n닫힌 gate:\n- ${failedGates.join("\n- ")}` : ""}\n현재 조작은 MOCK 전용`;
 
     dom.jogEnable.disabled = busy || enabled || state.apiStatus !== "connected";
@@ -1527,25 +1536,43 @@
     dom.jogEstopReady.disabled = enabled || busy;
     dom.jogDirectMotionAck.disabled = enabled || busy;
     dom.jogStepDeg.disabled = busy;
+    dom.jogLoadCurrent.disabled = busy || !payload;
+    dom.jogMoveJ.disabled = busy || !enabled;
+    if (document.activeElement?.classList.contains("jog-target-angle")) return;
     dom.jogJointList.replaceChildren();
     for (let jointIndex = 1; jointIndex <= 6; jointIndex += 1) {
       const row = create("div", { className: "jog-joint" });
       const limits = capabilities.joint_limits_deg?.[jointIndex - 1];
       const name = create("strong", { text: `J${jointIndex}` });
       if (limits) name.title = `허용 범위 ${limits.minimum}° .. ${limits.maximum}°`;
-      const angle = create("span", {
+      const currentAngle = create("span", {
         className: "jog-angle",
-        text: `${Number(positions[jointIndex - 1] || 0).toFixed(3)}°`,
+        text: `현재 ${Number(positions[jointIndex - 1] || 0).toFixed(3)}°`,
       });
-      const minus = create("button", { className: "button", text: "− 이동" });
-      const plus = create("button", { className: "button primary", text: "+ 이동" });
+      const target = create("input", { className: "jog-target-angle" });
+      target.type = "number";
+      target.step = "0.1";
+      target.inputMode = "decimal";
+      target.setAttribute("aria-label", `J${jointIndex} 목표 각도 (degree)`);
+      if (limits) {
+        target.min = String(limits.minimum);
+        target.max = String(limits.maximum);
+      }
+      target.value = String(state.jog.targetPositionsDeg[jointIndex - 1]);
+      target.disabled = !enabled || busy;
+      target.addEventListener("input", () => {
+        state.jog.targetPositionsDeg[jointIndex - 1] = target.value;
+        state.jog.targetDirty = true;
+      });
+      const minus = create("button", { className: "button", text: "− 설정" });
+      const plus = create("button", { className: "button", text: "+ 설정" });
       minus.type = "button";
       plus.type = "button";
       minus.disabled = !enabled || busy;
       plus.disabled = !enabled || busy;
       minus.addEventListener("click", () => moveJogJoint(jointIndex, -1));
       plus.addEventListener("click", () => moveJogJoint(jointIndex, 1));
-      row.append(name, angle, minus, plus);
+      row.append(name, currentAngle, target, minus, plus);
       dom.jogJointList.append(row);
     }
   }
@@ -1555,6 +1582,10 @@
     try {
       const wasEnabled = state.jog.status?.enabled === true;
       state.jog.status = await api.jogStatus();
+      if (!state.jog.targetDirty
+        && Array.isArray(state.jog.status?.joint_positions_deg)) {
+        state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
+      }
       if (wasEnabled && state.jog.status?.enabled !== true) {
         dom.jogWorkspaceCleared.checked = false;
         dom.jogEstopReady.checked = false;
@@ -1587,6 +1618,8 @@
         estop_ready: true,
         acknowledge_direct_motion: true,
       });
+      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
+      state.jog.targetDirty = false;
       const hardware = state.jog.status?.capabilities?.mode === "hardware";
       setBanner(
         hardware ? "실제 로봇 조그가 활성화되었습니다. 로봇 주변에 접근하지 마세요." : "MOCK 조그가 활성화되었습니다.",
@@ -1601,21 +1634,74 @@
     }
   }
 
-  async function moveJogJoint(jointIndex, direction) {
+  function moveJogJoint(jointIndex, direction) {
     const step = Number(dom.jogStepDeg.value);
     if (!Number.isFinite(step) || step < 0.1 || step > 5) {
-      setBanner("조그 이동 간격은 0.1° 이상 5° 이하여야 합니다.", "danger");
+      setBanner("목표각 설정 간격은 0.1° 이상 5° 이하여야 합니다.", "danger");
       return;
     }
+    const targetIndex = jointIndex - 1;
+    const currentTarget = Number(state.jog.targetPositionsDeg[targetIndex]);
+    const limits = state.jog.status?.capabilities?.joint_limits_deg?.[targetIndex];
+    const nextTarget = Number((currentTarget + direction * step).toFixed(3));
+    if (!Number.isFinite(nextTarget)
+      || (limits && (nextTarget < limits.minimum || nextTarget > limits.maximum))) {
+      setBanner(`J${jointIndex} 목표각이 허용 범위를 벗어납니다.`, "danger");
+      return;
+    }
+    state.jog.targetPositionsDeg[targetIndex] = nextTarget;
+    state.jog.targetDirty = true;
+    renderJog();
+  }
+
+  function loadCurrentJogTargets() {
+    const positions = state.jog.status?.joint_positions_deg;
+    if (!Array.isArray(positions) || positions.length !== 6) return;
+    state.jog.targetPositionsDeg = positions.map(Number);
+    state.jog.targetDirty = false;
+    renderJog();
+    setBanner("현재 관절각을 MOVEJ 목표로 불러왔습니다.");
+  }
+
+  async function executeJogMoveJ() {
+    const rawTargets = state.jog.targetPositionsDeg;
+    const hasBlankTarget = rawTargets?.some(
+      (value) => typeof value === "string" && value.trim() === "",
+    );
+    const targets = rawTargets?.map(Number);
+    if (hasBlankTarget || !Array.isArray(targets) || targets.length !== 6
+      || targets.some((value) => !Number.isFinite(value))) {
+      setBanner("J1–J6 목표 각도를 모두 숫자로 입력하세요.", "danger");
+      return;
+    }
+    const limits = state.jog.status?.capabilities?.joint_limits_deg || [];
+    const invalidIndex = targets.findIndex((value, index) => {
+      const limit = limits[index];
+      return limit && (value < limit.minimum || value > limit.maximum);
+    });
+    if (invalidIndex >= 0) {
+      const limit = limits[invalidIndex];
+      setBanner(
+        `J${invalidIndex + 1} 목표각은 ${limit.minimum}°–${limit.maximum}° 안이어야 합니다.`,
+        "danger",
+      );
+      return;
+    }
+    const hardware = state.jog.status?.capabilities?.mode === "hardware";
+    if (hardware && !window.confirm(
+      `입력한 목표각 [${targets.join(", ")}]°으로 MOVEJ를 실행할까요?`,
+    )) return;
     state.jog.loading = true;
+    state.jog.lastError = null;
     renderJog();
     try {
-      state.jog.status = await api.moveJogJoint(jointIndex, direction * step);
-      state.jog.lastError = null;
-      setBanner(`J${jointIndex} ${direction > 0 ? "+" : "−"}${step}° 이동 완료`, "ok");
+      state.jog.status = await api.moveJogJoints(targets);
+      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
+      state.jog.targetDirty = false;
+      setBanner(`MOVEJ 완료 · [${targets.join(", ")}]°`, "ok");
     } catch (error) {
       state.jog.lastError = errorText(error);
-      setBanner(`J${jointIndex} 조그 실패: ${errorText(error)}`, "danger");
+      setBanner(`MOVEJ 실패: ${errorText(error)}`, "danger");
     } finally {
       state.jog.loading = false;
       renderJog();
@@ -1630,6 +1716,8 @@
     try {
       state.jog.status = await api.stopJog("ui_operator_request");
       state.jog.lastError = null;
+      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
+      state.jog.targetDirty = false;
       dom.jogWorkspaceCleared.checked = false;
       dom.jogEstopReady.checked = false;
       dom.jogDirectMotionAck.checked = false;
@@ -3028,6 +3116,8 @@
   dom.jogEnable.addEventListener("click", enableJog);
   dom.jogRefresh.addEventListener("click", () => refreshJogStatus({ quiet: false }));
   dom.jogStop.addEventListener("click", stopJog);
+  dom.jogLoadCurrent.addEventListener("click", loadCurrentJogTargets);
+  dom.jogMoveJ.addEventListener("click", executeJogMoveJ);
   dom.arucoExperimentEnable.addEventListener("click", enableArucoExperiment);
   dom.arucoExperimentRefresh.addEventListener(
     "click",

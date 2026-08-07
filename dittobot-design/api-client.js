@@ -240,6 +240,14 @@
       });
     }
 
+    moveJogJoints(targetJointPositionsDeg) {
+      return this.request("/jog/movej", {
+        method: "POST",
+        body: { target_joint_positions_deg: targetJointPositionsDeg },
+        timeoutMs: 120000,
+      });
+    }
+
     stopJog(reason = "operator_request") {
       return this.request("/jog/stop", {
         method: "POST",
