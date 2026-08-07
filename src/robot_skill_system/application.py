@@ -520,7 +520,11 @@ class MVPApplication:
         return self._scene(scene_id).model_dump(mode="json")
 
     def get_camera_status(self) -> dict[str, Any]:
-        return self.camera_controller.status()
+        status = self.camera_controller.status()
+        status["maximum_timestamp_skew_ms"] = (
+            self.settings.rgbd_max_timestamp_delta_ms
+        )
+        return status
 
     def get_handeye_calibration_status(self) -> dict[str, Any]:
         return self.calibration_controller.status()

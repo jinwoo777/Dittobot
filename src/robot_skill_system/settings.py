@@ -96,7 +96,7 @@ class Settings(BaseModel):
     handeye_legacy_expected_tcp: str = Field(default="2FG_TCP", min_length=1, max_length=64)
     scene_capture_mode: CaptureMode = CaptureMode.BURST
     scene_burst_frame_count: int = Field(default=5, ge=1, le=30)
-    rgbd_max_timestamp_delta_ms: float = Field(default=20.0, gt=0, le=1_000)
+    rgbd_max_timestamp_delta_ms: float = Field(default=50.0, gt=0, le=1_000)
     pose_inference_fps: int = Field(default=10, ge=1, le=30)
     finger_close_threshold_m: float = Field(default=0.03, gt=0.0, le=0.2)
     finger_state_stable_frames: int = Field(default=3, ge=1, le=30)
@@ -301,7 +301,7 @@ class Settings(BaseModel):
             scene_capture_mode=CaptureMode(env.get("SCENE_CAPTURE_MODE", "burst").lower()),
             scene_burst_frame_count=int(env.get("SCENE_BURST_FRAME_COUNT", "5")),
             rgbd_max_timestamp_delta_ms=float(
-                env.get("RGBD_MAX_TIMESTAMP_DELTA_MS", "20")
+                env.get("RGBD_MAX_TIMESTAMP_DELTA_MS", "50")
             ),
             pose_inference_fps=int(env.get("POSE_INFERENCE_FPS", "10")),
             finger_close_threshold_m=float(

@@ -114,6 +114,9 @@
     .actions { display: flex; gap: 10px; flex-wrap: wrap; }
     .safety { display: flex; gap: 9px; flex-wrap: wrap; margin: 24px 0; }
     .safety span { padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--muted); font: 11px ui-monospace, monospace; }
+    .safety span.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+    .safety span.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+    .safety span.danger { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
     .monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .8fr); gap: 18px; }
     .panel { padding: 22px; border: 1px solid var(--border); border-radius: 17px; background: var(--panel); }
     .camera-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -1068,8 +1071,8 @@
       </section>
 
       <section id="page-monitor" class="page" hidden>
-        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">Scene/binding/runtime은 Mock 전용입니다. 별도 gate가 적용된 eye-in-hand calibration만 제한된 DSR 이동 경계를 사용합니다.</p></header>
-        <div class="safety"><span id="estop-chip">● E-STOP READY</span><span id="force-chip">○ FORCE SUPERVISOR IDLE</span><span id="workspace-chip">○ WORKSPACE MONITOR IDLE</span><span>● MOCK MODE</span></div>
+        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">상단 표시는 RealSense, frozen ArUco workspace와 현재 실행 세션 상태입니다. E-stop 표시는 물리 신호가 아니라 ArUco 활성화 때 작업자가 확인한 상태입니다.</p></header>
+        <div class="safety"><span id="estop-chip">○ E-STOP CHECK REQUIRED</span><span id="camera-chip">○ REALSENSE STOPPED</span><span id="workspace-chip">○ FIXED WORKSPACE CHECKING</span><span id="mode-chip">○ MODE CHECKING</span></div>
         <div class="monitor-grid">
           <div class="panel">
             <p class="eyebrow">REALSENSE RGB-D</p>
@@ -1087,9 +1090,9 @@
             </div>
             <p id="camera-status" class="recording-status" role="status" aria-live="polite">RealSense 정지됨 · 사용자가 시작할 때만 카메라가 열립니다.</p>
             <div class="calibration-card">
-              <h3>Eye-in-hand Calibration</h3>
-              <p class="muted">고정 10×7 Chessboard · 25mm · J1/J2 고정 · J3–J6 최대 ±5° · 출력 T_flange_camera</p>
-              <p class="notice">J1/J2를 0°에 놓고 보드 고정, 작업공간 비움, E-stop 준비를 확인하세요. Calibrate를 누르면 J1/J2는 고정한 채 J3–J6가 먼저 [90,0,90,0]으로 이동합니다. 실제 이동에는 모든 hardware/calibration gate가 필요합니다.</p>
+              <h3>Eye-in-hand Calibration (선택적 재보정)</h3>
+              <p class="muted">현재 ArUco 실험은 검증 후 freeze한 fixed_workspace_reference.npz를 사용하므로 이 재보정 기능을 실행할 필요가 없습니다.</p>
+              <p class="notice">새 카메라/TCP 조합을 다시 보정할 때만 사용합니다. 고정 10×7 Chessboard · 25mm · J1/J2 고정 · J3–J6 최대 ±5°이며, 실제 이동에는 별도의 calibration gate가 필요합니다.</p>
               <div class="camera-controls">
                 <button id="start-handeye-calibration" type="button" class="button primary" disabled>Calibrate</button>
                 <button id="abort-handeye-calibration" type="button" class="button danger" disabled>Calibration 중단</button>

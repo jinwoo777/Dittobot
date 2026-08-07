@@ -23,6 +23,7 @@
       lastRecording: null,
       lastError: null,
       frameNumber: null,
+      maximumTimestampSkewMs: null,
     },
     calibration: {
       capabilities: null,
@@ -121,8 +122,9 @@
     runTitle: element("run-title"),
     runSteps: element("run-steps"),
     estopChip: element("estop-chip"),
-    forceChip: element("force-chip"),
+    cameraChip: element("camera-chip"),
     workspaceChip: element("workspace-chip"),
+    modeChip: element("mode-chip"),
     rgbStream: element("rgb-stream"),
     depthStream: element("depth-stream"),
     rgbPlaceholder: element("rgb-placeholder"),
@@ -1425,11 +1427,62 @@
       });
     }
 
-    const supervising = ["starting", "running", "aborting"].includes(state.run.status);
-    dom.forceChip.textContent = `${supervising ? "●" : "○"} FORCE SUPERVISOR ${supervising ? "ACTIVE" : "IDLE"}`;
-    dom.workspaceChip.textContent = `${supervising ? "●" : "○"} WORKSPACE MONITOR ${supervising ? "ACTIVE" : "IDLE"}`;
-    dom.estopChip.textContent = state.run.status === "estop" ? "● E-STOP REQUESTED" : "● E-STOP READY";
-    dom.estopChip.style.color = state.run.status === "estop" ? "var(--danger)" : "";
+    const setChip = (chip, text, tone = "") => {
+      chip.textContent = text;
+      chip.classList.remove("ok", "warn", "danger");
+      if (tone) chip.classList.add(tone);
+    };
+    const aruco = state.arucoExperiment.status;
+    const capabilities = aruco?.capabilities || {};
+    const hardwareAruco = capabilities.mode === "hardware";
+    const arucoEnabled = aruco?.enabled === true;
+    const arucoError = state.arucoExperiment.lastError || aruco?.last_error;
+    const referenceReady = Boolean(
+      capabilities.reference && !capabilities.reference_error,
+    );
+    const runtimeReady = Boolean(aruco?.runtime_workspace);
+
+    if (state.run.status === "estop") {
+      setChip(dom.estopChip, "● E-STOP REQUESTED", "danger");
+    } else if (arucoEnabled) {
+      setChip(dom.estopChip, "● OPERATOR E-STOP ACK", "ok");
+    } else {
+      setChip(dom.estopChip, "○ E-STOP CHECK ON ENABLE");
+    }
+
+    if (state.camera.state === "streaming") {
+      setChip(dom.cameraChip, "● REALSENSE STREAMING", "ok");
+    } else if (state.camera.state === "starting") {
+      setChip(dom.cameraChip, "● REALSENSE STARTING", "warn");
+    } else if (state.camera.state === "error") {
+      setChip(dom.cameraChip, "● REALSENSE ERROR", "danger");
+    } else {
+      setChip(dom.cameraChip, "○ REALSENSE STOPPED");
+    }
+
+    if (capabilities.reference_error) {
+      setChip(dom.workspaceChip, "● WORKSPACE ERROR", "danger");
+    } else if (aruco?.reference_captured && runtimeReady) {
+      setChip(dom.workspaceChip, "● BASE/PLANE WORKSPACE ACTIVE", "ok");
+    } else if (runtimeReady) {
+      setChip(dom.workspaceChip, "● WIDTH WORKSPACE READY", "ok");
+    } else if (referenceReady) {
+      setChip(dom.workspaceChip, "● FROZEN REFERENCE VALID", "ok");
+    } else {
+      setChip(dom.workspaceChip, "○ FIXED WORKSPACE CHECKING");
+    }
+
+    if (state.apiStatus !== "connected") {
+      setChip(dom.modeChip, "● FASTAPI DISCONNECTED", "danger");
+    } else if (arucoError) {
+      setChip(dom.modeChip, "● ARUCO SESSION ERROR", "danger");
+    } else if (hardwareAruco && capabilities.hardware_authorized === true) {
+      setChip(dom.modeChip, "● HARDWARE ARUCO GATES READY", "ok");
+    } else if (hardwareAruco) {
+      setChip(dom.modeChip, "● HARDWARE GATES CLOSED", "danger");
+    } else {
+      setChip(dom.modeChip, "○ MOCK MODE");
+    }
     const canAbort = Boolean(state.run.runId) && ["starting", "running", "aborting"].includes(state.run.status);
     dom.abortRun.disabled = !canAbort;
     dom.estopRun.disabled = !canAbort;
@@ -1824,7 +1877,10 @@
       dom.cameraStatus.textContent = `녹화 ${camera.lastRecording.status} · ${camera.lastRecording.frame_count}프레임 · ${camera.lastRecording.duration_s.toFixed(1)}초 · ${camera.lastRecording.manifest_uri || "manifest 생성 중"}`;
       dom.cameraStatus.style.color = camera.lastRecording.status === "failed" ? "var(--danger)" : "var(--ok)";
     } else if (camera.state === "streaming") {
-      dom.cameraStatus.textContent = `RealSense RGB + 정렬 Depth 스트리밍 중 · 프레임 ${camera.frameNumber ?? "대기"}`;
+      const skewLimit = Number.isFinite(Number(camera.maximumTimestampSkewMs))
+        ? ` · 동기화 한도 ${Number(camera.maximumTimestampSkewMs).toFixed(0)} ms`
+        : "";
+      dom.cameraStatus.textContent = `RealSense RGB + 정렬 Depth 스트리밍 중 · 프레임 ${camera.frameNumber ?? "대기"}${skewLimit}`;
       dom.cameraStatus.style.color = "var(--ok)";
     } else if (camera.state === "error") {
       dom.cameraStatus.textContent = `RealSense 오류: ${camera.lastError || "장치 또는 Python 바인딩을 확인하세요."}`;
@@ -1834,6 +1890,7 @@
       dom.cameraStatus.style.color = "";
     }
     renderCalibration();
+    if (state.page === "monitor") renderMonitor();
   }
 
   function renderCalibration() {
@@ -1873,8 +1930,8 @@
           ? "var(--danger)"
           : "";
     } else if (failedGates.length) {
-      dom.calibrationStatus.textContent = `하드웨어 gate 닫힘 · ${failedGates.join(", ")}`;
-      dom.calibrationStatus.style.color = "var(--danger)";
+      dom.calibrationStatus.textContent = `선택적 재보정 비활성 · frozen ArUco 실행에는 영향 없음 · ${failedGates.join(", ")}`;
+      dom.calibrationStatus.style.color = "";
     } else {
       dom.calibrationStatus.textContent = state.camera.state === "streaming"
         ? "Calibrate 준비됨 · 기준 자세와 안전 조건을 확인하세요."
@@ -2384,6 +2441,7 @@
         recordingId: payload.recording?.recording_id || previousRecordingId,
         lastError: payload.last_error,
         frameNumber: payload.frame_number,
+        maximumTimestampSkewMs: payload.maximum_timestamp_skew_ms,
       };
       if (previousRecordingId && !payload.recording) {
         try {
@@ -2500,6 +2558,7 @@
         recording: payload.recording,
         lastError: payload.last_error,
         frameNumber: payload.frame_number,
+        maximumTimestampSkewMs: payload.maximum_timestamp_skew_ms,
       };
       setBanner("RealSense RGB + 정렬 Depth 스트리밍 시작", "ok");
     } catch (error) {
