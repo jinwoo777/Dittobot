@@ -8,11 +8,14 @@ depth and calibrated colour intrinsics.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 import numpy as np
 from pydantic import Field, model_validator
@@ -30,6 +33,9 @@ DEFAULT_FINGER_CLOSE_THRESHOLD_M = 0.03
 DEFAULT_FINGER_STATE_STABLE_FRAMES = 3
 DEFAULT_DEPTH_PATCH_SIZE_PX = 5
 DEFAULT_MAXIMUM_TIMESTAMP_SKEW_NS = 20_000_000
+DEFAULT_HAND_LANDMARKER_MODEL_PATH = (
+    Path(__file__).resolve().parents[3] / "data" / "models" / "hand_landmarker.task"
+)
 
 
 class FingerGripperState(str, Enum):
@@ -152,9 +158,151 @@ class _ResolvedLandmark:
     invalid_reason: str | None
 
 
+@dataclass(frozen=True)
+class _DetectedHand:
+    landmarks: Sequence[Any]
+    confidence: float
+
+
+class _HandsBackend(Protocol):
+    def detect(
+        self,
+        image_rgb: np.ndarray[Any, np.dtype[np.uint8]],
+        *,
+        timestamp_ns: int,
+    ) -> _DetectedHand | None: ...
+
+    def close(self) -> None: ...
+
+
+class _LegacySolutionsHandsBackend:
+    """Adapt the pre-Tasks ``solutions.hands.Hands`` graph."""
+
+    def __init__(
+        self,
+        mediapipe: ModuleType,
+        *,
+        minimum_detection_confidence: float,
+        minimum_tracking_confidence: float,
+    ) -> None:
+        self._minimum_detection_confidence = minimum_detection_confidence
+        self._hands = mediapipe.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=minimum_detection_confidence,
+            min_tracking_confidence=minimum_tracking_confidence,
+        )
+
+    def detect(
+        self,
+        image_rgb: np.ndarray[Any, np.dtype[np.uint8]],
+        *,
+        timestamp_ns: int,
+    ) -> _DetectedHand | None:
+        del timestamp_ns
+        result = self._hands.process(image_rgb)
+        multi_hand_landmarks = getattr(result, "multi_hand_landmarks", None)
+        if not multi_hand_landmarks:
+            return None
+        confidence = self._minimum_detection_confidence
+        multi_handedness = getattr(result, "multi_handedness", None)
+        if multi_handedness:
+            with suppress(AttributeError, IndexError, TypeError, ValueError):
+                confidence = float(multi_handedness[0].classification[0].score)
+        return _DetectedHand(
+            landmarks=multi_hand_landmarks[0].landmark,
+            confidence=min(1.0, max(0.0, confidence)),
+        )
+
+    def close(self) -> None:
+        close = getattr(self._hands, "close", None)
+        if callable(close):
+            close()
+
+
+class _TasksHandLandmarkerBackend:
+    """Adapt the MediaPipe Tasks HandLandmarker video API."""
+
+    def __init__(
+        self,
+        mediapipe: ModuleType,
+        *,
+        model_asset_path: Path,
+        minimum_detection_confidence: float,
+        minimum_tracking_confidence: float,
+    ) -> None:
+        if not model_asset_path.is_file():
+            raise NotConfiguredError(
+                "MediaPipe Tasks hand estimation requires a Hand Landmarker model at "
+                f"{model_asset_path}"
+            )
+        try:
+            options = mediapipe.tasks.vision.HandLandmarkerOptions(
+                base_options=mediapipe.tasks.BaseOptions(
+                    model_asset_path=str(model_asset_path)
+                ),
+                running_mode=mediapipe.tasks.vision.RunningMode.VIDEO,
+                num_hands=1,
+                min_hand_detection_confidence=minimum_detection_confidence,
+                min_hand_presence_confidence=minimum_detection_confidence,
+                min_tracking_confidence=minimum_tracking_confidence,
+            )
+            self._landmarker = (
+                mediapipe.tasks.vision.HandLandmarker.create_from_options(options)
+            )
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            raise NotConfiguredError(
+                "MediaPipe Tasks Hand Landmarker could not be initialized"
+            ) from exc
+        self._mediapipe = mediapipe
+        self._minimum_detection_confidence = minimum_detection_confidence
+        self._last_timestamp_ms = -1
+
+    def detect(
+        self,
+        image_rgb: np.ndarray[Any, np.dtype[np.uint8]],
+        *,
+        timestamp_ns: int,
+    ) -> _DetectedHand | None:
+        timestamp_ms = max(timestamp_ns // 1_000_000, self._last_timestamp_ms + 1)
+        self._last_timestamp_ms = timestamp_ms
+        image = self._mediapipe.Image(
+            image_format=self._mediapipe.ImageFormat.SRGB,
+            data=np.ascontiguousarray(image_rgb),
+        )
+        result = self._landmarker.detect_for_video(image, timestamp_ms)
+        hand_landmarks = getattr(result, "hand_landmarks", None)
+        if not hand_landmarks:
+            return None
+        confidence = self._minimum_detection_confidence
+        handedness = getattr(result, "handedness", None)
+        if handedness:
+            with suppress(AttributeError, IndexError, TypeError, ValueError):
+                confidence = float(handedness[0][0].score)
+        return _DetectedHand(
+            landmarks=hand_landmarks[0],
+            confidence=min(1.0, max(0.0, confidence)),
+        )
+
+    def close(self) -> None:
+        self._landmarker.close()
+
+
 def _load_mediapipe() -> ModuleType:
+    # MediaPipe 0.10.35 imports its audio task package even for vision-only use.
+    # On robot hosts PortAudio initialization can block indefinitely.  A temporary
+    # import stub keeps this vision-only path independent of audio hardware while
+    # leaving the installed sounddevice package and its version untouched.
+    existing_sounddevice = sys.modules.get("sounddevice")
+    inserted_stub = existing_sounddevice is None
+    if inserted_stub:
+        sys.modules["sounddevice"] = ModuleType("sounddevice")
     try:
-        import mediapipe  # type: ignore[import-not-found]
+        try:
+            import mediapipe  # type: ignore[import-untyped]
+        finally:
+            if inserted_stub:
+                sys.modules.pop("sounddevice", None)
     except ImportError as exc:
         raise NotConfiguredError(
             "MediaPipe hand estimation requires the optional mediapipe package"
@@ -321,6 +469,7 @@ class MediaPipeHandPoseEstimator:
         close_threshold_m: float = DEFAULT_FINGER_CLOSE_THRESHOLD_M,
         stable_frames: int = DEFAULT_FINGER_STATE_STABLE_FRAMES,
         maximum_timestamp_skew_ns: int = DEFAULT_MAXIMUM_TIMESTAMP_SKEW_NS,
+        hand_landmarker_model_path: Path | str = DEFAULT_HAND_LANDMARKER_MODEL_PATH,
     ) -> None:
         if not 0.0 <= minimum_detection_confidence <= 1.0:
             raise ValueError("minimum_detection_confidence must be in [0, 1]")
@@ -334,8 +483,9 @@ class MediaPipeHandPoseEstimator:
         self.minimum_tracking_confidence = minimum_tracking_confidence
         self.close_threshold_m = close_threshold_m
         self.maximum_timestamp_skew_ns = maximum_timestamp_skew_ns
+        self.hand_landmarker_model_path = Path(hand_landmarker_model_path).expanduser().resolve()
         self.state_stabilizer = FingerStateStabilizer(stable_frames=stable_frames)
-        self._hands: Any | None = None
+        self._hands: _HandsBackend | None = None
 
     @property
     def stable_state(self) -> FingerGripperState | None:
@@ -354,20 +504,27 @@ class MediaPipeHandPoseEstimator:
 
         if self._hands is None:
             return
-        close = getattr(self._hands, "close", None)
-        if callable(close):
-            close()
+        self._hands.close()
         self._hands = None
 
-    def _get_hands(self) -> Any:
+    def _get_hands(self) -> _HandsBackend:
         if self._hands is None:
             mediapipe = _load_mediapipe()
-            self._hands = mediapipe.solutions.hands.Hands(
-                static_image_mode=False,
-                max_num_hands=1,
-                min_detection_confidence=self.minimum_detection_confidence,
-                min_tracking_confidence=self.minimum_tracking_confidence,
-            )
+            solutions = getattr(mediapipe, "solutions", None)
+            hands = getattr(solutions, "hands", None)
+            if hands is not None and getattr(hands, "Hands", None) is not None:
+                self._hands = _LegacySolutionsHandsBackend(
+                    mediapipe,
+                    minimum_detection_confidence=self.minimum_detection_confidence,
+                    minimum_tracking_confidence=self.minimum_tracking_confidence,
+                )
+            else:
+                self._hands = _TasksHandLandmarkerBackend(
+                    mediapipe,
+                    model_asset_path=self.hand_landmarker_model_path,
+                    minimum_detection_confidence=self.minimum_detection_confidence,
+                    minimum_tracking_confidence=self.minimum_tracking_confidence,
+                )
         return self._hands
 
     def estimate(self, frame: SynchronizedRGBDFrame) -> HandPoseEstimate | None:
@@ -378,11 +535,13 @@ class MediaPipeHandPoseEstimator:
     def track(self, frame: SynchronizedRGBDFrame) -> FingerTrackingResult:
         """Run persistent MediaPipe tracking and deterministic local RGB-D inference."""
 
-        result = self._get_hands().process(frame.color_image_rgb)
-        multi_hand_landmarks = getattr(result, "multi_hand_landmarks", None)
-        if not multi_hand_landmarks:
+        detected_hand = self._get_hands().detect(
+            frame.color_image_rgb,
+            timestamp_ns=frame.timestamp_ns,
+        )
+        if detected_hand is None:
             return self._uncertain_result(frame, invalid_reason="hand_not_detected")
-        landmarks = multi_hand_landmarks[0].landmark
+        landmarks = detected_hand.landmarks
         required_highest_index = max(17, INDEX_TIP_LANDMARK_INDEX)
         if len(landmarks) <= required_highest_index:
             return self._uncertain_result(frame, invalid_reason="landmarks_incomplete")
@@ -390,17 +549,10 @@ class MediaPipeHandPoseEstimator:
             index: (float(landmarks[index].x), float(landmarks[index].y))
             for index in (0, THUMB_TIP_LANDMARK_INDEX, 5, INDEX_TIP_LANDMARK_INDEX, 17)
         }
-        confidence = self.minimum_detection_confidence
-        multi_handedness = getattr(result, "multi_handedness", None)
-        if multi_handedness:
-            try:
-                confidence = float(multi_handedness[0].classification[0].score)
-            except (AttributeError, IndexError, TypeError, ValueError):
-                confidence = self.minimum_detection_confidence
         return self.track_normalized_landmarks(
             frame,
             normalized_landmarks,
-            confidence=min(1.0, max(0.0, confidence)),
+            confidence=detected_hand.confidence,
         )
 
     def track_normalized_landmarks(
@@ -683,6 +835,7 @@ __all__ = [
     "DEFAULT_DEPTH_PATCH_SIZE_PX",
     "DEFAULT_FINGER_CLOSE_THRESHOLD_M",
     "DEFAULT_FINGER_STATE_STABLE_FRAMES",
+    "DEFAULT_HAND_LANDMARKER_MODEL_PATH",
     "FingerGripperState",
     "FingerObservation",
     "FingerStateStabilizer",

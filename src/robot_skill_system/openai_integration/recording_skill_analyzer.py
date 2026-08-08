@@ -102,6 +102,30 @@ tcp_proxy_observation.semantic_only must remain true, and robot_tcp_pose_availab
 false. State occlusion and ambiguity explicitly."""
 FIRST_FRAME_TRACE_INSTRUCTIONS += f"\n\n{MOTION_SIMPLIFICATION_INSTRUCTIONS}"
 
+RGB_KEYFRAME_TRACE_INSTRUCTIONS = """Analyze a robot teaching recording using two bounded
+evidence streams: (1) the supplied chronological RGB keyframes whose global frame indices are
+listed in keyframe_indices and (2) the compact thumb/index trace in the JSON metadata covering
+every stored frame. No depth image, metric fingertip distance, gripper classification, or robot
+pose is sent to you.
+
+When demonstration_cases contains more than one item, treat each item as an independent example
+of the same requested skill. Respect its global_frame_offset and keyframe mapping; do not infer a
+physical motion transition between the end of one case and the beginning of the next case.
+
+Use the RGB keyframes to identify semantic object, tool, hand, and work-surface regions. Every
+representative_frame_index and TCP observed state must refer to one of the supplied keyframe
+indices. Return normalized [0,1] image locations only. Use the full compact trace to describe the
+chronological hand motion between keyframes, but never convert trace pixels or timestamps into
+coordinates or motion targets. Local aligned depth, MediaPipe tracking, and the local metric
+trajectory fitter remain authoritative.
+
+Never output or infer depth, metric distance, coordinates, poses, transforms, velocity,
+acceleration, force, thresholds, code, robot calls, or execution permission. executable must
+remain false, requires_pose_trajectory must remain true, tcp_proxy_observation.semantic_only must
+remain true, and robot_tcp_pose_available must remain false. State occlusion and ambiguity
+explicitly."""
+RGB_KEYFRAME_TRACE_INSTRUCTIONS += f"\n\n{MOTION_SIMPLIFICATION_INSTRUCTIONS}"
+
 
 class ImageInputRejectedError(RuntimeError):
     """The provider rejected the direct image payload and a file fallback may be attempted."""
@@ -252,6 +276,54 @@ class RecordingSkillDraftAnalyzer:
                 if not as_file_fallback and _is_image_input_rejection(exc):
                     raise ImageInputRejectedError(
                         "OpenAI rejected the first-frame image payload"
+                    ) from exc
+                raise
+        self._validate_draft(draft, request)
+        return draft, metadata
+
+    def analyze_rgb_keyframe_trace(
+        self,
+        request: RecordingSkillDraftInput,
+        *,
+        rgb_paths: list[Path],
+        as_file_fallback: bool = False,
+    ) -> tuple[RecordingSkillDraft, APICallMetadata]:
+        """Analyze selected RGB frames plus a complete local-only fingertip trace."""
+
+        if request.visual_input_policy != "rgb_keyframes_plus_local_fingertip_trace":
+            raise ValueError("RGB keyframe analysis requires the RGB trace input policy")
+        if len(rgb_paths) != len(request.keyframe_indices):
+            raise ValueError("RGB paths and keyframe indices must have the same length")
+        if len(rgb_paths) > self.settings.openai_max_keyframes:
+            raise ValueError("keyframe count exceeds the configured OpenAI bound")
+        if any(not path.is_file() for path in rgb_paths):
+            raise ValueError("every RGB keyframe must be a checksum-verified local file")
+        trace_id = new_trace_id()
+        if self.settings.openai_mode is OpenAIMode.MOCK:
+            draft, metadata = self._mock.analyze_recording_skill_draft(request, trace_id)
+        else:
+            client = self._client or OpenAIClientFactory(self.settings).create()
+            semantic_payload = request.model_dump(
+                mode="json",
+                exclude={"image_pair_order", "depth_visualization"},
+            )
+            try:
+                draft, metadata = parse_structured_response(
+                    client=client,
+                    retry=self._retry,
+                    model=self.settings.openai_reasoning_model,
+                    instructions=RGB_KEYFRAME_TRACE_INSTRUCTIONS,
+                    payload=semantic_payload,
+                    output_type=RecordingSkillDraft,
+                    trace_id=trace_id,
+                    file_paths=rgb_paths if as_file_fallback else None,
+                    image_paths=None if as_file_fallback else rgb_paths,
+                    image_detail=self.settings.openai_image_detail,
+                )
+            except APIStatusError as exc:
+                if not as_file_fallback and _is_image_input_rejection(exc):
+                    raise ImageInputRejectedError(
+                        "OpenAI rejected the RGB keyframe image payload"
                     ) from exc
                 raise
         self._validate_draft(draft, request)

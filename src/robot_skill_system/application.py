@@ -13,11 +13,13 @@ import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from sqlalchemy import select
 
+from robot_skill_system.adapters.doosan_m0609 import DoosanM0609Adapter
 from robot_skill_system.adapters.mock_robot import MockGripperAdapter, MockRobotAdapter
+from robot_skill_system.adapters.onrobot_rg2 import OnRobotRG2Adapter
 from robot_skill_system.aruco_experiment.controller import (
     ArucoExperimentController,
     DoosanArucoExperimentRobot,
@@ -106,6 +108,11 @@ from robot_skill_system.openai_integration.function_tools import (
     SafeFunctionDispatcher,
 )
 from robot_skill_system.openai_integration.intent_resolver import RuntimeIntentResolver
+from robot_skill_system.openai_integration.motion_policy import (
+    MAXIMUM_ACTION_MOTION_BLOCKS,
+    MAXIMUM_END_MOTION_BLOCKS,
+    RECORDING_BLOCK_MOTION_OPERATIONS,
+)
 from robot_skill_system.openai_integration.recording_skill_analyzer import (
     ImageInputRejectedError,
     RecordingSkillDraftAnalyzer,
@@ -120,6 +127,7 @@ from robot_skill_system.openai_integration.training_semantics import (
     TrainingSemanticResolver,
     TrainingTaskSemantics,
 )
+from robot_skill_system.perception._geometry import rotation_matrix_to_quaternion_xyzw
 from robot_skill_system.perception.hand_pose import (
     FingerObservation,
     MediaPipeHandPoseEstimator,
@@ -140,21 +148,29 @@ from robot_skill_system.runtime.errors import ExecutionAbortedError, RuntimeErro
 from robot_skill_system.runtime.event_log import InMemoryEventSink
 from robot_skill_system.runtime.executor import RuntimeExecutor
 from robot_skill_system.runtime.force_supervisor import GlobalForceSupervisor
+from robot_skill_system.runtime.hardware_verification import (
+    DoosanFixedPlaneGeometryValidator,
+    DoosanStateMonitor,
+    FixedReferenceSceneMonitor,
+)
 from robot_skill_system.runtime.integrity import verify_skill_checksum
-from robot_skill_system.runtime.models import ExecutionMode, RuntimeContext
-from robot_skill_system.runtime.preflight import PreflightValidator
+from robot_skill_system.runtime.models import BoundTargetPose, ExecutionMode, RuntimeContext
+from robot_skill_system.runtime.preflight import PreflightPolicy, PreflightValidator
 from robot_skill_system.runtime.safety_supervisor import GlobalSafetySupervisor
 from robot_skill_system.runtime.task_flow_materializer import (
     TaskFlowMaterializer,
 )
 from robot_skill_system.runtime.workspace_monitor import GlobalWorkspaceSupervisor
 from robot_skill_system.scene.models import (
+    AccessPolicy,
     Pose,
     Quaternion,
     SceneSnapshot,
     SurfaceInstance,
     SurfaceRole,
     Vector3,
+    WorkspaceRegion,
+    WorkspaceRole,
 )
 from robot_skill_system.scene.transforms import RigidTransform, rotate_vector
 from robot_skill_system.settings import ExecutionMode as SettingsExecutionMode
@@ -180,7 +196,11 @@ from robot_skill_system.skills.retrieval import (
     rank_skills,
 )
 from robot_skill_system.skills.updater import SkillUpdater, UpdateEvidence
-from robot_skill_system.skills.versioning import SemanticVersion, stable_version
+from robot_skill_system.skills.versioning import (
+    SemanticVersion,
+    next_candidate_version,
+    stable_version,
+)
 from robot_skill_system.storage.artifact_store import LocalArtifactStore
 from robot_skill_system.storage.database import Database, StorageRepository
 from robot_skill_system.storage.grip_point_importer import GripPointResultImporter
@@ -217,7 +237,7 @@ class DemonstrationEvidence:
 class ActiveExecution:
     """Abort handles for a currently running mock/dry-run execution."""
 
-    robot: MockRobotAdapter
+    robot: Any
     force_supervisor: GlobalForceSupervisor
     safety_supervisor: GlobalSafetySupervisor
 
@@ -244,6 +264,9 @@ class MVPApplication:
         self._active_executions: dict[str, ActiveExecution] = {}
         self._active_execution_lock = threading.RLock()
         self._robot_motion_transition_lock = threading.RLock()
+        self._fixed_hardware_session_lock = threading.RLock()
+        self._fixed_hardware_robot: DoosanArucoExperimentRobot | None = None
+        self._fixed_base_plane_cache: tuple[Any, str] | None = None
         self._recording_flange_starts: dict[str, dict[str, Any]] = {}
         real_sense_config = RealSenseCaptureConfig(
             width_px=settings.realsense_width_px,
@@ -367,6 +390,7 @@ class MVPApplication:
                         robot_model=settings.doosan_robot_model,
                         execution_mode=settings.robot_execution_mode.value,
                         hardware_enabled=settings.aruco_experiment_hardware_enabled,
+                        expected_tcp_name=settings.aruco_experiment_expected_tcp,
                     )
                     if use_hardware_aruco
                     else MockArucoExperimentRobot(
@@ -405,6 +429,10 @@ class MVPApplication:
     def close(self) -> None:
         """Release database resources."""
 
+        with self._fixed_hardware_session_lock:
+            fixed_robot, self._fixed_hardware_robot = self._fixed_hardware_robot, None
+        if fixed_robot is not None:
+            fixed_robot.disconnect()
         self.aruco_experiment_controller.close()
         self.jog_controller.close()
         self.calibration_controller.close()
@@ -505,10 +533,58 @@ class MVPApplication:
 
     def capture_scene(self, request: dict[str, Any]) -> dict[str, Any]:
         mode = str(request.get("mode", "mock"))
-        if mode not in {"mock", "single", "burst"}:
-            raise ValueError("MVP scene capture supports mock/single/burst only")
+        if mode not in {"mock", "single", "burst", "hardware"}:
+            raise ValueError("scene capture supports mock/single/burst/hardware")
         frame_count = 1 if mode == "single" else self.settings.scene_burst_frame_count
         scene = capture_mock_scene(frame_count=frame_count)
+        if mode == "hardware":
+            aruco_robot, base_to_plane = self._acquire_fixed_hardware_session()
+            tcp_transform = rigid_transform_from_matrix(
+                aruco_robot.get_base_to_tcp_matrix(), label="hardware T_base_tcp"
+            )
+            active_tool = scene.tools[0].model_copy(
+                update={
+                    "instance_id": "active_rg2",
+                    "tool_class": "onrobot_rg2",
+                    "tcp_frame": self.settings.aruco_experiment_expected_tcp,
+                    "pose": Pose(
+                        frame_id="base",
+                        position_m=tcp_transform.translation_m,
+                        orientation_xyzw=tcp_transform.rotation_xyzw,
+                        timestamp_ns=time.time_ns(),
+                        source="live_doosan_active_tcp_feedback",
+                        confidence=1.0,
+                    ),
+                    "compatible_skills": ["take_hammer"],
+                    "verification_confidence": 1.0,
+                },
+                deep=True,
+            )
+            scene = scene.model_copy(
+                update={
+                    "scene_id": f"hardware_{uuid.uuid4().hex}",
+                    "timestamp_ns": time.time_ns(),
+                    "reference_frame": "base",
+                    "valid_for_ms": 1_800_000,
+                    "calibration_id": "aruco_fixed_plane_operator_session",
+                    "objects": [],
+                    "tools": [active_tool],
+                    "surfaces": [],
+                    "workspace_regions": [],
+                    "static_obstacles": [],
+                    "dynamic_obstacles": [],
+                },
+                deep=True,
+            )
+            self._scenes[scene.scene_id] = scene
+            self.store.put_json(
+                f"scenes/{scene.scene_id}_base_plane.json",
+                {
+                    "scene_id": scene.scene_id,
+                    "T_base_plane": base_to_plane.tolist(),
+                    "source": "enabled_aruco_reference_session",
+                },
+            )
         self.repository.record_scene(scene)
         self.store.put_json(
             f"scenes/{scene.scene_id}.json", scene.model_dump(mode="json")
@@ -533,7 +609,17 @@ class MVPApplication:
         return self.jog_controller.status()
 
     def get_aruco_experiment_status(self) -> dict[str, Any]:
-        return self.aruco_experiment_controller.status()
+        status = self.aruco_experiment_controller.status()
+        try:
+            transform, source = self._load_fixed_base_plane()
+            status["fixed_workspace_ready"] = True
+            status["fixed_workspace_source"] = source
+            status["fixed_T_base_plane"] = transform.tolist()
+            status["skill_execution_requires_aruco_enable"] = False
+        except Exception as exc:
+            status["fixed_workspace_ready"] = False
+            status["fixed_workspace_error"] = str(exc)
+        return status
 
     def enable_jog(self, request: dict[str, Any]) -> dict[str, Any]:
         with self._robot_motion_transition_lock:
@@ -570,26 +656,38 @@ class MVPApplication:
         )
 
     def enable_aruco_experiment(self, request: dict[str, Any]) -> dict[str, Any]:
-        with self._robot_motion_transition_lock:
-            self._ensure_aruco_motion_available("enable ArUco experiment")
-            return self.aruco_experiment_controller.enable(
-                operator_id=str(request.get("operator_id") or ""),
-                workspace_cleared=request.get("workspace_cleared") is True,
-                estop_ready=request.get("estop_ready") is True,
-                acknowledge_direct_motion=(
-                    request.get("acknowledge_direct_motion") is True
-                ),
-                object_width_mm=float(request["object_width_mm"]),
-                width_model=str(request.get("width_model") or "full-opening"),
-            )
+        try:
+            with self._robot_motion_transition_lock:
+                self._ensure_aruco_motion_available("enable ArUco experiment")
+                return self.aruco_experiment_controller.enable(
+                    operator_id=str(request.get("operator_id") or ""),
+                    workspace_cleared=request.get("workspace_cleared") is True,
+                    estop_ready=request.get("estop_ready") is True,
+                    acknowledge_direct_motion=(
+                        request.get("acknowledge_direct_motion") is True
+                    ),
+                    object_width_mm=float(request["object_width_mm"]),
+                    width_model=str(request.get("width_model") or "full-opening"),
+                )
+        except Exception as exc:
+            self.aruco_experiment_controller.record_failure("enable", exc)
+            raise
 
     def move_aruco_reference(self) -> dict[str, Any]:
-        self._ensure_aruco_motion_available("move ArUco reference")
-        return self.aruco_experiment_controller.move_to_reference()
+        try:
+            self._ensure_aruco_motion_available("move ArUco reference")
+            return self.aruco_experiment_controller.move_to_reference()
+        except Exception as exc:
+            self.aruco_experiment_controller.record_failure("move_to_reference", exc)
+            raise
 
     def move_aruco_plane_z_test(self) -> dict[str, Any]:
-        self._ensure_aruco_motion_available("run ArUco +Z test")
-        return self.aruco_experiment_controller.move_plane_z_test()
+        try:
+            self._ensure_aruco_motion_available("run ArUco +Z test")
+            return self.aruco_experiment_controller.move_plane_z_test()
+        except Exception as exc:
+            self.aruco_experiment_controller.record_failure("move_plane_z_test", exc)
+            raise
 
     def stop_aruco_experiment(self, request: dict[str, Any]) -> dict[str, Any]:
         return self.aruco_experiment_controller.stop(
@@ -828,25 +926,26 @@ class MVPApplication:
             "openai_mode": self.settings.openai_mode.value,
             "api_key_configured": self.settings.openai_api_key is not None,
             "model": self.settings.openai_reasoning_model,
-            "maximum_keyframes": 1,
-            "legacy_configured_maximum_keyframes": self.settings.openai_max_keyframes,
+            "maximum_keyframes": self.settings.openai_max_keyframes,
+            "maximum_demonstration_recordings": 8,
+            "multiple_demonstration_recordings_supported": True,
             "image_detail": self.settings.openai_image_detail,
             "uploads_rgb_keyframes_only": True,
             "uploads_rgb_and_aligned_depth_pairs": False,
-            "uploaded_rgb_frame_count": 1,
+            "uploaded_rgb_frame_count": "operator_selected_1_to_maximum_keyframes",
             "maximum_compact_trace_frames": MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES,
-            "uploaded_frame_policy": "first_manifest_rgb_only",
-            "request_keyframe_count_is_deprecated_and_ignored": True,
+            "uploaded_frame_policy": "evenly_spaced_manifest_rgb_keyframes",
+            "request_keyframe_count_is_deprecated_and_ignored": False,
             "depth_stays_local": True,
             "tcp_proxy_mode": "full_recording_local_thumb_index_trace",
             "provider_video_input_supported": False,
             "direct_image_transport": True,
-            "fallback_analysis_transport": "first_rgb_input_file",
+            "fallback_analysis_transport": "rgb_keyframe_input_files",
             "creates_zip_archive_on_fallback": False,
             "returns_frame_complete_tcp_audit": True,
             "llm_receives_metric_finger_distance": False,
             "local_finger_state_authoritative": True,
-            "first_frame_semantic_anchor_local_depth_verified": True,
+            "semantic_anchor_local_depth_verified_per_representative_frame": True,
             "returns_semantic_scene_regions": True,
             "automatic_surface_plane_backend": "local_numpy_ransac_raw_depth",
             "npy_validation_blocks_mock_candidate": False,
@@ -855,30 +954,123 @@ class MVPApplication:
         }
 
     def create_recording_skill_draft(self, request: dict[str, Any]) -> dict[str, Any]:
-        """Analyze one first RGB frame plus all-frame local fingertip coordinates."""
+        """Analyze selected RGB frames plus all-frame local fingertip coordinates."""
 
         recording_id = str(request["recording_id"])
-        manifest = self.camera_controller.get_recording_manifest(
-            recording_id, include_frames=True
+        requested_recording_ids = request.get("recording_ids") or []
+        source_recording_ids = list(
+            dict.fromkeys([recording_id, *(str(item) for item in requested_recording_ids)])
         )
-        manifest_frames = manifest.get("frames") or []
-        if not isinstance(manifest_frames, list) or not manifest_frames:
-            raise ValueError("RGB-D recording contains no manifest frames")
-        if len(manifest_frames) > MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES:
+        if len(source_recording_ids) > 8:
+            raise ValueError("skill drafting supports at most 8 demonstration recordings")
+
+        cases: list[dict[str, Any]] = []
+        total_frame_count = 0
+        for source_recording_id in source_recording_ids:
+            case_manifest = self.camera_controller.get_recording_manifest(
+                source_recording_id, include_frames=True
+            )
+            case_frames = case_manifest.get("frames") or []
+            if not isinstance(case_frames, list) or not case_frames:
+                raise ValueError(
+                    f"RGB-D recording {source_recording_id!r} contains no manifest frames"
+                )
+            if case_manifest.get("depth_aligned_to_color") is not True:
+                raise ValueError(
+                    f"RGB-D recording {source_recording_id!r} requires aligned depth"
+                )
+            total_frame_count += len(case_frames)
+            cases.append(
+                {
+                    "recording_id": source_recording_id,
+                    "manifest": case_manifest,
+                    "frames": case_frames,
+                    "tracking": self._track_recording_fingertips(
+                        source_recording_id, case_manifest
+                    ),
+                }
+            )
+        if total_frame_count > MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES:
             raise ValueError(
                 "skill drafting supports at most "
-                f"{MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES} full-recording trace frames"
+                f"{MAXIMUM_COMPACT_FINGERTIP_TRACE_FRAMES} combined trace frames"
             )
-        if manifest.get("depth_aligned_to_color") is not True:
-            raise ValueError("full-recording fingertip tracking requires aligned depth")
-        tracking = self._track_recording_fingertips(recording_id, manifest)
-        first_frame_index = int(manifest_frames[0].get("index", 0))
-        # Loading the frame verifies both stored RGB/depth checksums.  Only the
-        # original first RGB JPEG path is supplied to the semantic model.
-        self.camera_controller.load_recording_rgbd_frame(
-            recording_id, first_frame_index
+
+        manifest = cases[0]["manifest"]
+        tracking = cases[0]["tracking"]
+        requested_keyframe_count = min(
+            int(request.get("keyframe_count") or 1),
+            self.settings.openai_max_keyframes,
         )
-        first_rgb_path = self.store.path_for(str(manifest_frames[0]["rgb_uri"]))
+        if requested_keyframe_count < len(cases):
+            raise ValueError(
+                "RGB image count must be at least the number of demonstration recordings"
+            )
+        image_budget = min(requested_keyframe_count, total_frame_count)
+        allocations = [1] * len(cases)
+        remaining = image_budget - len(cases)
+        while remaining:
+            changed = False
+            for case_index, case in enumerate(cases):
+                if allocations[case_index] >= len(case["frames"]):
+                    continue
+                allocations[case_index] += 1
+                remaining -= 1
+                changed = True
+                if remaining == 0:
+                    break
+            if not changed:
+                break
+
+        keyframe_indices: list[int] = []
+        rgb_paths: list[Path] = []
+        analysis_trace: list[Any] = []
+        demonstration_cases: list[dict[str, Any]] = []
+        global_frame_mapping: dict[int, tuple[str, int, dict[str, Any]]] = {}
+        global_offset = 0
+        timestamp_cursor: int | None = None
+        for case, allocation in zip(cases, allocations, strict=True):
+            source_id = str(case["recording_id"])
+            selected = self.camera_controller.select_recording_keyframes(
+                source_id, maximum_count=allocation
+            )
+            local_keyframes = [index for index, _path in selected]
+            global_keyframes = [global_offset + index for index in local_keyframes]
+            keyframe_indices.extend(global_keyframes)
+            rgb_paths.extend(path for _index, path in selected)
+            compact_trace = case["tracking"]["compact_fingertip_trace"]
+            first_timestamp = int(compact_trace[0]["timestamp_ns"])
+            case_timestamp_origin = (
+                first_timestamp if timestamp_cursor is None else timestamp_cursor + 1
+            )
+            for trace_entry in compact_trace:
+                analysis_trace.append(
+                    {
+                        **trace_entry,
+                        "frame_index": global_offset + int(trace_entry["frame_index"]),
+                        "timestamp_ns": case_timestamp_origin
+                        + int(trace_entry["timestamp_ns"])
+                        - first_timestamp,
+                    }
+                )
+            timestamp_cursor = int(analysis_trace[-1]["timestamp_ns"])
+            for local_index, entry in enumerate(case["frames"]):
+                global_frame_mapping[global_offset + local_index] = (
+                    source_id,
+                    local_index,
+                    entry,
+                )
+            demonstration_cases.append(
+                {
+                    "recording_id": source_id,
+                    "global_frame_offset": global_offset,
+                    "frame_count": len(case["frames"]),
+                    "local_keyframe_indices": local_keyframes,
+                    "global_keyframe_indices": global_keyframes,
+                }
+            )
+            global_offset += len(case["frames"])
+        first_frame_index = keyframe_indices[0]
         primitive_catalog = list(get_default_registry().operation_names())
         entity_role_catalog = [
             "tool",
@@ -889,23 +1081,28 @@ class MVPApplication:
         ]
         analysis_input = RecordingSkillDraftInput(
             recording_id=recording_id,
+            demonstration_cases=demonstration_cases,
             name_hint=str(request.get("name_hint", "recorded_skill")),
             operator_instruction=str(request["operator_instruction"]),
             recording_summary={
-                "duration_s": manifest.get("duration_s"),
-                "frame_count": manifest.get("frame_count"),
+                "duration_s": sum(
+                    float(case["manifest"].get("duration_s") or 0.0) for case in cases
+                ),
+                "frame_count": total_frame_count,
+                "demonstration_count": len(cases),
                 "recording_fps": manifest.get("recording_fps"),
                 "depth_aligned_to_color": manifest.get("depth_aligned_to_color"),
                 "timestamps_preserved": manifest.get("timestamps_preserved"),
             },
             primitive_catalog=primitive_catalog,
             entity_role_catalog=entity_role_catalog,
-            keyframe_indices=[first_frame_index],
+            keyframe_indices=keyframe_indices,
             first_frame_index=first_frame_index,
-            fingertip_trace=tracking["compact_fingertip_trace"],
-            visual_input_policy="first_rgb_plus_local_fingertip_trace",
+            fingertip_trace=analysis_trace,
+            visual_input_policy="rgb_keyframes_plus_local_fingertip_trace",
             limitations=[
-                "Only the first RGB frame and compact thumb/index trace reach OpenAI.",
+                "Selected RGB keyframes and compact thumb/index traces from every named "
+                "demonstration case reach OpenAI.",
                 "Depth, metric fingertip distance, and local gripper state remain local.",
                 "The recording contains no trusted robot-base trajectory unless a separate "
                 "stationarity/base-chain artifact passes validation.",
@@ -918,38 +1115,51 @@ class MVPApplication:
         draft_id = f"draft_{uuid.uuid4().hex}"
         analyzer = RecordingSkillDraftAnalyzer(self.settings)
         transport: dict[str, Any] = {
-            "mode": "first_rgb_plus_compact_fingertip_trace",
+            "mode": "rgb_keyframes_plus_compact_fingertip_trace",
             "first_frame_index": first_frame_index,
-            "image_count": 1,
+            "keyframe_indices": keyframe_indices,
+            "image_count": len(rgb_paths),
+            "demonstration_count": len(cases),
+            "demonstration_cases": demonstration_cases,
             "depth_image_count": 0,
-            "trace_frame_count": len(tracking["compact_fingertip_trace"]),
-            "requested_keyframe_count_ignored": request.get("keyframe_count"),
+            "trace_frame_count": len(analysis_trace),
+            "requested_keyframe_count": requested_keyframe_count,
             "fallback_used": False,
         }
         try:
-            draft, metadata = analyzer.analyze_first_frame_trace(
+            draft, metadata = analyzer.analyze_rgb_keyframe_trace(
                 analysis_input,
-                first_rgb_path=first_rgb_path,
+                rgb_paths=rgb_paths,
             )
         except ImageInputRejectedError:
-            draft, metadata = analyzer.analyze_first_frame_trace(
+            draft, metadata = analyzer.analyze_rgb_keyframe_trace(
                 analysis_input,
-                first_rgb_path=first_rgb_path,
+                rgb_paths=rgb_paths,
                 as_file_fallback=True,
             )
             transport = {
-                "mode": "first_rgb_input_file_plus_compact_fingertip_trace",
+                "mode": "rgb_keyframe_files_plus_compact_fingertip_trace",
                 "first_frame_index": first_frame_index,
-                "image_count": 1,
+                "keyframe_indices": keyframe_indices,
+                "image_count": len(rgb_paths),
+                "demonstration_count": len(cases),
+                "demonstration_cases": demonstration_cases,
                 "depth_image_count": 0,
-                "trace_frame_count": len(tracking["compact_fingertip_trace"]),
-                "requested_keyframe_count_ignored": request.get("keyframe_count"),
+                "trace_frame_count": len(analysis_trace),
+                "requested_keyframe_count": requested_keyframe_count,
                 "fallback_used": True,
                 "reason": "direct_image_input_rejected",
             }
         tracking["semantic_conflicts"] = self._finger_semantic_conflicts(
             tracking, draft.model_dump(mode="json")
         )
+        tracking["demonstration_cases"] = [
+            {
+                **case_summary,
+                "tracking": {**case["tracking"]},
+            }
+            for case_summary, case in zip(demonstration_cases, cases, strict=True)
+        ]
         tracking["draft_id"] = draft_id
         evidence_root = (
             f"demonstrations/{recording_id}/skill_drafts/{draft_id}_evidence"
@@ -961,6 +1171,8 @@ class MVPApplication:
         initial_anchors = self._reconstruct_initial_scene_anchors(
             recording_id=recording_id,
             frame_index=first_frame_index,
+            allowed_frame_indices=set(keyframe_indices),
+            global_frame_mapping=global_frame_mapping,
             semantic_draft=draft.model_dump(mode="json"),
             manifest=manifest,
         )
@@ -974,8 +1186,9 @@ class MVPApplication:
             "status": "semantic_draft",
             "created_at_ns": time.time_ns(),
             "source_recording_id": recording_id,
-            "keyframe_indices": [first_frame_index],
-            "full_recording_frame_count": len(manifest_frames),
+            "source_recording_ids": source_recording_ids,
+            "keyframe_indices": keyframe_indices,
+            "full_recording_frame_count": total_frame_count,
             "openai_mode": self.settings.openai_mode.value,
             "openai_model": self.settings.openai_reasoning_model,
             "openai_trace_id": metadata.trace_id,
@@ -984,8 +1197,12 @@ class MVPApplication:
                 "tracking_id": tracking["tracking_id"],
                 "artifact_uri": tracking_artifact.uri,
                 "artifact_checksum_sha256": tracking_artifact.checksum_sha256,
-                "valid_frame_count": tracking["valid_frame_count"],
-                "transition_count": len(tracking["state_transitions"]),
+                "valid_frame_count": sum(
+                    int(case["tracking"]["valid_frame_count"]) for case in cases
+                ),
+                "transition_count": sum(
+                    len(case["tracking"]["state_transitions"]) for case in cases
+                ),
             },
             "initial_scene_anchors": {
                 "artifact_uri": anchor_artifact.uri,
@@ -1223,25 +1440,34 @@ class MVPApplication:
         *,
         recording_id: str,
         frame_index: int,
+        allowed_frame_indices: set[int] | None = None,
+        global_frame_mapping: dict[int, tuple[str, int, dict[str, Any]]] | None = None,
         semantic_draft: dict[str, Any],
         manifest: dict[str, Any],
     ) -> dict[str, Any]:
-        """Turn first-frame semantic ROIs into local, unconfirmed metric evidence."""
+        """Turn keyframe semantic ROIs into local, unconfirmed metric evidence."""
 
-        frame = self.camera_controller.load_recording_rgbd_frame(
-            recording_id, frame_index
-        )
         manifest_frames = manifest.get("frames") or []
-        frame_entry = next(
-            (
-                item
-                for sequence_index, item in enumerate(manifest_frames)
-                if int(item.get("index", sequence_index)) == frame_index
-            ),
-            None,
+        entries_by_index = {
+            int(item.get("index", sequence_index)): item
+            for sequence_index, item in enumerate(manifest_frames)
+            if isinstance(item, dict)
+        }
+        if global_frame_mapping is None:
+            global_frame_mapping = {
+                index: (recording_id, index, entry)
+                for index, entry in entries_by_index.items()
+            }
+        first_source_id, first_local_index, frame_entry = global_frame_mapping.get(
+            frame_index, (recording_id, frame_index, None)
         )
         if not isinstance(frame_entry, dict):
             raise ValueError("first semantic frame is outside the recording manifest")
+        first_frame = self.camera_controller.load_recording_rgbd_frame(
+            first_source_id, first_local_index
+        )
+        permitted = allowed_frame_indices or {frame_index}
+        loaded_frames = {frame_index: first_frame}
         scene = semantic_draft.get("scene_observation") or {}
         anchors: list[dict[str, Any]] = []
         warnings: list[str] = []
@@ -1257,6 +1483,27 @@ class MVPApplication:
             if not isinstance(region, dict):
                 warnings.append(f"{role}: semantic ROI missing")
                 continue
+            observation_frame_index = int(
+                observation.get("representative_frame_index", frame_index)
+            )
+            if observation_frame_index not in permitted:
+                warnings.append(
+                    f"{role}: representative frame is not a supplied RGB keyframe"
+                )
+                continue
+            mapped_observation = global_frame_mapping.get(observation_frame_index)
+            if mapped_observation is None:
+                warnings.append(f"{role}: representative frame is outside the manifest")
+                continue
+            observation_source_id, observation_local_index, observation_entry = (
+                mapped_observation
+            )
+            observation_frame = loaded_frames.get(observation_frame_index)
+            if observation_frame is None:
+                observation_frame = self.camera_controller.load_recording_rgbd_frame(
+                    observation_source_id, observation_local_index
+                )
+                loaded_frames[observation_frame_index] = observation_frame
             bounds = (
                 float(region["x_min"]),
                 float(region["y_min"]),
@@ -1264,7 +1511,7 @@ class MVPApplication:
                 float(region["y_max"]),
             )
             try:
-                metric = reconstruct_semantic_roi_anchor(frame, bounds)
+                metric = reconstruct_semantic_roi_anchor(observation_frame, bounds)
             except (KeyError, TypeError, ValueError) as exc:
                 warnings.append(f"{role}: {exc}")
                 continue
@@ -1277,33 +1524,45 @@ class MVPApplication:
                     "semantic_confidence": observation.get("confidence"),
                     "semantic_region_normalized": region,
                     **metric.as_dict(),
-                    "frame_id": frame.reference_frame,
-                    "timestamp_ns": frame.timestamp_ns,
+                    "frame_index": observation_frame_index,
+                    "source_recording_id": observation_source_id,
+                    "source_frame_index": observation_local_index,
+                    "frame_id": observation_frame.reference_frame,
+                    "timestamp_ns": observation_frame.timestamp_ns,
+                    "rgb_uri": observation_entry.get("rgb_uri"),
+                    "rgb_checksum_sha256": observation_entry.get(
+                        "rgb_checksum_sha256"
+                    ),
+                    "depth_uri": observation_entry.get("depth_uri"),
+                    "depth_checksum_sha256": observation_entry.get(
+                        "depth_checksum_sha256"
+                    ),
                     "operator_confirmed": False,
                     "usable_for_skill_binding": False,
                 }
             )
         return {
             "schema_version": "1.0",
-            "evidence_type": "first_frame_semantic_anchor_candidates",
+            "evidence_type": "keyframe_semantic_anchor_candidates",
             "recording_id": recording_id,
             "frame_index": frame_index,
-            "frame_id": frame.reference_frame,
-            "timestamp_ns": frame.timestamp_ns,
+            "keyframe_indices": sorted(permitted),
+            "frame_id": first_frame.reference_frame,
+            "timestamp_ns": first_frame.timestamp_ns,
             "rgb_uri": frame_entry.get("rgb_uri"),
             "rgb_checksum_sha256": frame_entry.get("rgb_checksum_sha256"),
             "depth_uri": frame_entry.get("depth_uri"),
             "depth_checksum_sha256": frame_entry.get("depth_checksum_sha256"),
             "intrinsics": {
-                "width_px": frame.color_intrinsics.width_px,
-                "height_px": frame.color_intrinsics.height_px,
-                "fx_px": frame.color_intrinsics.fx_px,
-                "fy_px": frame.color_intrinsics.fy_px,
-                "cx_px": frame.color_intrinsics.cx_px,
-                "cy_px": frame.color_intrinsics.cy_px,
-                "distortion_model": frame.color_intrinsics.distortion_model,
+                "width_px": first_frame.color_intrinsics.width_px,
+                "height_px": first_frame.color_intrinsics.height_px,
+                "fx_px": first_frame.color_intrinsics.fx_px,
+                "fy_px": first_frame.color_intrinsics.fy_px,
+                "cx_px": first_frame.color_intrinsics.cx_px,
+                "cy_px": first_frame.color_intrinsics.cy_px,
+                "distortion_model": first_frame.color_intrinsics.distortion_model,
                 "distortion_coefficients": list(
-                    frame.color_intrinsics.distortion_coefficients
+                    first_frame.color_intrinsics.distortion_coefficients
                 ),
             },
             "anchors": anchors,
@@ -1871,12 +2130,20 @@ class MVPApplication:
         draft_path = self._recording_skill_draft_path(draft_id)
         draft_payload = json.loads(draft_path.read_text(encoding="utf-8"))
         draft_payload["artifact_uri"] = draft_path.relative_to(self.store.root).as_posix()
-        calibration = self._latest_draft_evidence(
-            draft_payload, "surface_calibration_*.json"
-        )
-        trajectory = self._latest_draft_evidence(
-            draft_payload, "tcp_trajectory_*.json"
-        )
+        calibration: dict[str, Any] | None
+        trajectory: dict[str, Any] | None
+        if self._fixed_workspace_reuse_enabled():
+            calibration = self._ensure_fixed_workspace_calibration(draft_payload)
+            trajectory = self._ensure_fixed_workspace_trajectory(
+                draft_payload, calibration
+            )
+        else:
+            calibration = self._latest_draft_evidence(
+                draft_payload, "surface_calibration_*.json"
+            )
+            trajectory = self._latest_draft_evidence(
+                draft_payload, "tcp_trajectory_*.json"
+            )
         if calibration is None or trajectory is None:
             raise ValueError("surface calibration and TCP trajectory are required")
         if trajectory.get("calibration_id") != calibration.get("calibration_id"):
@@ -1997,6 +2264,301 @@ class MVPApplication:
             f"demonstrations/{payload['source_recording_id']}/skill_drafts/"
             f"{payload['draft_id']}_evidence"
         )
+
+    def _fixed_workspace_reuse_enabled(self) -> bool:
+        """Return whether this server is running the acknowledged fixed cell setup.
+
+        The fixed workspace is intentionally a hardware-session capability.  Mock
+        tests and ordinary recording review keep the manual teaching tools, while
+        the M0609 station reuses its already selected [0, 0, 90, 0, 90, -90]
+        workspace for every draft.
+        """
+
+        return self.settings.hardware_enabled
+
+    def _fixed_workspace_calibration_payload(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Represent the frozen NPZ/URDF workspace as a draft task-plane TF.
+
+        This is deliberately deterministic: it reads the same reference camera
+        plane used to produce the stored base-plane candidate instead of asking
+        for three pixels or running ArUco again.
+        """
+
+        source = (
+            self.settings.repo_root
+            / "aruco/results/d435i_plane_scans/scan_20260807_123803/"
+            "base_workspace_urdf_candidate.json"
+        ).resolve()
+        fixed = json.loads(source.read_text(encoding="utf-8"))
+        transforms = fixed.get("transforms")
+        if not isinstance(transforms, dict):
+            raise ValueError("fixed workspace artifact has no transform payload")
+        camera_to_plane = rigid_transform_from_matrix(
+            transforms.get("reference_T_camera_plane"),
+            label="fixed reference T_camera_plane",
+        )
+        base_to_plane = rigid_transform_from_matrix(
+            transforms.get(
+                "T_base_plane_from_urdf_camera_and_reference_T_camera_plane"
+            ),
+            label="fixed reference T_base_plane",
+        )
+        frame_id = "camera_color_optical_frame"
+        anchors = payload.get("initial_scene_anchors") or {}
+        if isinstance(anchors, dict):
+            artifact_uri = anchors.get("artifact_uri")
+            checksum = anchors.get("artifact_checksum_sha256")
+            if isinstance(artifact_uri, str) and isinstance(checksum, str):
+                try:
+                    anchor_evidence = json.loads(
+                        self.store.read_bytes(
+                            artifact_uri,
+                            expected_checksum_sha256=checksum,
+                        ).decode("utf-8")
+                    )
+                    if isinstance(anchor_evidence, dict) and isinstance(
+                        anchor_evidence.get("frame_id"), str
+                    ):
+                        frame_id = str(anchor_evidence["frame_id"])
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    # The recorded frame metadata is advisory here.  The frozen
+                    # artifact itself is explicitly for the optical camera frame.
+                    pass
+        if frame_id != "camera_color_optical_frame":
+            raise ValueError(
+                "fixed workspace is defined for camera_color_optical_frame, "
+                f"not {frame_id!r}"
+            )
+        calibration_id = f"cal_fixed_workspace_{str(payload['draft_id']).removeprefix('draft_')}"
+        return {
+            "schema_version": "1.0",
+            "evidence_type": "fixed_workspace_task_plane_reuse",
+            "calibration_id": calibration_id,
+            "draft_id": str(payload["draft_id"]),
+            "recording_id": str(payload["source_recording_id"]),
+            "source_frame": frame_id,
+            "parent_frame_id": frame_id,
+            "child_frame_id": "fixed_workspace_surface",
+            "surface_anchor_id": "fixed_workspace_surface",
+            "method": "fixed_workspace_npz_urdf_reuse",
+            "transform_convention": "T_camera_task_plane",
+            "task_plane_revision": calibration_id,
+            "camera_to_task_plane": camera_to_plane.model_dump(mode="json"),
+            "camera_to_surface": camera_to_plane.model_dump(mode="json"),
+            "base_chain": {
+                "available": True,
+                "verified": False,
+                "operator_fixed_workspace_reuse": True,
+                "parent_frame_id": "base_link",
+                "child_frame_id": "fixed_workspace_surface",
+                "transform_convention": "T_base_task_plane",
+                "base_to_task_plane": base_to_plane.model_dump(mode="json"),
+                "source_artifact": source.as_posix(),
+            },
+            "fixed_workspace_reuse": True,
+            "operator_confirmed": True,
+            "hardware_validated": False,
+            "created_at_ns": time.time_ns(),
+        }
+
+    def _ensure_fixed_workspace_calibration(
+        self, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist the fixed station's task plane once per semantic draft."""
+
+        existing = self._latest_draft_evidence(payload, "surface_calibration_*.json")
+        if existing is not None and existing.get("fixed_workspace_reuse") is True:
+            return existing
+        evidence = self._fixed_workspace_calibration_payload(payload)
+        artifact = self.store.put_json(
+            f"{self._draft_evidence_root(payload)}/"
+            f"surface_calibration_{evidence['calibration_id']}.json",
+            evidence,
+        )
+        return {
+            **evidence,
+            "artifact_uri": artifact.uri,
+            "artifact_checksum_sha256": artifact.checksum_sha256,
+        }
+
+    def _fixed_workspace_semantic_trajectory(
+        self,
+        payload: dict[str, Any],
+        calibration: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project the recorded semantic fingertip trace onto the fixed plane.
+
+        This fallback keeps older recordings usable even when their raw RGB-D
+        frame files have been archived.  It only uses the stored image intrinsics,
+        the frozen camera-to-plane transform, and the already persisted trace.
+        """
+
+        anchor_metadata = payload.get("initial_scene_anchors") or {}
+        if not isinstance(anchor_metadata, dict):
+            raise ValueError("fixed workspace projection needs recorded intrinsics")
+        anchor_uri = anchor_metadata.get("artifact_uri")
+        anchor_checksum = anchor_metadata.get("artifact_checksum_sha256")
+        if not isinstance(anchor_uri, str) or not isinstance(anchor_checksum, str):
+            raise ValueError("fixed workspace projection needs recorded intrinsics")
+        anchor_evidence = json.loads(
+            self.store.read_bytes(
+                anchor_uri, expected_checksum_sha256=anchor_checksum
+            ).decode("utf-8")
+        )
+        intrinsics = (
+            anchor_evidence.get("intrinsics")
+            if isinstance(anchor_evidence, dict)
+            else None
+        )
+        if not isinstance(intrinsics, dict):
+            raise ValueError("fixed workspace projection needs recorded intrinsics")
+        try:
+            width_px = int(intrinsics["width_px"])
+            height_px = int(intrinsics["height_px"])
+            fx_px = float(intrinsics["fx_px"])
+            fy_px = float(intrinsics["fy_px"])
+            cx_px = float(intrinsics["cx_px"])
+            cy_px = float(intrinsics["cy_px"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("fixed workspace projection has invalid intrinsics") from exc
+        if min(width_px, height_px, fx_px, fy_px) <= 0:
+            raise ValueError("fixed workspace projection has invalid intrinsics")
+        semantic = payload.get("draft") or {}
+        tcp = semantic.get("tcp_proxy_observation") if isinstance(semantic, dict) else None
+        states = tcp.get("observed_states") if isinstance(tcp, dict) else None
+        if not isinstance(states, list):
+            raise ValueError("semantic draft has no fingertip trace to project")
+        camera_to_surface = RigidTransform.model_validate(
+            calibration["camera_to_task_plane"]
+        )
+        plane_normal_camera = rotate_vector(
+            camera_to_surface.rotation_xyzw, Vector3(x=0.0, y=0.0, z=1.0)
+        )
+        plane_point_camera = camera_to_surface.translation_m
+        denominator_offset = (
+            plane_normal_camera.x * plane_point_camera.x
+            + plane_normal_camera.y * plane_point_camera.y
+            + plane_normal_camera.z * plane_point_camera.z
+        )
+        samples: list[ManualTCPPathSample] = []
+        for sequence_index, state in enumerate(states):
+            if not isinstance(state, dict) or state.get("landmarks_detected") is not True:
+                continue
+            midpoint = state.get("midpoint_normalized")
+            if not isinstance(midpoint, dict):
+                continue
+            try:
+                pixel_x = float(midpoint["x"]) * (width_px - 1)
+                pixel_y = float(midpoint["y"]) * (height_px - 1)
+            except (KeyError, TypeError, ValueError):
+                continue
+            ray_x = (pixel_x - cx_px) / fx_px
+            ray_y = (pixel_y - cy_px) / fy_px
+            denominator = (
+                plane_normal_camera.x * ray_x
+                + plane_normal_camera.y * ray_y
+                + plane_normal_camera.z
+            )
+            if abs(denominator) <= 1e-9:
+                continue
+            scale = denominator_offset / denominator
+            if not math.isfinite(scale) or scale <= 0.0:
+                continue
+            surface_pose = transform_camera_pose_to_surface(
+                camera_to_surface,
+                RigidTransform(
+                    translation_m=Vector3(
+                        x=scale * ray_x, y=scale * ray_y, z=scale
+                    ),
+                    rotation_xyzw=camera_to_surface.rotation_xyzw,
+                ),
+            )
+            samples.append(
+                ManualTCPPathSample(
+                    frame_index=int(state.get("frame_index", sequence_index)),
+                    timestamp_ns=int(payload.get("created_at_ns") or 0) + sequence_index,
+                    position_surface_m=surface_pose.translation_m.as_tuple(),
+                    orientation_surface_xyzw=surface_pose.rotation_xyzw.as_tuple(),
+                    gripper_width_m=0.03,
+                    confidence=float(state.get("confidence") or 0.5),
+                )
+            )
+        quality = validate_surface_relative_path(samples)
+        trajectory_id = f"trajectory_{uuid.uuid4().hex}"
+        evidence = {
+            "schema_version": "1.0",
+            "evidence_type": "fixed_workspace_projected_tcp_trajectory",
+            "trajectory_id": trajectory_id,
+            "draft_id": str(payload["draft_id"]),
+            "recording_id": str(payload["source_recording_id"]),
+            "calibration_id": calibration["calibration_id"],
+            "surface_anchor_id": calibration["surface_anchor_id"],
+            "frame_id": calibration["surface_anchor_id"],
+            "method": "fixed_workspace_semantic_trace_projection",
+            "tcp_definition": "semantic_fingertip_midpoint_projected_to_fixed_plane",
+            "orientation_definition": "fixed_task_plane",
+            "samples": [
+                {
+                    "frame_index": sample.frame_index,
+                    "timestamp_ns": sample.timestamp_ns,
+                    "position_surface_m": sample.position_surface_m,
+                    "orientation_surface_xyzw": sample.orientation_surface_xyzw,
+                    "gripper_width_m": sample.gripper_width_m,
+                    "confidence": sample.confidence,
+                }
+                for sample in samples
+            ],
+            "quality": {
+                **quality,
+                "coverage_ratio": len(samples) / max(1, len(states)),
+            },
+            "state_transitions": [],
+            "finger_observations": [],
+            "invalid_frames": [],
+            "semantic_conflicts": [],
+            "fixed_workspace_reuse": True,
+            "operator_confirmed": True,
+            "hardware_validated": False,
+            "created_at_ns": time.time_ns(),
+        }
+        artifact = self.store.put_json(
+            f"{self._draft_evidence_root(payload)}/"
+            f"tcp_trajectory_{trajectory_id}.json",
+            evidence,
+        )
+        return {
+            **evidence,
+            "artifact_uri": artifact.uri,
+            "artifact_checksum_sha256": artifact.checksum_sha256,
+        }
+
+    def _ensure_fixed_workspace_trajectory(
+        self,
+        payload: dict[str, Any],
+        calibration: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build the fixed-workspace path automatically when Candidate is clicked."""
+
+        existing = self._latest_draft_evidence(payload, "tcp_trajectory_*.json")
+        if existing is not None and existing.get("calibration_id") == calibration.get(
+            "calibration_id"
+        ):
+            return existing
+        try:
+            return self.create_recording_draft_tcp_trajectory(
+                str(payload["draft_id"]),
+                {"method": "mediapipe_rgbd", "operator_confirmed": True},
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            try:
+                return self.create_recording_draft_tcp_trajectory(
+                    str(payload["draft_id"]),
+                    {"method": "openai_rgbd", "operator_confirmed": True},
+                )
+            except (KeyError, OSError, TypeError, ValueError):
+                return self._fixed_workspace_semantic_trajectory(payload, calibration)
 
     @staticmethod
     def _recording_has_complete_rgbd_evidence(payload: dict[str, Any]) -> bool:
@@ -2620,6 +3182,42 @@ class MVPApplication:
         elif not gripper_events:
             append_motion_segment(samples, segment_index)
         has_gripper = bool(gripper_events)
+        motion_phase_policy = self._recording_motion_phase_policy(node_specs)
+        close_frame_index = next(
+            (
+                int(item["frame_index"])
+                for _boundary, item in gripper_events
+                if item["state"] == "closed"
+            ),
+            None,
+        )
+        final_open_frame_index = next(
+            (
+                int(item["frame_index"])
+                for _boundary, item in reversed(gripper_events)
+                if item["state"] == "open"
+                and (
+                    close_frame_index is None
+                    or int(item["frame_index"]) > close_frame_index
+                )
+            ),
+            None,
+        )
+        for item in simplification_provenance:
+            start_frame_index = int(item["start_frame_index"])
+            end_frame_index = int(item["end_frame_index"])
+            if close_frame_index is None:
+                phase = "action"
+            elif end_frame_index <= close_frame_index:
+                phase = "grip"
+            elif (
+                final_open_frame_index is not None
+                and start_frame_index >= final_open_frame_index
+            ):
+                phase = "end_motion"
+            else:
+                phase = "action"
+            item["grip_action_end_phase"] = phase
         nodes = [
             SkillNode(
                 node_id=node_id,
@@ -2716,6 +3314,14 @@ class MVPApplication:
                 "base_chain": calibration.get("base_chain"),
                 "tcp_trajectory_id": trajectory["trajectory_id"],
                 "trajectory_quality": trajectory["quality"],
+                "observed_trajectory_task_plane_m": [
+                    [
+                        float(sample["position_surface_m"][0]),
+                        float(sample["position_surface_m"][1]),
+                        float(sample["position_surface_m"][2]),
+                    ]
+                    for sample in samples
+                ],
                 "gripper_state_transitions": [
                     {
                         "frame_index": int(item["frame_index"]),
@@ -2728,6 +3334,7 @@ class MVPApplication:
                 ],
                 "gripper_behavior_unresolved": not has_gripper,
                 "motion_simplification": simplification_provenance,
+                "grip_action_end_motion_policy": motion_phase_policy,
                 "semantic_conflicts": trajectory.get("semantic_conflicts") or [],
                 "initial_scene_anchor_evidence": draft_payload.get(
                     "initial_scene_anchors"
@@ -2749,6 +3356,88 @@ class MVPApplication:
             validation_status=ValidationStatus.PENDING,
             lifecycle_status=SkillLifecycleStatus.CANDIDATE,
         )
+
+    @staticmethod
+    def _recording_motion_phase_policy(
+        node_specs: list[tuple[str, str, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Classify and enforce the generated Grip -> Action -> End block budget.
+
+        Geometry has already passed the bounded local simplifier when this is
+        called.  A larger result is rejected rather than silently crossing a
+        stable gripper boundary or dropping an observed motion interval.
+        """
+
+        first_close_index = next(
+            (
+                index
+                for index, (_node_id, operation, _arguments) in enumerate(node_specs)
+                if operation == "gripper.close"
+            ),
+            None,
+        )
+        final_open_index = next(
+            (
+                index
+                for index in range(len(node_specs) - 1, -1, -1)
+                if node_specs[index][1] == "gripper.open"
+                and (first_close_index is None or index > first_close_index)
+            ),
+            None,
+        )
+        phase_node_ids: dict[str, list[str]] = {
+            "grip": [],
+            "action": [],
+            "end_motion": [],
+        }
+        for index, (node_id, operation, _arguments) in enumerate(node_specs):
+            if not operation.startswith("motion."):
+                continue
+            if operation not in RECORDING_BLOCK_MOTION_OPERATIONS:
+                raise ValueError(
+                    "recording materialization emitted a path operation that is not "
+                    f"available as an approved Blockly motion block: {operation}"
+                )
+            if first_close_index is None:
+                phase = "action"
+            elif index < first_close_index:
+                phase = "grip"
+            elif final_open_index is not None and index > final_open_index:
+                phase = "end_motion"
+            else:
+                phase = "action"
+            phase_node_ids[phase].append(node_id)
+
+        limits = {
+            "action": MAXIMUM_ACTION_MOTION_BLOCKS,
+            "end_motion": MAXIMUM_END_MOTION_BLOCKS,
+        }
+        violations = [
+            f"{phase} has {len(phase_node_ids[phase])} motion blocks (maximum {limit})"
+            for phase, limit in limits.items()
+            if len(phase_node_ids[phase]) > limit
+        ]
+        if violations:
+            raise ValueError(
+                "Grip -> Action -> End path cannot be represented within the Blockly "
+                "motion budget after bounded local simplification without crossing a "
+                "gripper boundary: "
+                + "; ".join(violations)
+            )
+        return {
+            "schema_version": "1.0",
+            "source": "deterministic_local_trajectory_simplifier",
+            "allowed_motion_operations": sorted(RECORDING_BLOCK_MOTION_OPERATIONS),
+            "maximum_motion_blocks": limits,
+            "phases": {
+                phase: {
+                    "motion_node_ids": node_ids,
+                    "motion_block_count": len(node_ids),
+                }
+                for phase, node_ids in phase_node_ids.items()
+            },
+            "passed": True,
+        }
 
     @staticmethod
     def _bounded_path_chunks(
@@ -2808,6 +3497,12 @@ class MVPApplication:
             payload, "surface_calibration_*.json"
         )
         trajectory = self._latest_draft_evidence(payload, "tcp_trajectory_*.json")
+        if self._fixed_workspace_reuse_enabled() and (
+            calibration is None or calibration.get("fixed_workspace_reuse") is not True
+        ):
+            # The button can be enabled immediately: the exact evidence is
+            # persisted only when Candidate registration begins.
+            calibration = self._fixed_workspace_calibration_payload(payload)
         registration = self._latest_draft_evidence(
             payload, "candidate_registration_*.json"
         )
@@ -3286,6 +3981,13 @@ class MVPApplication:
                     segmentation.segmentation.evidence.action_intermediate_transitions
                 )
             ],
+            "motion_block_policy": {
+                "allowed_motion_operations": sorted(
+                    RECORDING_BLOCK_MOTION_OPERATIONS
+                ),
+                "maximum_motion_blocks": MAXIMUM_ACTION_MOTION_BLOCKS,
+                "geometry_owner": "deterministic_local_trajectory_simplifier",
+            },
             "source": common_source,
         }
         action_artifact = self._put_content_addressed_json(
@@ -3306,6 +4008,13 @@ class MVPApplication:
                     mode="json"
                 )
             ),
+            "motion_block_policy": {
+                "allowed_motion_operations": sorted(
+                    RECORDING_BLOCK_MOTION_OPERATIONS
+                ),
+                "maximum_motion_blocks": MAXIMUM_END_MOTION_BLOCKS,
+                "geometry_owner": "deterministic_local_trajectory_simplifier",
+            },
             "source": common_source,
         }
         end_artifact = self._put_content_addressed_json(
@@ -3648,22 +4357,199 @@ class MVPApplication:
                 ).tuples()
             )
         response: dict[str, Any] = {
-            "skills": [
-                {
-                    **self._version_summary(version, include_graph=True),
-                    "name": skill.name,
-                    "intent": skill.intent,
-                    "variant": skill.variant,
-                    "description": skill.description,
-                    "node_count": len(version.graph_json.get("nodes", [])),
-                }
-                for version, skill in rows
-            ]
+            "skills": [self._skill_registry_summary(version, skill) for version, skill in rows]
         }
         hierarchy = self.list_task_flow_hierarchy()
         if hierarchy["objects"]:
             response["task_flow_catalog"] = hierarchy
         return response
+
+    def _skill_registry_summary(
+        self, version: SkillVersionRecord, skill: SkillRecord
+    ) -> dict[str, Any]:
+        summary = {
+            **self._version_summary(version, include_graph=True),
+            "name": skill.name,
+            "intent": skill.intent,
+            "variant": skill.variant,
+            "description": skill.description,
+            "node_count": len(version.graph_json.get("nodes", [])),
+        }
+        repair = self._builtin_wipe_repair_metadata(version)
+        if repair is not None:
+            summary["repair"] = repair
+        return summary
+
+    @staticmethod
+    def _builtin_wipe_repair_metadata(
+        version: SkillVersionRecord,
+    ) -> dict[str, Any] | None:
+        """Identify only the known 1.0 relative-target/MoveJ registry regression."""
+
+        graph = version.graph_json
+        if (
+            graph.get("skill_id") != "wipe_surface"
+            or version.status != "active"
+            or version.validation_status != "failed"
+        ):
+            return None
+        nodes = graph.get("nodes")
+        if not isinstance(nodes, list):
+            return None
+        legacy_node = next(
+            (
+                node
+                for node in nodes
+                if isinstance(node, dict) and node.get("node_id") == "approach_joint"
+            ),
+            None,
+        )
+        if not isinstance(legacy_node, dict):
+            return None
+        arguments = legacy_node.get("arguments")
+        if (
+            legacy_node.get("operation") != "motion.move_j"
+            or not isinstance(arguments, dict)
+            or "target" not in arguments
+            or "target_joint_positions_rad" in arguments
+        ):
+            return None
+        return {
+            "available": True,
+            "repair_id": "wipe_surface_relative_pre_approach_v1",
+            "reason": (
+                "legacy approach_joint stores an anchor-relative target under motion.move_j"
+            ),
+            "mock_only": True,
+            "preserves_parent": True,
+        }
+
+    def repair_builtin_wipe_skill(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Create, validate, and activate a corrected Mock-only child version."""
+
+        if request.get("acknowledge_mock_only") is not True:
+            raise ValueError("built-in wipe repair requires Mock-only acknowledgement")
+        parent = self._find_version("wipe_surface")
+        expected_checksum = str(request.get("expected_parent_checksum_sha256") or "")
+        if expected_checksum != parent.graph_checksum_sha256:
+            raise ValueError("wipe repair parent checksum no longer matches the registry")
+
+        repair = self._builtin_wipe_repair_metadata(parent)
+        if repair is None:
+            if (
+                parent.status == "active"
+                and parent.validation_status == "passed"
+                and SkillGraphValidator().inspect(
+                    SkillGraph.model_validate(parent.graph_json)
+                ).valid
+            ):
+                return {
+                    "repaired": False,
+                    "already_ready": True,
+                    "mock_only": True,
+                    "active": self._version_summary(parent, include_graph=True),
+                }
+            raise ValueError(
+                "selected wipe_surface version is not the recognized built-in regression"
+            )
+
+        parent_graph = SkillGraph.model_validate(parent.graph_json)
+        repaired_nodes: list[SkillNode] = []
+        for node in parent_graph.nodes:
+            updates: dict[str, Any] = {}
+            if node.node_id == "approach_joint":
+                updates.update(
+                    {
+                        "node_id": "pre_approach_linear",
+                        "operation": "motion.move_l",
+                        "arguments": {
+                            "target": node.arguments["target"],
+                            "motion_profile_id": "linear_slow",
+                        },
+                    }
+                )
+            if node.on_success == "approach_joint":
+                updates["on_success"] = "pre_approach_linear"
+            if node.on_failure == "approach_joint":
+                updates["on_failure"] = "pre_approach_linear"
+            repaired_nodes.append(
+                node.model_copy(update=updates, deep=True) if updates else node
+            )
+        repaired_motion_profiles = list(parent_graph.motion_profiles)
+        if "linear_slow" not in repaired_motion_profiles:
+            repaired_motion_profiles.append("linear_slow")
+        if not any(
+            node.arguments.get("motion_profile_id") == "joint_safe"
+            for node in repaired_nodes
+        ):
+            repaired_motion_profiles = [
+                profile
+                for profile in repaired_motion_profiles
+                if profile != "joint_safe"
+            ]
+        existing_versions = {row.semantic_version for row in self._versions("wipe_surface")}
+        candidate_version = next_candidate_version(parent.semantic_version)
+        while (
+            candidate_version in existing_versions
+            or stable_version(candidate_version) in existing_versions
+        ):
+            parsed = SemanticVersion.parse(candidate_version)
+            candidate_version = str(
+                SemanticVersion(parsed.major, parsed.minor + 1, 0, "candidate")
+            )
+        candidate_graph = parent_graph.model_copy(
+            update={
+                "version": candidate_version,
+                "parent_version": parent.semantic_version,
+                "nodes": repaired_nodes,
+                "motion_profiles": repaired_motion_profiles,
+                "validation_status": ValidationStatus.UNVALIDATED,
+                "lifecycle_status": SkillLifecycleStatus.CANDIDATE,
+                "uncertainty": {
+                    **parent_graph.uncertainty,
+                    "builtin_repair": {
+                        "repair_id": repair["repair_id"],
+                        "parent_version": parent.semantic_version,
+                        "parent_checksum_sha256": parent.graph_checksum_sha256,
+                        "mock_only": True,
+                    },
+                },
+            },
+            deep=True,
+        )
+        candidate = self._persist_graph(
+            candidate_graph,
+            status="candidate",
+            validation_status="pending",
+            variant=self._skill_variant(parent),
+            parent_version_id=parent.id,
+        )
+        validation = self.validate_skill(
+            "wipe_surface", {"version": candidate.semantic_version, "mode": "mock"}
+        )
+        if not validation["passed"]:
+            return {
+                "repaired": False,
+                "already_ready": False,
+                "mock_only": True,
+                "candidate": self._version_summary(
+                    self._find_version("wipe_surface", candidate.semantic_version),
+                    include_graph=True,
+                ),
+                "validation": validation,
+            }
+        active = self.activate_skill(
+            "wipe_surface", {"version": candidate.semantic_version}
+        )
+        return {
+            "repaired": True,
+            "already_ready": False,
+            "mock_only": True,
+            "parent_version": parent.semantic_version,
+            "candidate_version": candidate.semantic_version,
+            "validation": validation,
+            "active": active,
+        }
 
     def delete_skill(self, skill_id: str) -> dict[str, Any]:
         """Delete an inactive skill identity and all of its candidate versions."""
@@ -4188,6 +5074,15 @@ class MVPApplication:
                 "inline_velocity_acceleration_force_allowed": False,
                 "candidate_only": True,
                 "hardware_compatible": False,
+                "generated_grip_action_end": {
+                    "allowed_motion_operations": sorted(
+                        RECORDING_BLOCK_MOTION_OPERATIONS
+                    ),
+                    "maximum_action_motion_blocks": (
+                        MAXIMUM_ACTION_MOTION_BLOCKS
+                    ),
+                    "maximum_end_motion_blocks": MAXIMUM_END_MOTION_BLOCKS,
+                },
             },
         }
 
@@ -4470,13 +5365,24 @@ class MVPApplication:
             for placeholder, binding in bindings.items()
             if binding.role is not None
         }
+        source_recording_ids = [
+            str(recording_id) for recording_id in request.get("source_recording_ids", [])
+        ]
+        source_demonstrations = [
+            str(
+                self.camera_controller.get_recording_manifest(
+                    recording_id, include_frames=False
+                )["manifest_uri"]
+            )
+            for recording_id in source_recording_ids
+        ]
         return SkillGraph(
             skill_id=str(request["skill_id"]),
             version=version,
             name=str(request["name"]),
             description=str(request["description"]),
             skill_type=skill_type,
-            source_demonstrations=[],
+            source_demonstrations=source_demonstrations,
             required_tools=required_tools,
             required_entity_roles=required_roles,
             bindings=bindings,
@@ -4489,6 +5395,7 @@ class MVPApplication:
                 "authoring_method": "sequential_block_editor",
                 "demonstration_required": False,
                 "hardware_compatible": False,
+                "source_recording_ids": source_recording_ids,
             },
             validation_status=ValidationStatus.UNVALIDATED,
             lifecycle_status=SkillLifecycleStatus.CANDIDATE,
@@ -4998,6 +5905,43 @@ class MVPApplication:
             approved_motion_profiles=list(self._motion_profiles()),
             approved_force_profiles=list(self._force_profiles()),
         )
+        local_match = self._local_command_skill_match(str(request["text"]))
+        if local_match is not None:
+            matched_row, matched_name = local_match
+            intent = intent.model_copy(
+                update={
+                    "skill_query": str(matched_row.graph_json["skill_id"]),
+                    "tool_query": None,
+                    "target_query": None,
+                    "speed_profile_request": None,
+                    "force_profile_request": None,
+                    "confidence": 1.0,
+                    "unresolved_ambiguities": [],
+                    "ambiguity": False,
+                    "confidence_rationale": "exact local command phrase matched an active skill",
+                },
+                deep=True,
+            )
+            return {
+                "intent": intent.model_dump(mode="json"),
+                "trace": metadata.model_dump(mode="json"),
+                "skill_candidates": {
+                    "mode": "local_command_phrase",
+                    "results": [
+                        {
+                            "skill_id": str(matched_row.graph_json["skill_id"]),
+                            "version": matched_row.semantic_version,
+                            "name": matched_name,
+                            "score": 1.0,
+                            "factors": {
+                                "local_command_phrase": 1.0,
+                                "embedding_used": False,
+                            },
+                        }
+                    ],
+                },
+                "resolver_mode": "local_command_phrase",
+            }
         matches = self.search_skills(
             {
                 "query": intent.skill_query or intent.intent,
@@ -5014,6 +5958,51 @@ class MVPApplication:
             "skill_candidates": matches,
             "resolver_mode": "legacy_monolithic_compatibility",
         }
+
+    def _local_command_skill_match(
+        self, text: str
+    ) -> tuple[SkillVersionRecord, str] | None:
+        """Match an exact normalized command phrase embedded in one active skill.
+
+        This deterministic path is intentionally narrow: short fragments do not match, and
+        ambiguity returns no result so the normal semantic resolver remains authoritative.
+        """
+
+        normalized_text = self._normalize_command_phrase(text)
+        if len(normalized_text) < 4:
+            return None
+        with self.database.session() as session:
+            rows = list(
+                session.execute(
+                    select(SkillVersionRecord, SkillRecord)
+                    .join(SkillRecord, SkillVersionRecord.skill_id == SkillRecord.id)
+                    .where(
+                        SkillRecord.active_version_id == SkillVersionRecord.id,
+                        SkillVersionRecord.status == "active",
+                        SkillVersionRecord.validation_status == "passed",
+                    )
+                ).tuples()
+            )
+        matches: list[tuple[SkillVersionRecord, str]] = []
+        for version, skill in rows:
+            graph = SkillGraph.model_validate(version.graph_json)
+            uncertainty_aliases = graph.uncertainty.get("command_aliases", [])
+            aliases = (
+                [str(value) for value in uncertainty_aliases]
+                if isinstance(uncertainty_aliases, list)
+                else []
+            )
+            searchable = [graph.name, graph.description, skill.name, skill.description, *aliases]
+            if any(
+                normalized_text in self._normalize_command_phrase(value)
+                for value in searchable
+            ):
+                matches.append((version, skill.name))
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _normalize_command_phrase(value: str) -> str:
+        return "".join(character.casefold() for character in value if character.isalnum())
 
     @staticmethod
     def _task_scene_entities(
@@ -5276,7 +6265,10 @@ class MVPApplication:
         if (
             scene.reference_frame in {"base", "base_link", "robot_base"}
             and isinstance(base_chain, dict)
-            and base_chain.get("verified") is True
+            and (
+                base_chain.get("verified") is True
+                or base_chain.get("operator_fixed_workspace_reuse") is True
+            )
             and isinstance(base_chain.get("base_to_task_plane"), dict)
         ):
             transform_payload = base_chain["base_to_task_plane"]
@@ -5319,9 +6311,72 @@ class MVPApplication:
             surface for surface in scene.surfaces if surface.instance_id != anchor_id
         ]
         surfaces.append(task_plane)
+        workspace_regions = list(scene.workspace_regions)
+        observed_path = uncertainty.get("observed_trajectory_task_plane_m")
+        if isinstance(observed_path, list) and observed_path:
+            observed_points: list[Vector3] = []
+            for value in observed_path:
+                if not isinstance(value, list) or len(value) != 3:
+                    observed_points = []
+                    break
+                relative = Vector3(
+                    x=float(value[0]), y=float(value[1]), z=float(value[2])
+                )
+                rotated = rotate_vector(transform.rotation_xyzw, relative)
+                observed_points.append(
+                    Vector3(
+                        x=transform.translation_m.x + rotated.x,
+                        y=transform.translation_m.y + rotated.y,
+                        z=transform.translation_m.z + rotated.z,
+                    )
+                )
+            # These narrow boxes are derived from the operator-confirmed RGB-D
+            # trajectory and cover only each measured segment. They extend Mock
+            # observed-space evidence; collision volumes and hardware gates remain
+            # unchanged and are still evaluated independently.
+            segment_points = (
+                list(zip(observed_points, observed_points[1:], strict=False))
+                if len(observed_points) >= 2
+                else [(observed_points[0], observed_points[0])]
+                if observed_points
+                else []
+            )
+            for index, (start, end) in enumerate(segment_points):
+                padding_m = 0.002
+                workspace_regions.append(
+                    WorkspaceRegion(
+                        region_id=f"{anchor_id}_observed_segment_{index:03d}",
+                        role=WorkspaceRole.FREE_SPACE,
+                        geometry={
+                            "type": "box",
+                            "center_m": [
+                                (start.x + end.x) / 2.0,
+                                (start.y + end.y) / 2.0,
+                                (start.z + end.z) / 2.0,
+                            ],
+                            "size_m": [
+                                max(abs(end.x - start.x), padding_m),
+                                max(abs(end.y - start.y), padding_m),
+                                max(abs(end.z - start.z), padding_m),
+                            ],
+                        },
+                        frame_id=scene.reference_frame,
+                        minimum_clearance_m=0.0,
+                        access_policy=AccessPolicy.ALLOWED,
+                        confidence=min(
+                            0.99,
+                            float(
+                                (uncertainty.get("trajectory_quality") or {}).get(
+                                    "mean_confidence", 0.0
+                                )
+                            ),
+                        ),
+                    )
+                )
         return scene.model_copy(
             update={
                 "surfaces": surfaces,
+                "workspace_regions": workspace_regions,
                 "calibration_id": str(
                     uncertainty.get("task_plane_calibration_id")
                     or scene.calibration_id
@@ -5333,9 +6388,13 @@ class MVPApplication:
     def bind_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         row = self._find_version(str(request["skill_id"]), request.get("version"))
         graph = SkillGraph.model_validate(row.graph_json)
+        if str(request.get("mode", "mock")) == "hardware":
+            _, base_to_plane = self._acquire_fixed_hardware_session()
+            graph = self._graph_with_aruco_base_plane(graph, base_to_plane)
         scene = self._scene_with_graph_task_plane(
             self._scene(str(request["scene_id"])), graph
         )
+        scene = self._scene_with_mock_binding_fixtures(scene, graph)
         hints = dict(request.get("entity_hints", {}))
         requirements = [
             requirement.model_copy(update={"instance_id": hints.get(requirement.variable)})
@@ -5356,10 +6415,22 @@ class MVPApplication:
         }
 
     def preflight_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
-        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(request)
         mode = ExecutionMode(str(request.get("mode", "mock")))
+        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(request)
         safety_policy = self._safety_policy()
-        report = PreflightValidator().validate(
+        geometry_validator = (
+            DoosanFixedPlaneGeometryValidator(robot, minimum_clearance_m=0.0)
+            if mode is ExecutionMode.HARDWARE
+            else None
+        )
+        preflight_policy = (
+            PreflightPolicy(maximum_scene_age_ms=1_800_000, minimum_clearance_m=0.0)
+            if mode is ExecutionMode.HARDWARE
+            else None
+        )
+        report = PreflightValidator(
+            geometry_validator=geometry_validator, policy=preflight_policy
+        ).validate(
             scene=scene,
             skill=graph,
             bindings=bindings,
@@ -5377,6 +6448,8 @@ class MVPApplication:
             robot_backend=self.settings.robot_backend,
             enable_real_robot=self.settings.enable_real_robot,
             dry_run=self.settings.dry_run,
+            hardware_workspace_monitor_verified=mode is ExecutionMode.HARDWARE,
+            hardware_scene_monitor_verified=mode is ExecutionMode.HARDWARE,
         )
         return report.as_dict()
 
@@ -5397,15 +6470,25 @@ class MVPApplication:
                 raise ValueError(
                     "Mock override requires operator, reason, and explicit acknowledgements"
                 )
-        if requested_mode == "hardware":
-            if not self.settings.hardware_enabled:
-                raise ValueError("hardware execution gates are not all enabled")
-            raise ValueError("Doosan hardware adapter is not configured or physically validated")
+        if requested_mode == "hardware" and not self.settings.hardware_enabled:
+            raise ValueError("hardware execution gates are not all enabled")
         row, graph, scene, bindings, robot, motion, force = self._runtime_parts(
             request, allow_mock_candidate=mock_override is not None
         )
         safety_policy = self._safety_policy()
-        report = PreflightValidator().validate(
+        geometry_validator = (
+            DoosanFixedPlaneGeometryValidator(robot, minimum_clearance_m=0.0)
+            if requested_mode == "hardware"
+            else None
+        )
+        preflight_policy = (
+            PreflightPolicy(maximum_scene_age_ms=1_800_000, minimum_clearance_m=0.0)
+            if requested_mode == "hardware"
+            else None
+        )
+        report = PreflightValidator(
+            geometry_validator=geometry_validator, policy=preflight_policy
+        ).validate(
             scene=scene,
             skill=graph,
             bindings=bindings,
@@ -5420,12 +6503,28 @@ class MVPApplication:
             force_profiles=force,
             verification_profiles=self._verification_profiles(),
             safety_policy=safety_policy,
-            robot_backend="mock",
-            enable_real_robot=False,
-            dry_run=True,
+            enable_hardware_execution=self.settings.hardware_enabled,
+            robot_backend=self.settings.robot_backend,
+            enable_real_robot=self.settings.enable_real_robot,
+            dry_run=self.settings.dry_run,
+            hardware_workspace_monitor_verified=requested_mode == "hardware",
+            hardware_scene_monitor_verified=requested_mode == "hardware",
         )
-        run = self._load_verified_run(row, graph)
-        gripper = MockGripperAdapter()
+        run = self._load_verified_run(row, SkillGraph.model_validate(row.graph_json))
+        gripper = (
+            OnRobotRG2Adapter(
+                host=self.settings.rg2_modbus_host,
+                port=self.settings.rg2_modbus_port,
+                unit_id=self.settings.rg2_modbus_unit_id,
+                force_n=self.settings.rg2_grip_force_n,
+                open_width_m=self.settings.rg2_open_width_m,
+                closed_width_m=self.settings.rg2_closed_width_m,
+                execution_mode="hardware",
+                hardware_enabled=self.settings.hardware_enabled,
+            )
+            if requested_mode == "hardware"
+            else MockGripperAdapter()
+        )
         gripper.connect()
         event_sink = InMemoryEventSink()
         if mock_override is not None:
@@ -5473,18 +6572,28 @@ class MVPApplication:
             maximum_force_n=safety_policy.maximum_force_n,
         )
         safety_supervisor = GlobalSafetySupervisor()
+        workspace_monitor = (
+            DoosanStateMonitor(robot) if requested_mode == "hardware" else None
+        )
+        scene_monitor = (
+            FixedReferenceSceneMonitor(maximum_scene_age_ms=1_800_000)
+            if requested_mode == "hardware"
+            else None
+        )
         executor = RuntimeExecutor(
             context=context,
             robot=robot,
             gripper=gripper,
             binder=EntityBinder(),
             workspace_supervisor=GlobalWorkspaceSupervisor(
+                monitor=workspace_monitor,
                 minimum_clearance_m=safety_policy.minimum_clearance_m
             ),
             force_supervisor=force_supervisor,
             safety_supervisor=safety_supervisor,
             primitive_registry=get_default_registry(),
             event_sink=event_sink,
+            scene_monitor=scene_monitor,
         )
         execution = self.repository.start_execution(
             started_at_ns=time.time_ns(),
@@ -5535,6 +6644,11 @@ class MVPApplication:
                 error_code=None if error is None else type(error).__name__,
                 error_message=None if error is None else str(error),
             )
+            try:
+                gripper.disconnect()
+            finally:
+                if requested_mode == "hardware":
+                    robot.disconnect()
         if error is not None:
             raise error
         return {
@@ -5611,15 +6725,24 @@ class MVPApplication:
         SkillGraph,
         SceneSnapshot,
         dict[str, Any],
-        MockRobotAdapter,
+        Any,
         dict[str, Any],
         dict[str, Any],
     ]:
+        mode = str(request.get("mode", "mock"))
         row = self._find_version(str(request["skill_id"]), request.get("version"))
         if row.status != "active" or row.validation_status != "passed":
+            hardware_validated_candidate = (
+                mode == "hardware"
+                and row.status == "validated"
+                and row.validation_status == "passed"
+            )
             if not allow_mock_candidate:
-                raise ValueError("runtime accepts only active, validated skill versions")
-            if row.status not in {"candidate", "validated"}:
+                if not hardware_validated_candidate:
+                    raise ValueError(
+                        "runtime accepts active skills or passed validated Candidates"
+                    )
+            elif row.status not in {"candidate", "validated"}:
                 raise ValueError(
                     "Mock override cannot run rejected or retired skill versions"
                 )
@@ -5631,9 +6754,35 @@ class MVPApplication:
         graph = SkillGraph.model_validate(row.graph_json)
         SkillGraphValidator().validate(graph)
         SkillCompiler().compile(graph)
+        fixed_workspace_orientation_xyzw: tuple[float, float, float, float] | None = None
+        initial_hardware_pose: BoundTargetPose | None = None
+        if mode == "hardware":
+            aruco_robot, base_to_plane = self._acquire_fixed_hardware_session()
+            initial_tcp_matrix = aruco_robot.get_base_to_tcp_matrix()
+            fixed_workspace_orientation_xyzw = rotation_matrix_to_quaternion_xyzw(
+                initial_tcp_matrix[:3, :3]
+            )
+            initial_hardware_pose = BoundTargetPose(
+                frame_id="base",
+                position_m=cast(
+                    tuple[float, float, float],
+                    tuple(float(value) for value in initial_tcp_matrix[:3, 3]),
+                ),
+                orientation_xyzw=fixed_workspace_orientation_xyzw,
+                anchor_entity_id="fixed_workspace_run_start_tcp",
+                timestamp_ns=time.time_ns(),
+            )
+            graph = self._graph_with_aruco_base_plane(graph, base_to_plane)
+            scene_source = self._scene(str(request["scene_id"]))
+            self._scenes[scene_source.scene_id] = scene_source.model_copy(
+                update={"timestamp_ns": time.time_ns(), "valid_for_ms": 1_800_000},
+                deep=True,
+            )
         scene = self._scene_with_graph_task_plane(
             self._scene(str(request["scene_id"])), graph
         )
+        if mode != "hardware":
+            scene = self._scene_with_mock_binding_fixtures(scene, graph)
         hints = dict(request.get("bindings", {}))
         requirements = [
             requirement.model_copy(update={"instance_id": hints.get(requirement.variable)})
@@ -5646,9 +6795,80 @@ class MVPApplication:
             requirements,
             maximum_scene_age_ms=self.settings.scene_freshness_ms,
         )
-        robot = MockRobotAdapter()
+        robot = (
+            DoosanM0609Adapter(
+                aruco_robot,
+                fixed_workspace_orientation_xyzw=fixed_workspace_orientation_xyzw,
+                initial_pose=initial_hardware_pose,
+            )
+            if mode == "hardware"
+            else MockRobotAdapter()
+        )
         robot.connect()
         return row, graph, scene, bindings, robot, self._motion_profiles(), self._force_profiles()
+
+    @staticmethod
+    def _graph_with_aruco_base_plane(graph: SkillGraph, base_to_plane: Any) -> SkillGraph:
+        """Bind the recorded task-plane anchor to the current acknowledged base frame."""
+
+        uncertainty = dict(graph.uncertainty)
+        transform = rigid_transform_from_matrix(base_to_plane, label="ArUco T_base_plane")
+        uncertainty["base_chain"] = {
+            "verified": True,
+            "verification_source": "operator_acknowledged_aruco_reference_session",
+            "base_to_task_plane": transform.model_dump(mode="json"),
+        }
+        return graph.model_copy(update={"uncertainty": uncertainty}, deep=True)
+
+    def _load_fixed_base_plane(self) -> tuple[Any, str]:
+        """Load the operator-frozen base/workspace transform without re-running ArUco."""
+
+        with self._fixed_hardware_session_lock:
+            cached = self._fixed_base_plane_cache
+            if cached is not None:
+                return cached[0].copy(), cached[1]
+        source = (
+            self.settings.repo_root
+            / "aruco/results/d435i_plane_scans/scan_20260807_123803/"
+            "base_workspace_urdf_candidate.json"
+        ).resolve()
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        transforms = payload.get("transforms")
+        if not isinstance(transforms, dict):
+            raise ValueError("fixed base workspace artifact has no transforms")
+        matrix = transforms.get(
+            "T_base_plane_from_urdf_camera_and_reference_T_camera_plane"
+        )
+        transform = rigid_transform_from_matrix(matrix, label="fixed T_base_plane")
+        # Round-trip through the typed transform to reject malformed matrices, then
+        # retain the exact matrix values selected by the operator.
+        del transform
+        import numpy as np
+
+        result = np.asarray(matrix, dtype=np.float64), str(source)
+        with self._fixed_hardware_session_lock:
+            self._fixed_base_plane_cache = result
+        return result[0].copy(), result[1]
+
+    def _acquire_fixed_hardware_session(self) -> tuple[DoosanArucoExperimentRobot, Any]:
+        """Reuse one server-owned Doosan session and the frozen workspace transform."""
+
+        if not self.settings.hardware_enabled:
+            raise ValueError("서버가 hardware 모드로 시작되지 않았습니다")
+        base_to_plane, _ = self._load_fixed_base_plane()
+        with self._fixed_hardware_session_lock:
+            robot = self._fixed_hardware_robot
+            if robot is None:
+                robot = DoosanArucoExperimentRobot(
+                    robot_id=self.settings.doosan_robot_id,
+                    robot_model=self.settings.doosan_robot_model,
+                    execution_mode="hardware",
+                    hardware_enabled=True,
+                    expected_tcp_name=self.settings.aruco_experiment_expected_tcp,
+                )
+                robot.connect()
+                self._fixed_hardware_robot = robot
+            return robot, base_to_plane.copy()
 
     def _mock_regression_validate(
         self, row: SkillVersionRecord, graph: SkillGraph
@@ -5659,6 +6879,7 @@ class MVPApplication:
             capture_mock_scene(frame_count=self.settings.scene_burst_frame_count),
             graph,
         )
+        scene = self._scene_with_mock_binding_fixtures(scene, graph)
         bindings = EntityBinder().bind_entities(
             scene,
             graph.binding_requirements(),
@@ -5737,6 +6958,67 @@ class MVPApplication:
             },
             "events": [event.event_type for event in event_sink.events],
         }
+
+    @staticmethod
+    def _scene_with_mock_binding_fixtures(
+        scene: SceneSnapshot, graph: SkillGraph
+    ) -> SceneSnapshot:
+        """Supply declared object classes only inside the explicit built-in Mock scene.
+
+        This makes class-specific block skills reproducible without weakening real-scene
+        binding.  The cloned object retains the Mock perception pose, including its complete
+        quaternion, and is visibly marked as a generated test fixture.
+        """
+
+        camera = scene.camera_metadata
+        if (
+            scene.calibration_id != "mock_calibration_v1"
+            or camera is None
+            or camera.camera_id != "mock_d435i"
+        ):
+            return scene
+        objects = list(scene.objects)
+        if not objects:
+            return scene
+        existing_ids = {
+            entity.instance_id
+            for collection in (scene.objects, scene.tools, scene.surfaces)
+            for entity in collection
+        }
+        for binding in graph.bindings.values():
+            class_name = binding.class_name
+            if binding.entity_kind is not EntityKind.OBJECT or class_name is None:
+                continue
+            if any(item.class_name == class_name for item in objects):
+                continue
+            identifier_class = re.sub(r"[^A-Za-z0-9_.:-]+", "_", class_name).strip("_")
+            if not identifier_class:
+                raise ValueError("Mock object binding class has no safe identifier")
+            base_identifier = f"mock_{identifier_class}_01"
+            identifier = base_identifier
+            suffix = 2
+            while identifier in existing_ids:
+                identifier = f"mock_{identifier_class}_{suffix:02d}"
+                suffix += 1
+            seed = objects[0]
+            fixture = seed.model_copy(
+                update={
+                    "instance_id": identifier,
+                    "class_name": class_name,
+                    "attributes": {
+                        **seed.attributes,
+                        "mock_binding_fixture": True,
+                        "declared_skill_id": graph.skill_id,
+                    },
+                    "pose_source": "mock_declared_binding_fixture_6d",
+                },
+                deep=True,
+            )
+            objects.append(fixture)
+            existing_ids.add(identifier)
+        if objects == scene.objects:
+            return scene
+        return scene.model_copy(update={"objects": objects}, deep=True)
 
     def _load_verified_run(
         self, row: SkillVersionRecord, graph: SkillGraph

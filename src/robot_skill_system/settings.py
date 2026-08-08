@@ -92,6 +92,12 @@ class Settings(BaseModel):
     aruco_runtime_workspace_npz: Path
     doosan_robot_id: str = Field(default="dsr01", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
     doosan_robot_model: Literal["m0609"] = "m0609"
+    rg2_modbus_host: str = Field(default="192.168.1.1", min_length=1, max_length=255)
+    rg2_modbus_port: int = Field(default=502, ge=1, le=65535)
+    rg2_modbus_unit_id: int = Field(default=65, ge=0, le=255)
+    rg2_grip_force_n: float = Field(default=20.0, ge=3.0, le=40.0)
+    rg2_open_width_m: float = Field(default=0.110, ge=0.0, le=0.110)
+    rg2_closed_width_m: float = Field(default=0.0, ge=0.0, le=0.110)
     handeye_legacy_npy_path: Path | None = None
     handeye_legacy_expected_tcp: str = Field(default="2FG_TCP", min_length=1, max_length=64)
     scene_capture_mode: CaptureMode = CaptureMode.BURST
@@ -292,6 +298,12 @@ class Settings(BaseModel):
             doosan_robot_model=cast(
                 Literal["m0609"], env.get("DOOSAN_ROBOT_MODEL", "m0609").lower()
             ),
+            rg2_modbus_host=env.get("RG2_MODBUS_HOST", "192.168.1.1"),
+            rg2_modbus_port=int(env.get("RG2_MODBUS_PORT", "502")),
+            rg2_modbus_unit_id=int(env.get("RG2_MODBUS_UNIT_ID", "65")),
+            rg2_grip_force_n=float(env.get("RG2_GRIP_FORCE_N", "20")),
+            rg2_open_width_m=float(env.get("RG2_OPEN_WIDTH_M", "0.110")),
+            rg2_closed_width_m=float(env.get("RG2_CLOSED_WIDTH_M", "0.0")),
             handeye_legacy_npy_path=(
                 legacy_npy_path.resolve() if legacy_npy_path is not None else None
             ),

@@ -1,13 +1,13 @@
-# Hardware setup (not yet physically validated)
+# Hardware setup and fixed-plane skill execution
 
 ## ROS 2 status
 
-The skill runtime still has no commissioned Doosan ROS 2 service/action client,
-`realsense2_camera` subscriber, TF listener, MoveIt client, or rosbag adapter. A separate,
-calibration-only adapter now lazily creates one `rclpy` node and binds the fixed DSR functions used
-by the supplied M0609 tutorial. It remains disabled until all runtime and calibration gates are
-open. Sourcing ROS alone does not enable motion. On the Ubuntu 22.04 target cell, source the
-verified Humble installation and that cell's built workspace before starting the API:
+The fixed-plane runtime loads the frozen `T_base_plane` and workspace artifact directly and opens
+one server-owned Doosan MoveJ/MoveL/IK session. ArUco enable, operator checkboxes, reference-pose
+recapture, and per-run confirmation are not part of skill execution. Device disconnect,
+protective-stop, and IK rejection remain automatic controller errors. MoveIt link/self-collision
+validation is not part of this path. On the Ubuntu 22.04 target cell, source the verified Humble
+installation and that cell's built workspace before starting the API:
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -18,7 +18,18 @@ The supplied `dsr_bringup2_rviz.launch.py` declares `name`, `host`, `port`, `mod
 For this cell the explicit command is:
 
 ```bash
-export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
+cd /home/rokey/Dittobot
+./run_terminal1_doosan_rviz.sh --check
+./run_terminal1_doosan_rviz.sh
+```
+
+The launcher validates the setup files, interface name/state, ROS domain, robot endpoint, model,
+and `dsr_bringup2` package before launch. `--check` never calls `ros2 launch`; the normal mode uses
+the equivalent explicit command below and hands Ctrl+C directly to ROS 2.
+
+```bash
+export DITTOBOT_ROBOT_INTERFACE=enp2s0
+export CYCLONEDDS_URI="<CycloneDDS xmlns=\"https://cdds.io/config\"><Domain><General><Interfaces><NetworkInterface name=\"${DITTOBOT_ROBOT_INTERFACE}\"/></Interfaces></General></Domain></CycloneDDS>"
 ros2 launch dsr_bringup2 dsr_bringup2_rviz.launch.py \
   name:=dsr01 mode:=real host:=192.168.1.100 port:=12345 model:=m0609
 ```
@@ -34,16 +45,18 @@ replacing it hides `DR_init`, `DSR_ROBOT2`, and the generated `dsr_msgs2` Python
 cd /home/rokey/Dittobot
 source /opt/ros/humble/setup.bash
 source /home/rokey/cobot_ws/install/setup.bash
-export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
-PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m uvicorn \
+export DITTOBOT_ROBOT_INTERFACE=enp2s0
+export CYCLONEDDS_URI="<CycloneDDS xmlns=\"https://cdds.io/config\"><Domain><General><Interfaces><NetworkInterface name=\"${DITTOBOT_ROBOT_INTERFACE}\"/></Interfaces></General></Domain></CycloneDDS>"
+export DITTOBOT_RG2_SITE=/home/rokey/wok_wark/ws_cobot_pjt/ws_dsr/install/rokey/lib/python3.10/site-packages
+PYTHONPATH="$PWD/src:$DITTOBOT_RG2_SITE${PYTHONPATH:+:$PYTHONPATH}" python3 -m uvicorn \
   robot_skill_system.api.app:create_app --factory --env-file .env \
   --host 127.0.0.1 --port 8000
 ```
 
-On this workstation `enp3s0` is the active `192.168.1.0/24` robot-network interface. The current
-shell startup value uses an empty `NetworkInterface name`, which makes CycloneDDS reject node
-creation. If the physical interface name changes, update this deployment value after checking
-`ip -brief address`; do not blindly reuse `enp3s0` on another cell.
+The local launcher currently defaults to `enp2s0`, which exists on this workstation. Confirm its
+address and link state with `ip -brief address` before every commissioning session. An empty or
+stale `NetworkInterface name` makes CycloneDDS reject node creation; do not blindly reuse this
+interface name on another cell.
 
 The calibration adapter waits up to two seconds for the exact `/dsr01/aux_control/*`,
 `/dsr01/system/get_robot_state`, and `/dsr01/motion/*` services and requires
@@ -151,6 +164,20 @@ p_base               = T_base_camera(t) * p_camera
 The active TCP name and geometry must match the TCP used to produce the file. Validate the converted
 candidate against fixed-board observations and held-out measured points before publishing it to TF;
 an `.npy` filename alone is not frame or unit evidence.
+
+### URDF-only ArUco base-frame candidate
+
+For the reference joint vector `[0, 0, 90, 0, 90, -90] deg`, the local combined
+M0609+RG2+D435 model provides a complete `base_link -> camera_color_optical_frame` chain. The
+offline tool `aruco/urdf_reference_candidate.py` evaluates that chain and composes the frozen raw
+`T_camera_plane`; it does not treat the legacy tutorial TCP as the flange. The resulting candidate
+is stored at
+`aruco/results/d435i_plane_scans/scan_20260807_123803/base_workspace_urdf_candidate.json`.
+
+The model uses nominal bracket dimensions and nominal RealSense extrinsics, not a measured hand-eye
+transform. The artifact therefore records `usable_for_motion=false` and `hardware_approved=false`.
+It also does not establish that ROS `base_link` equals controller `DR_BASE`. Use this transform only
+for offline geometry review until a held-out physical measurement verifies the complete chain.
 
 The monitoring UI's `NPY TF 복사·검증` action performs only this read/convert/validate flow; it
 does not move the robot. It copies the original bytes into a new immutable artifact directory,

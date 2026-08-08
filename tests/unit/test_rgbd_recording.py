@@ -153,3 +153,45 @@ def test_finalized_recording_is_discovered_and_previewed_after_restart(
         )
     finally:
         restarted.close()
+
+
+def test_imported_recording_directory_is_discovered_and_previewed(
+    tmp_path: Path,
+) -> None:
+    first = _controller(tmp_path)
+    try:
+        first.start_preview()
+        recording = first.start_recording(maximum_duration_s=1.0)
+        time.sleep(0.12)
+        finished = first.stop_recording(recording["recording_id"])
+    finally:
+        first.close()
+
+    canonical_directory = tmp_path / "demonstrations" / finished["recording_id"]
+    imported_directory = tmp_path / "demonstrations" / "hammer1"
+    canonical_directory.rename(imported_directory)
+
+    restarted = _controller(tmp_path)
+    try:
+        catalog = restarted.list_recordings()
+        assert catalog["invalid_recording_count"] == 0
+        assert len(catalog["recordings"]) == 1
+        imported = catalog["recordings"][0]
+        assert imported["recording_id"] == finished["recording_id"]
+        assert imported["source_label"] == "hammer1"
+        assert imported["manifest_uri"] == "demonstrations/hammer1/rgbd_manifest.json"
+
+        assert restarted.get_recording_frame_jpeg(
+            finished["recording_id"], 0, "rgb"
+        ).startswith(b"\xff\xd8")
+        assert restarted.get_recording_frame_jpeg(
+            finished["recording_id"], 0, "depth"
+        ).startswith(b"\xff\xd8")
+        selected = restarted.select_recording_keyframes(
+            finished["recording_id"], maximum_count=8
+        )
+        assert selected
+        assert all(path.parent == imported_directory / "rgb" for _index, path in selected)
+        assert all(path.is_file() for _index, path in selected)
+    finally:
+        restarted.close()
