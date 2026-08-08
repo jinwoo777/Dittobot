@@ -24,6 +24,7 @@ from robot_skill_system.openai_integration.recording_skill_analyzer import (
 )
 from robot_skill_system.openai_integration.schemas import RecordingSkillDraftInput
 from robot_skill_system.settings import Settings
+from robot_skill_system.skills.compiler import SkillCompiler
 from robot_skill_system.skills.models import SkillGraph
 from robot_skill_system.storage.artifact_store import LocalArtifactStore
 from robot_skill_system.storage.orm import (
@@ -102,6 +103,7 @@ def test_openapi_exposes_every_required_original_and_supplemental_route(
         "/skills/editor/preview",
         "/skills/editor/candidates",
         "/skills/search",
+        "/skills/builtins/wipe-surface/repair",
         "/skills/{skill_id}/versions/{version}/parameter-candidates",
         "/skills/{skill_id}/validate",
         "/skills/{skill_id}/versions/{version}/promote",
@@ -203,12 +205,14 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
 
         capabilities = client.get("/skills/draft-from-recording/capabilities").json()
         assert capabilities["openai_mode"] == "mock"
-        assert capabilities["maximum_keyframes"] == 1
+        assert capabilities["maximum_keyframes"] == settings.openai_max_keyframes
         assert capabilities["uploads_rgb_and_aligned_depth_pairs"] is False
-        assert capabilities["uploaded_rgb_frame_count"] == 1
+        assert capabilities["uploaded_rgb_frame_count"] == (
+            "operator_selected_1_to_maximum_keyframes"
+        )
         assert capabilities["depth_stays_local"] is True
         assert capabilities["provider_video_input_supported"] is False
-        assert capabilities["fallback_analysis_transport"] == "first_rgb_input_file"
+        assert capabilities["fallback_analysis_transport"] == "rgb_keyframe_input_files"
         assert capabilities["creates_zip_archive_on_fallback"] is False
         assert capabilities["creates_executable_skill"] is False
         draft_response = client.post(
@@ -227,8 +231,12 @@ def test_camera_api_records_local_rgbd_with_injected_capture(tmp_path: Path) -> 
         assert draft["openai"]["mode"] == "mock"
         assert draft["draft"]["suggested_skill_id"] == "table_wipe_recorded"
         assert draft["draft"]["tcp_proxy_observation"]["detected"] is True
-        assert draft["transport"]["mode"] == "first_rgb_plus_compact_fingertip_trace"
-        assert draft["transport"]["image_count"] == 1
+        assert draft["transport"]["mode"] == (
+            "rgb_keyframes_plus_compact_fingertip_trace"
+        )
+        assert draft["transport"]["image_count"] == min(
+            8, stopped.json()["frame_count"]
+        )
         assert draft["transport"]["depth_image_count"] == 0
         assert draft["transport"]["trace_frame_count"] == stopped.json()["frame_count"]
         assert draft["local_fingertip_tracking"]["valid_frame_count"] == 0
@@ -380,7 +388,7 @@ def test_manual_task_plane_and_metric_tcp_path_register_candidate_without_valid_
         application.close()
 
 
-def test_recording_draft_falls_back_to_first_rgb_input_file(
+def test_recording_draft_falls_back_to_rgb_keyframe_input_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -399,14 +407,15 @@ def test_recording_draft_falls_back_to_first_rgb_input_file(
         def __init__(self, _settings: Settings) -> None:
             self.mock = MockOpenAIClient()
 
-        def analyze_first_frame_trace(
+        def analyze_rgb_keyframe_trace(
             self,
             request: RecordingSkillDraftInput,
             *,
-            first_rgb_path: Path,
+            rgb_paths: list[Path],
             as_file_fallback: bool = False,
         ) -> object:
-            assert first_rgb_path.read_bytes().startswith(b"\xff\xd8")
+            assert rgb_paths
+            assert all(path.read_bytes().startswith(b"\xff\xd8") for path in rgb_paths)
             if not as_file_fallback:
                 raise ImageInputRejectedError("forced image rejection")
             return self.mock.analyze_recording_skill_draft(
@@ -434,10 +443,10 @@ def test_recording_draft_falls_back_to_first_rgb_input_file(
         )
 
         assert result["transport"]["mode"] == (
-            "first_rgb_input_file_plus_compact_fingertip_trace"
+            "rgb_keyframe_files_plus_compact_fingertip_trace"
         )
         assert result["transport"]["fallback_used"] is True
-        assert result["transport"]["image_count"] == 1
+        assert result["transport"]["image_count"] == stopped["frame_count"]
         assert result["transport"]["depth_image_count"] == 0
         assert result["transport"]["trace_frame_count"] == stopped["frame_count"]
         assert result["local_fingertip_tracking"]["valid_frame_count"] == 0
@@ -488,6 +497,103 @@ def test_ui_registry_api_and_static_console_are_connected(
     assert "분석 초안" in client.get("/ui/").text
     assert "두 손가락" in client.get("/ui/").text
     assert "DittobotApiClient" in client.get("/ui/api-client.js").text
+
+
+def test_builtin_wipe_repair_preserves_legacy_parent_and_activates_mock_child(
+    service: MVPApplication,
+) -> None:
+    induced = service.induce_skill(
+        {"demo_path": "tests/fixtures/demonstrations/novice_wipe.json"}
+    )
+    assert induced["version"] == "1.0.0"
+
+    with service.database.session() as session:
+        row = session.scalar(
+            select(SkillVersionRecord).where(
+                SkillVersionRecord.semantic_version == "1.0.0"
+            )
+        )
+        assert row is not None
+        graph = SkillGraph.model_validate(row.graph_json)
+        legacy_nodes = []
+        for node in graph.nodes:
+            if node.node_id == "validate_path":
+                legacy_nodes.append(
+                    node.model_copy(update={"on_success": "approach_joint"}, deep=True)
+                )
+            elif node.node_id == "pre_approach_linear":
+                legacy_nodes.append(
+                    node.model_copy(
+                        update={
+                            "node_id": "approach_joint",
+                            "operation": "motion.move_j",
+                            "arguments": {
+                                "target": node.arguments["target"],
+                                "motion_profile_id": "joint_safe",
+                            },
+                        },
+                        deep=True,
+                    )
+                )
+            else:
+                legacy_nodes.append(node)
+        legacy_graph = graph.model_copy(
+            update={
+                "nodes": legacy_nodes,
+                "motion_profiles": [*graph.motion_profiles, "joint_safe"],
+            },
+            deep=True,
+        )
+        row.graph_json = legacy_graph.model_dump(mode="json")
+        row.graph_checksum_sha256 = SkillCompiler.graph_checksum(legacy_graph)
+        row.validation_status = "failed"
+        legacy_checksum = row.graph_checksum_sha256
+
+    registry = service.list_skills()["skills"]
+    legacy = next(item for item in registry if item["version"] == "1.0.0")
+    assert legacy["repair"] == {
+        "available": True,
+        "repair_id": "wipe_surface_relative_pre_approach_v1",
+        "reason": (
+            "legacy approach_joint stores an anchor-relative target under motion.move_j"
+        ),
+        "mock_only": True,
+        "preserves_parent": True,
+    }
+
+    repaired = service.repair_builtin_wipe_skill(
+        {
+            "expected_parent_checksum_sha256": legacy_checksum,
+            "acknowledge_mock_only": True,
+        }
+    )
+    assert repaired["repaired"] is True
+    assert repaired["mock_only"] is True
+    assert repaired["candidate_version"] == "1.1.0-candidate"
+    assert repaired["validation"]["passed"] is True
+    assert repaired["active"]["version"] == "1.1.0"
+    assert repaired["active"]["status"] == "active"
+    assert repaired["active"]["validation_status"] == "passed"
+    assert repaired["active"]["hardware_compatible"] is False
+
+    versions = service.get_skill_versions("wipe_surface")["versions"]
+    old = next(item for item in versions if item["version"] == "1.0.0")
+    active = next(item for item in versions if item["version"] == "1.1.0")
+    assert old["status"] == "retired"
+    assert old["validation_status"] == "failed"
+    assert active["status"] == "active"
+    graph = service.get_skill("wipe_surface", "1.1.0")["skill_graph"]
+    operations = {node["node_id"]: node["operation"] for node in graph["nodes"]}
+    assert operations["pre_approach_linear"] == "motion.move_l"
+    assert "approach_joint" not in operations
+
+    repeated = service.repair_builtin_wipe_skill(
+        {
+            "expected_parent_checksum_sha256": active["graph_checksum_sha256"],
+            "acknowledge_mock_only": True,
+        }
+    )
+    assert repeated["already_ready"] is True
 
 
 def test_persisted_teaching_runtime_update_promotion_and_rollback(
@@ -732,4 +838,4 @@ def test_offline_vertical_slice_has_exact_compiled_motion_order(tmp_path: Path) 
         for operation in result.robot_commands
         if operation in {"move_l", "move_c", "move_periodic"}
     ]
-    assert motions == ["move_l", "move_l", "move_c", "move_l"]
+    assert motions == ["move_l", "move_l", "move_l", "move_c", "move_l"]

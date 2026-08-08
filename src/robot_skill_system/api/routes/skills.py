@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter
 
 from robot_skill_system.api.contracts import (
+    BuiltinWipeRepairRequest,
     DraftAutoSurfaceCalibrationRequest,
     DraftCandidateRegistrationRequest,
     DraftSurfaceCalibrationRequest,
@@ -132,6 +133,14 @@ def search_skills(
     request: SkillSearchRequest, service: ServiceDependency
 ) -> dict[str, Any]:
     return service.search_skills(request.model_dump())
+
+
+@router.post("/builtins/wipe-surface/repair")
+def repair_builtin_wipe_surface(
+    request: BuiltinWipeRepairRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.repair_builtin_wipe_skill(request.model_dump(mode="json"))
 
 
 @router.get("/{skill_id}")

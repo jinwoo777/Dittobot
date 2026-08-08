@@ -50,6 +50,128 @@ def _gripper_skill_payload() -> dict[str, object]:
     }
 
 
+def _relative_pose(
+    anchor_id: str,
+    anchor_type: str,
+    *,
+    x: float = 0.0,
+    y: float = 0.0,
+    z: float = 0.0,
+) -> dict[str, object]:
+    return {
+        "anchor_id": anchor_id,
+        "anchor_type": anchor_type,
+        "position_m": {"x": x, "y": y, "z": z},
+        "orientation_xyzw": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+    }
+
+
+def _hammer_bring_payload() -> dict[str, object]:
+    hammer_approach = _relative_pose("$hammer", "object", z=0.04)
+    hammer_grasp = _relative_pose("$hammer", "object")
+    destination_approach = _relative_pose("$destination", "surface", z=0.04)
+    destination_place = _relative_pose("$destination", "surface", z=0.01)
+    return {
+        "skill_id": "hammer_bring",
+        "name": "망치 가져오기",
+        "description": "‘망치 가져와’ 명령을 위한 6D 객체 anchor 기반 pick-and-bring Mock 스킬",
+        "skill_type": "composite",
+        "source_recording_ids": ["rgbd_hammer_demo"],
+        "blocks": [
+            {"operation": "gripper.open", "arguments": {"tool": "$tool"}},
+            {
+                "operation": "workspace.validate_target",
+                "arguments": {"target": hammer_approach},
+            },
+            {
+                "operation": "motion.move_l",
+                "arguments": {
+                    "target": hammer_approach,
+                    "motion_profile_id": "linear_slow",
+                },
+            },
+            {
+                "operation": "motion.move_l",
+                "arguments": {
+                    "target": hammer_grasp,
+                    "motion_profile_id": "linear_slow",
+                },
+            },
+            {"operation": "gripper.close", "arguments": {"tool": "$tool"}},
+            {
+                "operation": "grasp.verify_holding",
+                "arguments": {
+                    "object": "$hammer",
+                    "tool": "$tool",
+                    "verification_profile_id": "grasp_default",
+                },
+            },
+            {
+                "operation": "motion.move_l",
+                "arguments": {
+                    "target": hammer_approach,
+                    "motion_profile_id": "linear_slow",
+                },
+            },
+            {
+                "operation": "workspace.validate_target",
+                "arguments": {"target": destination_approach},
+            },
+            {
+                "operation": "motion.move_l",
+                "arguments": {
+                    "target": destination_approach,
+                    "motion_profile_id": "linear_slow",
+                },
+            },
+            {
+                "operation": "motion.move_l",
+                "arguments": {
+                    "target": destination_place,
+                    "motion_profile_id": "linear_slow",
+                },
+            },
+            {"operation": "gripper.open", "arguments": {"tool": "$tool"}},
+            {
+                "operation": "grasp.verify_released",
+                "arguments": {
+                    "object": "$hammer",
+                    "tool": "$tool",
+                    "verification_profile_id": "grasp_default",
+                },
+            },
+            {
+                "operation": "motion.move_l",
+                "arguments": {
+                    "target": destination_approach,
+                    "motion_profile_id": "linear_slow",
+                },
+            },
+        ],
+        "bindings": {
+            "$hammer": {
+                "variable": "$hammer",
+                "entity_kind": "object",
+                "class_name": "hammer",
+                "minimum_confidence": 0.8,
+                "minimum_visible_fraction": 0.8,
+            },
+            "$destination": {
+                "variable": "$destination",
+                "entity_kind": "surface",
+                "role": "contact_target",
+                "minimum_confidence": 0.8,
+            },
+            "$tool": {
+                "variable": "$tool",
+                "entity_kind": "tool",
+                "minimum_confidence": 0.8,
+                "must_be_attached": True,
+            },
+        },
+    }
+
+
 def test_editor_catalog_exposes_canonical_typed_primitives_and_profile_ids(
     service: MVPApplication,
 ) -> None:
@@ -84,6 +206,16 @@ def test_editor_catalog_exposes_canonical_typed_primitives_and_profile_ids(
         "inline_velocity_acceleration_force_allowed": False,
         "candidate_only": True,
         "hardware_compatible": False,
+        "generated_grip_action_end": {
+            "allowed_motion_operations": [
+                "motion.move_c",
+                "motion.move_l",
+                "motion.move_periodic",
+                "motion.move_spline",
+            ],
+            "maximum_action_motion_blocks": 3,
+            "maximum_end_motion_blocks": 3,
+        },
     }
 
 
@@ -243,6 +375,87 @@ def test_block_and_parameter_candidates_are_immutable_and_mock_validated(
                 "acknowledge_mock_only": True,
             },
         )
+
+
+def test_hammer_recording_candidate_binds_6d_mock_anchor_and_executes(
+    service: MVPApplication,
+) -> None:
+    service.store.put_json(
+        "demonstrations/rgbd_hammer_demo/rgbd_manifest.json",
+        {
+            "schema_version": "1.0",
+            "recording_id": "rgbd_hammer_demo",
+            "status": "finished",
+            "started_at_ns": 1,
+            "ended_at_ns": 2,
+            "duration_s": 1.0,
+            "raw_capture_fps": 30.0,
+            "recording_fps": 10.0,
+            "frames": [],
+        },
+    )
+    payload = {**_hammer_bring_payload(), "acknowledge_mock_only": True}
+
+    created = service.create_skill_editor_candidate(payload)
+
+    assert created["mock_validation_passed"] is True
+    candidate = created["candidate"]
+    graph = candidate["skill_graph"]
+    assert graph["source_demonstrations"] == [
+        "demonstrations/rgbd_hammer_demo/rgbd_manifest.json"
+    ]
+    assert graph["bindings"]["$hammer"]["class_name"] == "hammer"
+    assert graph["nodes"][-1]["on_success"] is None
+    assert created["validation"]["runtime"]["robot_commands"].count("move_l") == 6
+    assert "grasp_holding_verified" in created["validation"]["runtime"]["events"]
+    assert "grasp_release_verified" in created["validation"]["runtime"]["events"]
+
+    active = service.activate_skill(
+        "hammer_bring", {"version": candidate["version"]}
+    )
+    assert active["version"] == "0.1.0"
+    assert active["status"] == "active"
+    scene = service.capture_scene({"mode": "mock"})
+    binding = service.bind_runtime(
+        {
+            "skill_id": "hammer_bring",
+            "version": active["version"],
+            "scene_id": scene["scene_id"],
+            "entity_hints": {},
+        }
+    )
+    assert binding["bindings"]["$hammer"] == "mock_hammer_01"
+    preflight = service.preflight_runtime(
+        {
+            "skill_id": "hammer_bring",
+            "version": active["version"],
+            "scene_id": scene["scene_id"],
+            "bindings": binding["bindings"],
+            "mode": "mock",
+        }
+    )
+    assert preflight["passed"] is True
+    execution = service.execute_runtime(
+        {
+            "skill_id": "hammer_bring",
+            "version": active["version"],
+            "scene_id": scene["scene_id"],
+            "bindings": binding["bindings"],
+            "mode": "mock",
+            "text": "망치 가져와",
+            "run_id": "hammer-mock-e2e",
+        }
+    )
+    assert execution["status"] == "succeeded"
+    assert execution["bindings"]["$hammer"] == "mock_hammer_01"
+    assert execution["robot_commands"].count("move_l") == 6
+    resolved = service.resolve_runtime(
+        {"text": "망치 가져와", "scene_id": scene["scene_id"]}
+    )
+    assert resolved["resolver_mode"] == "local_command_phrase"
+    assert [
+        item["skill_id"] for item in resolved["skill_candidates"]["results"]
+    ] == ["hammer_bring"]
 
 
 def test_parameter_child_does_not_replace_active_parent(

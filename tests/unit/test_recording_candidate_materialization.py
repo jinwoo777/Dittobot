@@ -8,10 +8,16 @@ import pytest
 
 from robot_skill_system.application import MVPApplication
 from robot_skill_system.demonstrations.synthetic import generate_periodic_trajectory
+from robot_skill_system.openai_integration.motion_policy import (
+    RECORDING_BLOCK_MOTION_OPERATIONS,
+)
+from robot_skill_system.runtime.binder import EntityBinder
+from robot_skill_system.runtime.geometry import DeterministicSceneGeometry
 from robot_skill_system.scene.transforms import RigidTransform
 from robot_skill_system.settings import Settings
 from robot_skill_system.skills.compiler import SkillCompiler
 from robot_skill_system.skills.models import SkillGraph
+from robot_skill_system.vertical_slice import capture_mock_scene
 
 
 @pytest.fixture
@@ -118,6 +124,44 @@ def _materialize(
     return graph
 
 
+def test_measured_trajectory_segments_extend_only_mock_observed_space(
+    service: MVPApplication,
+) -> None:
+    samples = [
+        _sample(0, (-0.10, 0.00, -0.55)),
+        _sample(1, (-0.05, 0.01, -0.50)),
+        _sample(2, (0.00, 0.02, -0.45)),
+    ]
+    graph = _materialize(service, samples=samples)
+    assert graph.uncertainty["observed_trajectory_task_plane_m"] == [
+        [-0.10, 0.00, -0.55],
+        [-0.05, 0.01, -0.50],
+        [0.00, 0.02, -0.45],
+    ]
+
+    base_scene = capture_mock_scene(frame_count=3)
+    scene = service._scene_with_graph_task_plane(base_scene, graph)
+    observed_regions = [
+        region
+        for region in scene.workspace_regions
+        if region.region_id.startswith("surface_test_observed_segment_")
+    ]
+    assert len(observed_regions) == 2
+    assert all(region.access_policy.value == "allowed" for region in observed_regions)
+
+    bindings = EntityBinder().bind_entities(scene, graph.binding_requirements())
+    validation_node = next(
+        node for node in graph.nodes if node.operation == "workspace.validate_path"
+    )
+    arguments = EntityBinder().bind_arguments(
+        validation_node.arguments, scene=scene, bindings=bindings
+    )
+    assessment = DeterministicSceneGeometry(
+        minimum_clearance_m=0.03
+    ).validate_path(path=arguments["path"], scene=scene)
+    assert assessment.passed is True
+
+
 def test_open_closed_open_is_inserted_once_in_chronological_motion_order(
     service: MVPApplication,
 ) -> None:
@@ -157,6 +201,34 @@ def test_open_closed_open_is_inserted_once_in_chronological_motion_order(
     ] == [(0, 3), (3, 5), (5, 6)]
     assert all(item["chosen_primitive_id"] == "motion.move_l" for item in provenance)
     assert all(item["maximum_error_m"] <= 0.004 for item in provenance)
+    assert [item["grip_action_end_phase"] for item in provenance] == [
+        "grip",
+        "action",
+        "end_motion",
+    ]
+    phase_policy = graph.uncertainty["grip_action_end_motion_policy"]
+    assert phase_policy["passed"] is True
+    assert phase_policy["maximum_motion_blocks"] == {
+        "action": 3,
+        "end_motion": 3,
+    }
+    assert phase_policy["allowed_motion_operations"] == sorted(
+        RECORDING_BLOCK_MOTION_OPERATIONS
+    )
+    assert phase_policy["phases"] == {
+        "grip": {
+            "motion_node_ids": ["move_l_000"],
+            "motion_block_count": 1,
+        },
+        "action": {
+            "motion_node_ids": ["move_l_001"],
+            "motion_block_count": 1,
+        },
+        "end_motion": {
+            "motion_node_ids": ["move_l_002"],
+            "motion_block_count": 1,
+        },
+    }
 
     service._persist_graph(
         graph,
@@ -180,6 +252,29 @@ def test_open_closed_open_is_inserted_once_in_chronological_motion_order(
         "is_holding": False,
         "fault_code": None,
     }
+
+
+def test_action_motion_budget_rejects_more_than_three_boundary_preserving_blocks(
+    service: MVPApplication,
+) -> None:
+    samples = [_sample(index, (index * 0.01, 0.0, 0.0)) for index in range(11)]
+    transitions = [
+        _transition(0, "open", None),
+        *[
+            _transition(
+                index,
+                "closed" if index % 2 else "open",
+                "open" if index % 2 else "closed",
+            )
+            for index in range(1, 11)
+        ],
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=r"action has 9 motion blocks \(maximum 3\)",
+    ):
+        _materialize(service, samples=samples, transitions=transitions)
 
 
 def test_stationary_segment_at_gripper_boundary_is_skipped_not_rejected(

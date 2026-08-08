@@ -173,7 +173,10 @@ class MockOpenAIClient:
                 "trace frames and one initial RGB frame."
                 if request.visual_input_policy
                 == "first_rgb_plus_local_fingertip_trace"
-                else f"Chronological review of {len(request.keyframe_indices)} selected RGB frames."
+                else (
+                    f"Chronological review of {len(request.keyframe_indices)} selected RGB "
+                    f"frames and {len(request.fingertip_trace)} local trace frames."
+                )
             ),
             required_entity_roles=roles,
             primitive_sequence=[

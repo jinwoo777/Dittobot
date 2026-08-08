@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -38,7 +39,7 @@ class TeachingFinishRequest(APIModel):
 
 
 class SceneCaptureRequest(APIModel):
-    mode: Literal["mock", "single", "burst"] = "mock"
+    mode: Literal["mock", "single", "burst", "hardware"] = "mock"
     fixture_path: str | None = None
 
 
@@ -173,21 +174,38 @@ class SkillInduceRequest(APIModel):
 
 class RecordingSkillDraftRequest(APIModel):
     recording_id: str = Field(pattern=r"^rgbd_[A-Za-z0-9_-]{1,96}$")
+    recording_ids: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "Optional demonstration set analyzed together. recording_id remains the primary "
+            "case used for local geometry teaching."
+        ),
+    )
     name_hint: str = Field(
         default="recorded_skill",
         pattern=r"^[a-z][a-z0-9_]{2,63}$",
     )
     operator_instruction: str = Field(min_length=1, max_length=2000)
     keyframe_count: int = Field(
-        default=1,
+        default=8,
         ge=1,
         le=300,
-        deprecated=True,
         description=(
-            "Deprecated and ignored. Drafting always sends the first manifest RGB frame and "
-            "tracks every manifest frame locally."
+            "Number of evenly spaced, checksum-verified RGB frames supplied to the semantic "
+            "model. Aligned depth and the complete fingertip trace remain local."
         ),
     )
+
+    @field_validator("recording_ids")
+    @classmethod
+    def validate_recording_ids(cls, value: list[str]) -> list[str]:
+        pattern = re.compile(r"^rgbd_[A-Za-z0-9_-]{1,96}$")
+        if any(pattern.fullmatch(item) is None for item in value):
+            raise ValueError("every recording_ids entry must be a valid RGB-D recording ID")
+        if len(value) != len(set(value)):
+            raise ValueError("recording_ids must be unique")
+        return value
 
 
 class PixelPointRequest(APIModel):
@@ -261,6 +279,13 @@ class SkillValidateRequest(APIModel):
     mode: Literal["mock", "simulation"] = "mock"
 
 
+class BuiltinWipeRepairRequest(APIModel):
+    """Checksum-guarded acknowledgement for the one-time built-in wipe repair."""
+
+    expected_parent_checksum_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acknowledge_mock_only: Literal[True]
+
+
 class SkillActivateRequest(APIModel):
     version: str
 
@@ -292,6 +317,16 @@ class SkillEditorPreviewRequest(APIModel):
     skill_type: SkillType = SkillType.COMPOSITE
     blocks: list[SkillEditorBlockRequest] = Field(min_length=1, max_length=128)
     bindings: dict[str, BindingSpec] = Field(default_factory=dict)
+    source_recording_ids: list[
+        Annotated[str, Field(pattern=r"^rgbd_[A-Za-z0-9_-]{1,96}$")]
+    ] = Field(default_factory=list, max_length=32)
+
+    @field_validator("source_recording_ids")
+    @classmethod
+    def validate_unique_source_recordings(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("source_recording_ids must be unique")
+        return value
 
 
 class SkillEditorCandidateRequest(SkillEditorPreviewRequest):
@@ -340,6 +375,7 @@ class RuntimeBindRequest(APIModel):
     version: str | None = None
     scene_id: str
     entity_hints: dict[str, str] = Field(default_factory=dict)
+    mode: Literal["mock", "dry_run", "simulation", "hardware"] = "mock"
 
 
 class RuntimePreflightRequest(APIModel):

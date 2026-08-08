@@ -97,6 +97,7 @@
     executionMode: element("execution-mode"),
     skillList: element("skill-list"),
     skillEmpty: element("skill-empty"),
+    refreshSkills: element("refresh-skills"),
     taskFlowCatalog: element("task-flow-catalog"),
     taskFlowList: element("task-flow-list"),
     draftInspector: element("draft-inspector"),
@@ -198,6 +199,7 @@
     openaiCapability: element("openai-capability"),
     draftSkillName: element("draft-skill-name"),
     draftInstruction: element("draft-instruction"),
+    draftSourceRecordings: element("draft-source-recordings"),
     draftKeyframeCount: element("draft-keyframe-count"),
     analyzeRecording: element("analyze-recording"),
     draftStatus: element("draft-status"),
@@ -252,7 +254,8 @@
     const graph = row.skill_graph || {};
     const nodes = Array.isArray(graph.nodes) ? graph.nodes : [];
     let uiState = "candidate";
-    if (row.status === "active") uiState = "active";
+    if (row.validation_status === "failed") uiState = "invalid";
+    else if (row.status === "active") uiState = "active";
     else if (row.validation_status === "passed") uiState = "tested";
     return {
       key: `${row.skill_id}@${row.version}`,
@@ -264,6 +267,7 @@
       checksum: row.graph_checksum_sha256 || "",
       description: row.description || graph.description || "",
       graph,
+      repair: row.repair || null,
       nodes: nodes.map((node) => ({
         nodeId: node.node_id || "unknown",
         operation: node.operation || node.node_id || "unknown",
@@ -318,10 +322,19 @@
     ) || null;
   }
 
+  function selectedDraftSourceIds() {
+    const selected = Array.from(dom.draftSourceRecordings.selectedOptions || [])
+      .map((option) => option.value)
+      .filter(Boolean);
+    const primary = selectedRecording()?.recording_id;
+    return Array.from(new Set(primary ? [primary, ...selected] : selected)).slice(0, 8);
+  }
+
   function tagText(uiState) {
     if (uiState === "draft") return "분석 초안";
     if (uiState === "active") return "운영 중";
     if (uiState === "tested") return "테스트 통과";
+    if (uiState === "invalid") return "검증 실패";
     return "미검증";
   }
 
@@ -365,7 +378,10 @@
     }
     if (page === "aruco-experiment") {
       renderArucoExperiment();
-      refreshArucoExperimentStatus({ quiet: true });
+      Promise.all([
+        refreshJogStatus({ quiet: true }),
+        refreshArucoExperimentStatus({ quiet: true }),
+      ]).catch(() => undefined);
     }
     if (page === "create") {
       renderCreateMode();
@@ -421,13 +437,37 @@
     }
   }
 
+  async function repairBuiltinWipeSurface(skill, button) {
+    if (!skill.repair?.available || !skill.checksum) return;
+    const confirmed = window.confirm(
+      "구형 wipe_surface를 수정된 새 버전으로 복구합니다.\n\n"
+      + "기존 버전은 이력으로 보존하고, 새 버전은 Mock 회귀 검증 후 Mock 실행 대상으로 활성화합니다.\n"
+      + "이 작업은 실제 로봇 하드웨어 실행 권한을 부여하지 않습니다.",
+    );
+    if (!confirmed) return;
+    button.disabled = true;
+    setBanner(`${skill.id} 체크섬 확인 및 Mock 복구 중…`);
+    try {
+      const result = await api.repairBuiltinWipeSurface(skill.checksum);
+      const active = result.active || {};
+      await loadRegistry(
+        result.already_ready
+          ? `${skill.id} v${active.version}은 이미 Mock 실행 준비가 되어 있습니다.`
+          : `${skill.id} v${active.version} 복구 및 Mock 활성화 완료`,
+      );
+    } catch (error) {
+      button.disabled = false;
+      setBanner(`스킬 복구 실패: ${errorText(error)}`, "danger");
+    }
+  }
+
   function renderRegistry() {
     dom.skillList.replaceChildren();
     const visibleSkills = state.skills.filter((skill) => {
       if (state.filter === "draft") return false;
       if (state.filter === "all") return true;
-      if (state.filter === "active") return skill.uiState === "active";
-      return skill.uiState !== "active";
+      if (state.filter === "active") return skill.status === "active";
+      return skill.status !== "active";
     });
     const visibleDrafts = state.filter === "all" || state.filter === "draft"
       ? state.drafts
@@ -443,7 +483,7 @@
       summary.append(create("h2", { text: draft.suggestedSkillId }));
       const meta = create("div", { className: "meta" });
       meta.append(document.createTextNode(
-        `첫 RGB 1장 + 손끝 trace ${draft.traceFrameCount}프레임 · 신뢰도 ${draft.confidence.toFixed(2)}`,
+        `선택 RGB ${draft.keyframeCount}장 + 손끝 trace ${draft.traceFrameCount}프레임 · 신뢰도 ${draft.confidence.toFixed(2)}`,
       ));
       meta.append(create("span", { className: "tag draft", text: tagText("draft") }));
       summary.append(meta);
@@ -480,7 +520,7 @@
       });
       actions.append(detail);
       const hasActiveVersion = state.skills.some(
-        (item) => item.id === skill.id && item.uiState === "active",
+        (item) => item.id === skill.id && item.status === "active",
       );
       const deleteButton = create("button", {
         className: "button danger",
@@ -494,7 +534,7 @@
       deleteButton.addEventListener("click", () => {
         deleteInactiveSkill(skill, deleteButton);
       });
-      if (skill.uiState === "active") {
+      if (skill.status === "active") {
         const deactivateButton = create("button", {
           className: "button danger",
           text: "비활성화",
@@ -507,10 +547,30 @@
         actions.append(deactivateButton);
       }
       actions.append(deleteButton);
-      if (skill.uiState === "active") {
-        const run = create("button", { className: "button primary", text: "Mock 실행" });
+      if (skill.repair?.available) {
+        const repair = create("button", {
+          className: "button primary",
+          text: "복구 · Mock 활성화",
+        });
+        repair.type = "button";
+        repair.disabled = state.apiStatus !== "connected";
+        repair.title = "기존 버전을 보존하고 수정된 child 버전을 Mock 검증합니다.";
+        repair.addEventListener("click", () => repairBuiltinWipeSurface(skill, repair));
+        actions.append(repair);
+      }
+      const hardware = state.arucoExperiment.status?.capabilities?.mode === "hardware";
+      if (skill.uiState === "active" || (hardware && skill.uiState === "tested")) {
+        const run = create("button", {
+          className: "button primary",
+          text: hardware ? "실제 실행" : "Mock 실행",
+        });
         run.type = "button";
+        // A leftover enabled Jog session is stopped in startRun().  Do not make
+        // the skill-run control inert before that transition has a chance to run.
         run.disabled = state.apiStatus !== "connected";
+        run.title = hardware
+          ? "고정 workspace 좌표로 실제 로봇을 실행합니다. 조그 세션은 자동 종료됩니다."
+          : "Mock 어댑터로 실행합니다.";
         run.addEventListener("click", () => startRun(skill.key));
         actions.append(run);
       }
@@ -562,14 +622,14 @@
     const evidence = [
       {
         label: draft.traceFrameCount > 0
-          ? `첫 RGB 1장 + 전체 손끝 trace ${draft.traceFrameCount}프레임`
+          ? `선택 RGB ${draft.keyframeCount}장 + 전체 손끝 trace ${draft.traceFrameCount}프레임`
           : "전체 손끝 trace 재분석 필요",
         passed: draft.traceFrameCount > 0,
       },
       {
         label: draft.tcp?.detected
-          ? "첫 RGB의 LLM fingertip 관찰됨 · 상태 판정은 로컬 MediaPipe 우선"
-          : "첫 RGB의 LLM fingertip은 advisory 미검출",
+          ? "선택 RGB의 LLM fingertip 관찰됨 · 상태 판정은 로컬 MediaPipe 우선"
+          : "선택 RGB의 LLM fingertip은 advisory 미검출",
         passed: Boolean(draft.tcp?.detected),
       },
       {
@@ -637,17 +697,24 @@
     const calibrationReady = Boolean(checkById.get("operator_task_plane")?.passed);
     const trajectoryReady = Boolean(checkById.get("metric_trajectory")?.passed)
       && Boolean(checkById.get("anchor_geometry")?.passed);
+    const fixedWorkspace = Boolean(
+      draft.promotionEvidence?.calibration?.fixed_workspace_reuse,
+    );
     const candidateReady = Boolean(checkById.get("mock_validation")?.passed);
-    dom.autoSurfaceCalibration.disabled = false;
+    dom.autoSurfaceCalibration.hidden = fixedWorkspace;
+    dom.startSurfaceCalibration.hidden = fixedWorkspace;
+    dom.startPathTeaching.hidden = fixedWorkspace;
+    dom.autoTcpPath.hidden = fixedWorkspace;
+    dom.autoSurfaceCalibration.disabled = fixedWorkspace;
     dom.autoSurfaceCalibration.textContent = calibrationReady
       ? "Depth 평면 보조 힌트 다시 계산" : "Depth 평면 보조 힌트";
-    dom.startSurfaceCalibration.disabled = false;
+    dom.startSurfaceCalibration.disabled = fixedWorkspace;
     dom.startSurfaceCalibration.textContent = calibrationReady ? "task-plane TF 다시 보정" : "수동 3점 task-plane TF";
-    dom.startPathTeaching.disabled = !calibrationReady;
+    dom.startPathTeaching.disabled = fixedWorkspace || !calibrationReady;
     dom.startPathTeaching.title = calibrationReady
       ? "녹화 프레임에서 두 fingertip을 직접 지정"
       : "먼저 수동 3점 camera → task-plane TF를 보정하세요.";
-    dom.autoTcpPath.disabled = !calibrationReady;
+    dom.autoTcpPath.disabled = fixedWorkspace || !calibrationReady;
     dom.autoTcpPath.title = calibrationReady
       ? "MediaPipe landmark 4·8을 각자의 aligned depth로 3D 복원"
       : "먼저 수동 3점 camera → task-plane TF를 보정하세요.";
@@ -1373,9 +1440,9 @@
     const skill = selectedSkill();
     dom.detailNodes.replaceChildren();
     dom.validateSkill.disabled = !skill || state.apiStatus !== "connected";
-    dom.activateSkill.disabled = !skill || state.apiStatus !== "connected" || skill.uiState === "active";
-    dom.activateSkill.hidden = Boolean(skill && skill.uiState === "active");
-    dom.deactivateSkill.hidden = !skill || skill.uiState !== "active";
+    dom.activateSkill.disabled = !skill || state.apiStatus !== "connected" || skill.status === "active";
+    dom.activateSkill.hidden = Boolean(skill && skill.status === "active");
+    dom.deactivateSkill.hidden = !skill || skill.status !== "active";
     dom.deactivateSkill.disabled = !skill || state.apiStatus !== "connected";
     if (!skill) {
       dom.detailTitle.textContent = "스킬을 선택하세요";
@@ -1448,6 +1515,8 @@
 
     if (state.run.status === "estop") {
       setChip(dom.estopChip, "● E-STOP REQUESTED", "danger");
+    } else if (aruco?.fixed_workspace_ready && hardwareAruco) {
+      setChip(dom.estopChip, "● CONTROLLER STATE AUTO", "ok");
     } else if (arucoEnabled) {
       setChip(dom.estopChip, "● OPERATOR E-STOP ACK", "ok");
     } else {
@@ -1459,12 +1528,14 @@
     } else if (state.camera.state === "starting") {
       setChip(dom.cameraChip, "● REALSENSE STARTING", "warn");
     } else if (state.camera.state === "error") {
-      setChip(dom.cameraChip, "● REALSENSE ERROR", "danger");
+      setChip(dom.cameraChip, "○ CAMERA OPTIONAL");
     } else {
       setChip(dom.cameraChip, "○ REALSENSE STOPPED");
     }
 
-    if (capabilities.reference_error) {
+    if (aruco?.fixed_workspace_ready) {
+      setChip(dom.workspaceChip, "● FIXED BASE/PLANE WORKSPACE", "ok");
+    } else if (capabilities.reference_error) {
       setChip(dom.workspaceChip, "● WORKSPACE ERROR", "danger");
     } else if (aruco?.reference_captured && runtimeReady) {
       setChip(dom.workspaceChip, "● BASE/PLANE WORKSPACE ACTIVE", "ok");
@@ -1478,10 +1549,10 @@
 
     if (state.apiStatus !== "connected") {
       setChip(dom.modeChip, "● FASTAPI DISCONNECTED", "danger");
+    } else if (hardwareAruco && aruco?.fixed_workspace_ready) {
+      setChip(dom.modeChip, "● HARDWARE DIRECT READY", "ok");
     } else if (arucoError) {
-      setChip(dom.modeChip, "● ARUCO SESSION ERROR", "danger");
-    } else if (hardwareAruco && capabilities.hardware_authorized === true) {
-      setChip(dom.modeChip, "● HARDWARE ARUCO GATES READY", "ok");
+      setChip(dom.modeChip, "○ OPTIONAL DIAGNOSTIC ERROR");
     } else if (hardwareAruco) {
       setChip(dom.modeChip, "● HARDWARE GATES CLOSED", "danger");
     } else {
@@ -1597,6 +1668,8 @@
       if (!quiet) setBanner(`조그 상태 확인 실패: ${errorText(error)}`, "danger");
     }
     renderJog();
+    if (state.page === "skills") renderRegistry();
+    if (state.page === "aruco-experiment") renderArucoExperiment();
   }
 
   async function enableJog() {
@@ -1737,36 +1810,46 @@
     const enabled = payload?.enabled === true;
     const hardware = capabilities.mode === "hardware";
     const busy = state.arucoExperiment.loading;
+    const jogEnabled = state.jog.status?.enabled === true;
     const reference = capabilities.reference || null;
     const runtime = payload?.runtime_workspace || null;
     const failedGates = Array.isArray(capabilities.failed_gates)
       ? capabilities.failed_gates
       : [];
 
-    dom.arucoExperimentModeNotice.textContent = capabilities.reference_error
+    dom.arucoExperimentModeNotice.textContent = jogEnabled
+      ? "조그가 활성화되어 ArUco 실험이 잠겨 있습니다. 먼저 조그 화면에서 ‘정지 · 비활성화’를 누르세요."
+      : capabilities.reference_error
       ? `Frozen reference 오류: ${capabilities.reference_error}`
       : hardware
         ? "실제 M0609 ArUco 실험 모드입니다. 두 이동 버튼은 로봇을 즉시 움직입니다."
         : "MOCK ArUco 실험 모드입니다. 계산과 runtime NPZ는 실제와 같지만 로봇은 움직이지 않습니다.";
     dom.arucoExperimentModeNotice.style.color = (
-      hardware || capabilities.reference_error
+      hardware || capabilities.reference_error || jogEnabled
     ) ? "var(--danger)" : "";
     dom.arucoExperimentStatus.textContent = state.arucoExperiment.lastError
       ? `오류 · ${state.arucoExperiment.lastError}`
-      : enabled
+      : jogEnabled
+        ? "○ 전환 대기 · 조그 정지 및 비활성화 필요"
+        : enabled
         ? `● 활성 · ${payload.operator_id || "operator"} · ${payload.last_action || "대기"}`
         : "○ 비활성 · 물체 폭과 안전 확인 후 활성화하세요.";
     dom.arucoExperimentStatus.style.color = state.arucoExperiment.lastError
       ? "var(--danger)"
       : enabled ? "var(--ok)" : "";
-    dom.arucoExperimentGates.textContent = hardware
+    dom.arucoExperimentGates.textContent = jogEnabled
+      ? "상호잠금: WEB JOG 활성\n조그 정지·비활성화 후 ArUco 상태를 새로고침하세요."
+      : hardware
       ? `실제 로봇 gate: 모두 통과\nactive TCP: ${capabilities.expected_tcp_name}\nbase 반경: ${capabilities.maximum_base_radius_m} m 이하`
       : `실제 로봇은 비활성화됨${failedGates.length ? `\n닫힌 gate:\n- ${failedGates.join("\n- ")}` : ""}\n현재 이동은 MOCK 전용`;
 
     const legacyModel = dom.arucoWidthModel.value === "legacy-half-factor";
     dom.arucoObjectWidthMm.max = legacyModel ? "55" : "110";
     dom.arucoExperimentEnable.disabled = busy || enabled || state.apiStatus !== "connected"
-      || Boolean(capabilities.reference_error);
+      || jogEnabled || Boolean(capabilities.reference_error);
+    dom.arucoExperimentEnable.title = jogEnabled
+      ? "조그 정지·비활성화가 먼저 필요합니다."
+      : "ArUco 실험 세션 활성화";
     dom.arucoExperimentRefresh.disabled = busy || state.apiStatus !== "connected";
     dom.arucoExperimentStop.disabled = busy || !enabled;
     dom.arucoMoveReference.disabled = busy || !enabled;
@@ -1806,21 +1889,31 @@
     if (state.apiStatus !== "connected") return;
     try {
       const wasEnabled = state.arucoExperiment.status?.enabled === true;
-      state.arucoExperiment.status = await api.arucoExperimentStatus();
+      const refreshed = await api.arucoExperimentStatus();
+      state.arucoExperiment.status = refreshed;
       if (wasEnabled && state.arucoExperiment.status?.enabled !== true) {
         dom.arucoWorkspaceCleared.checked = false;
         dom.arucoEstopReady.checked = false;
         dom.arucoDirectMotionAck.checked = false;
       }
-      state.arucoExperiment.lastError = null;
+      if (refreshed?.last_error) {
+        state.arucoExperiment.lastError = refreshed.last_error;
+      } else if (!quiet) {
+        state.arucoExperiment.lastError = null;
+      }
     } catch (error) {
       state.arucoExperiment.lastError = errorText(error);
       if (!quiet) setBanner(`ArUco 실험 상태 확인 실패: ${errorText(error)}`, "danger");
     }
     renderArucoExperiment();
+    if (state.skills.length) renderRegistry();
   }
 
   async function enableArucoExperiment() {
+    if (state.jog.status?.enabled === true) {
+      setBanner("ArUco 실험 전에 조그 화면에서 정지·비활성화를 완료하세요.", "danger");
+      return;
+    }
     if (
       !dom.arucoWorkspaceCleared.checked
       || !dom.arucoEstopReady.checked
@@ -1830,9 +1923,29 @@
       return;
     }
     const widthMm = Number(dom.arucoObjectWidthMm.value);
-    const maximumWidthMm = dom.arucoWidthModel.value === "legacy-half-factor" ? 55 : 110;
+    let maximumWidthMm = dom.arucoWidthModel.value === "legacy-half-factor" ? 55 : 110;
+    if (Number.isFinite(widthMm) && widthMm > 55 && widthMm <= 110
+      && dom.arucoWidthModel.value === "legacy-half-factor") {
+      const switchModel = window.confirm(
+        `legacy 폭 모델은 최대 55 mm만 허용합니다.\n\n${widthMm} mm를 사용하려면 full-opening 모델로 전환해야 합니다. 전환하고 계속할까요?`,
+      );
+      if (!switchModel) {
+        state.arucoExperiment.lastError = (
+          `물체 폭 ${widthMm} mm는 legacy 모델 한도 55 mm를 초과합니다. `
+          + "폭 모델을 full-opening으로 바꿔 주세요."
+        );
+        renderArucoExperiment();
+        return;
+      }
+      dom.arucoWidthModel.value = "full-opening";
+      maximumWidthMm = 110;
+    }
     if (!Number.isFinite(widthMm) || widthMm < 0 || widthMm > maximumWidthMm) {
-      setBanner(`현재 폭 모델에서 물체 폭은 0–${maximumWidthMm} mm여야 합니다.`, "danger");
+      state.arucoExperiment.lastError = (
+        `현재 폭 모델에서 물체 폭은 0–${maximumWidthMm} mm여야 합니다.`
+      );
+      setBanner(state.arucoExperiment.lastError, "danger");
+      renderArucoExperiment();
       return;
     }
     const hardware = state.arucoExperiment.status?.capabilities?.mode === "hardware";
@@ -1854,6 +1967,7 @@
         object_width_mm: widthMm,
         width_model: dom.arucoWidthModel.value,
       });
+      state.arucoExperiment.lastError = null;
       setBanner(
         hardware
           ? "실제 ArUco 실험 활성화 완료 · 기준 자세 버튼을 누르세요."
@@ -2210,21 +2324,36 @@
   }
 
   function renderRecordingCapability() {
-    const capabilities = state.recordingReview.capabilities;
+    const review = state.recordingReview;
+    const capabilities = review.capabilities;
     if (!capabilities) {
       dom.openaiCapability.textContent = "OpenAI 연결 상태 확인 중…";
       return;
     }
     const live = capabilities.openai_mode === "live";
     const ready = !live || capabilities.api_key_configured;
+    const configuredMaximum = Math.max(1, Number(capabilities.maximum_keyframes || 1));
+    const sourceIds = selectedDraftSourceIds();
+    const selectedFrameCount = review.recordings
+      .filter((item) => sourceIds.includes(item.recording_id))
+      .reduce((sum, item) => sum + Number(item.frame_count || 0), 0);
+    const recordingMaximum = Math.max(
+      1,
+      Math.min(configuredMaximum, selectedFrameCount || 1),
+    );
+    const recordingMinimum = Math.max(1, sourceIds.length);
+    const requestedCount = Number(dom.draftKeyframeCount.value || 8);
     dom.openaiCapability.textContent = live
       ? ready
-        ? `GPT LIVE 준비됨 · ${capabilities.model} · 첫 RGB 1장 + 전체 엄지/검지 trace · Depth/거리/상태는 로컬 유지`
+        ? `GPT LIVE 준비됨 · ${capabilities.model} · ${sourceIds.length}개 사례 · 선택 RGB 최대 ${recordingMaximum}장 + 전체 엄지/검지 trace · Depth/거리/상태는 로컬 유지`
         : "OPENAI_MODE=live이지만 서버에 OPENAI_API_KEY가 없습니다."
       : `현재 MOCK 분석 모드 · 실제 GPT 전송은 OPENAI_MODE=live에서만 수행됩니다. · ${capabilities.model}`;
     dom.openaiCapability.style.color = ready ? "" : "var(--danger)";
-    dom.draftKeyframeCount.max = "1";
-    dom.draftKeyframeCount.value = "1";
+    dom.draftKeyframeCount.min = String(recordingMinimum);
+    dom.draftKeyframeCount.max = String(recordingMaximum);
+    dom.draftKeyframeCount.value = String(
+      Math.min(recordingMaximum, Math.max(recordingMinimum, Math.trunc(requestedCount))),
+    );
   }
 
   function renderRecordingReview() {
@@ -2240,7 +2369,7 @@
       || !recording
       || !liveReady;
     if (review.loading) {
-      dom.draftStatus.textContent = "첫 RGB 1장과 전체 녹화 엄지/검지 trace를 준비하는 중…";
+      dom.draftStatus.textContent = `${dom.draftKeyframeCount.value}개 RGB와 전체 녹화 엄지/검지 trace를 준비하는 중…`;
     } else if (!recording) {
       dom.draftStatus.textContent = "녹화를 선택해 주세요.";
     }
@@ -2266,7 +2395,9 @@
         (recording) => recording.recording_id === review.selectedId,
       ) ? review.selectedId : review.recordings[0]?.recording_id || null;
       review.frameIndex = 0;
+      const previouslySelectedSources = new Set(selectedDraftSourceIds());
       dom.recordingSelect.replaceChildren();
+      dom.draftSourceRecordings.replaceChildren();
       if (!review.recordings.length) {
         const option = create("option", { text: "완료된 RGB-D 녹화가 없습니다" });
         option.value = "";
@@ -2275,12 +2406,21 @@
         dom.recordingReviewStatus.textContent = "실시간 모니터링에서 모션 녹화를 먼저 완료해 주세요.";
       } else {
         review.recordings.forEach((recording) => {
+          const sourceLabel = recording.source_label
+            && recording.source_label !== recording.recording_id
+            ? `${recording.source_label} · `
+            : "";
           const option = create("option", {
-            text: `${recording.recording_id} · ${recording.frame_count}프레임 · ${Number(recording.duration_s || 0).toFixed(1)}초`,
+            text: `${sourceLabel}${recording.recording_id} · ${recording.frame_count}프레임 · ${Number(recording.duration_s || 0).toFixed(1)}초`,
           });
           option.value = recording.recording_id;
           option.selected = recording.recording_id === review.selectedId;
           dom.recordingSelect.append(option);
+          const sourceOption = option.cloneNode(true);
+          sourceOption.selected = previouslySelectedSources.size
+            ? previouslySelectedSources.has(recording.recording_id)
+            : recording.recording_id === review.selectedId;
+          dom.draftSourceRecordings.append(sourceOption);
         });
         dom.recordingSelect.disabled = false;
         dom.recordingReviewStatus.textContent = `${review.recordings.length}개 녹화 · RGB/Depth는 로컬에서만 재생됩니다.`;
@@ -2334,6 +2474,7 @@
     try {
       const result = await api.createRecordingSkillDraft({
         recordingId: recording.recording_id,
+        recordingIds: selectedDraftSourceIds(),
         nameHint: dom.draftSkillName.value.trim(),
         operatorInstruction: dom.draftInstruction.value.trim(),
         keyframeCount: Number(dom.draftKeyframeCount.value),
@@ -2355,9 +2496,9 @@
       dom.draftStatus.style.color = "var(--ok)";
       dom.draftStatus.textContent = result.openai?.mode === "live"
         ? result.transport?.fallback_used
-          ? "GPT 분석 완료 · 첫 RGB 파일 1장 + 전체 엄지/검지 trace 전송 · Depth는 로컬 유지"
-          : `GPT 분석 완료 · ${result.openai.model} · 첫 RGB 1장 + 전체 ${result.transport?.trace_frame_count || 0}프레임 손끝 trace 전송`
-        : "Mock 분석 완료 · 실제 모드에서도 첫 RGB 1장과 전체 손끝 trace만 전송되고 Depth는 로컬에 남습니다.";
+          ? `GPT 분석 완료 · RGB 파일 ${result.transport?.image_count || 0}장 + 전체 엄지/검지 trace 전송 · Depth는 로컬 유지`
+          : `GPT 분석 완료 · ${result.openai.model} · RGB ${result.transport?.image_count || 0}장 + 전체 ${result.transport?.trace_frame_count || 0}프레임 손끝 trace 전송`
+        : `Mock 분석 완료 · 실제 모드에서는 선택 RGB ${result.transport?.image_count || 0}장과 전체 손끝 trace만 전송되고 Depth는 로컬에 남습니다.`;
     } catch (error) {
       dom.draftStatus.textContent = `스킬 초안 생성 실패: ${errorText(error)}`;
       dom.draftStatus.style.color = "var(--danger)";
@@ -2953,12 +3094,8 @@
   async function registerSelectedDraftCandidate() {
     const draft = selectedDraft();
     if (!draft?.readiness.can_register_candidate) return;
-    const confirmed = window.confirm(
-      "이 Candidate는 surface-relative 경로의 컴파일/Mock 검증만 수행하며 실제 로봇 하드웨어 검증은 포함하지 않습니다. 등록할까요?",
-    );
-    if (!confirmed) return;
     dom.registerDraftCandidate.disabled = true;
-    setBanner(`${draft.suggestedSkillId} Candidate 생성 및 Mock 회귀 검증 중…`);
+    setBanner(`${draft.suggestedSkillId} Candidate 생성 중… 고정 workspace 경로를 적용합니다.`);
     try {
       const result = await api.registerDraftCandidate(draft.draftId);
       await loadRegistry(
@@ -3022,21 +3159,40 @@
 
   async function startRun(skillKey) {
     const skill = state.skills.find((item) => item.key === skillKey);
-    if (!skill || skill.uiState !== "active" || state.apiStatus !== "connected") return;
+    const hardwareCandidate = skill?.uiState === "tested"
+      && state.arucoExperiment.status?.capabilities?.mode === "hardware";
+    if (!skill || (skill.uiState !== "active" && !hardwareCandidate)
+      || state.apiStatus !== "connected") return;
+    await refreshJogStatus({ quiet: true });
+    if (state.jog.status?.enabled === true) {
+      try {
+        await api.stopJog("automatic_skill_execution_transition");
+        await refreshJogStatus({ quiet: true });
+      } catch (error) {
+        setBanner(`조그 세션 자동 종료 실패: ${errorText(error)}`, "danger");
+        return;
+      }
+    }
+    const hardware = state.arucoExperiment.status?.capabilities?.mode === "hardware";
+    const mode = hardware ? "hardware" : "mock";
     const runId = newRunId();
     state.run = { skillKey, runId, status: "starting", completedSteps: 0 };
     setBanner(`${skill.id} Scene 캡처 및 preflight 준비 중…`);
     showPage("monitor");
     renderMonitor();
     try {
-      const scene = await api.captureScene();
-      const binding = await api.bindRuntime(skill.id, skill.version, scene.scene_id);
-      const preflight = await api.preflightRuntime(skill.id, skill.version, scene.scene_id, binding.bindings);
-      if (!preflight.passed) {
-        throw new Error(`preflight 거부: ${(preflight.errors || []).join(", ")}`);
+      const scene = await api.captureScene(mode);
+      const binding = await api.bindRuntime(skill.id, skill.version, scene.scene_id, mode);
+      if (!hardware) {
+        const preflight = await api.preflightRuntime(
+          skill.id, skill.version, scene.scene_id, binding.bindings, mode,
+        );
+        if (!preflight.passed) {
+          throw new Error(`preflight 거부: ${(preflight.errors || []).join(", ")}`);
+        }
       }
       state.run.status = "running";
-      setBanner(`${skill.id} Mock 실행 중…`);
+      setBanner(`${skill.id} ${hardware ? "실제 로봇" : "Mock"} 실행 중…`);
       renderMonitor();
       const result = await api.executeRuntime({
         skillId: skill.id,
@@ -3044,6 +3200,7 @@
         sceneId: scene.scene_id,
         bindings: binding.bindings,
         runId,
+        mode,
       });
       state.run.runId = result.run_id;
       state.run.status = "succeeded";
@@ -3084,6 +3241,10 @@
       renderRegistry();
     });
   });
+  dom.refreshSkills.addEventListener(
+    "click",
+    () => loadRegistry("스킬 레지스트리를 새로고침했습니다."),
+  );
   dom.validateSkill.addEventListener("click", validateSelected);
   dom.activateSkill.addEventListener("click", activateSelected);
   dom.deactivateSkill.addEventListener("click", () => {
@@ -3131,11 +3292,15 @@
     stopRecordingPlayback();
     cancelGeometryTeaching();
     state.recordingReview.selectedId = dom.recordingSelect.value || null;
+    const primarySource = Array.from(dom.draftSourceRecordings.options)
+      .find((option) => option.value === state.recordingReview.selectedId);
+    if (primarySource) primarySource.selected = true;
     state.recordingReview.frameIndex = 0;
     state.recordingReview.draft = null;
     dom.draftStatus.style.color = "";
     renderRecordingReview();
   });
+  dom.draftSourceRecordings.addEventListener("change", renderRecordingReview);
   dom.refreshRecordings.addEventListener("click", loadRecordings);
   dom.toggleRecordingPlayback.addEventListener("click", toggleRecordingPlayback);
   dom.recordingFrameIndex.addEventListener("input", () => {

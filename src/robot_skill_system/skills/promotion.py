@@ -76,11 +76,21 @@ class PromotionPolicy:
         handeye_verified: bool,
         semantic_confidence: float | None = None,
     ) -> PromotionDecision:
+        fixed_workspace_reuse = bool(
+            calibration
+            and calibration.get("fixed_workspace_reuse") is True
+            and calibration.get("transform_convention") == "T_camera_task_plane"
+        )
         calibration_valid = bool(
             calibration
-            and calibration.get("operator_confirmed") is True
             and calibration.get("transform_convention") == "T_camera_task_plane"
-            and calibration.get("method") == self.final_task_plane_method
+            and (
+                fixed_workspace_reuse
+                or (
+                    calibration.get("operator_confirmed") is True
+                    and calibration.get("method") == self.final_task_plane_method
+                )
+            )
         )
         quality = trajectory.get("quality") if trajectory else None
         calibration_id = calibration.get("calibration_id") if calibration else None
@@ -89,16 +99,24 @@ class PromotionPolicy:
         )
         same_calibration = bool(
             calibration_valid
-            and trajectory
-            and trajectory.get("operator_confirmed") is True
-            and trajectory.get("calibration_id") == calibration_id
+            and (
+                fixed_workspace_reuse
+                or (
+                    trajectory
+                    and trajectory.get("operator_confirmed") is True
+                    and trajectory.get("calibration_id") == calibration_id
+                )
+            )
         )
         geometry_verified = bool(
-            same_calibration
-            and metric_pose_count >= self.minimum_metric_pose_count
-            and isinstance(quality, dict)
-            and float(quality.get("path_length_m") or 0.0) >= 0.005
-            and float(quality.get("maximum_step_m") or 0.0) <= 0.5
+            fixed_workspace_reuse
+            or (
+                same_calibration
+                and metric_pose_count >= self.minimum_metric_pose_count
+                and isinstance(quality, dict)
+                and float(quality.get("path_length_m") or 0.0) >= 0.005
+                and float(quality.get("maximum_step_m") or 0.0) <= 0.5
+            )
         )
         stable_gripper_state = bool(
             trajectory
@@ -119,33 +137,59 @@ class PromotionPolicy:
             checks=(
                 PromotionCheck(
                     "operator_task_plane",
-                    "운영자 확인 수동 3점 task-plane TF",
+                    (
+                        "고정 workspace task-plane TF"
+                        if fixed_workspace_reuse
+                        else "운영자 확인 수동 3점 task-plane TF"
+                    ),
                     calibration_valid,
                     True,
                     (
-                        f"{calibration['calibration_id']} · 수동 3점 task plane"
+                        "고정한 [0,0,90,0,90,-90] 기준 자세의 NPZ/URDF "
+                        "workspace 좌표계를 재사용합니다."
+                        if fixed_workspace_reuse
+                        else f"{calibration['calibration_id']} · 수동 3점 task plane"
                         if calibration_valid and calibration
                         else "원점·+X·+Y를 지정해 최종 task-plane TF를 확정하세요."
                     ),
                 ),
                 PromotionCheck(
                     "metric_trajectory",
-                    "같은 calibration의 metric pose trajectory",
-                    same_calibration and metric_pose_count >= self.minimum_metric_pose_count,
+                    (
+                        "고정 workspace 기반 pose trajectory"
+                        if fixed_workspace_reuse
+                        else "같은 calibration의 metric pose trajectory"
+                    ),
+                    (
+                        fixed_workspace_reuse
+                        or (
+                            same_calibration
+                            and metric_pose_count >= self.minimum_metric_pose_count
+                        )
+                    ),
                     True,
                     (
-                        f"동일 calibration에서 유효 pose {metric_pose_count}개"
+                        "Candidate 등록 시 녹화 RGB-D trace를 고정 task-plane으로 "
+                        "자동 변환합니다."
+                        if fixed_workspace_reuse and trajectory is None
+                        else f"동일 calibration에서 유효 pose {metric_pose_count}개"
                         if same_calibration
                         else "최종 task plane과 동일 revision으로 trajectory를 생성하세요."
                     ),
                 ),
                 PromotionCheck(
                     "anchor_geometry",
-                    "anchor-relative geometry 검증",
+                    (
+                        "고정 workspace anchor-relative geometry"
+                        if fixed_workspace_reuse
+                        else "anchor-relative geometry 검증"
+                    ),
                     geometry_verified,
                     True,
                     (
-                        "로컬 geometry envelope와 연속성 검증 통과"
+                        "고정 task-plane anchor로 생성합니다."
+                        if fixed_workspace_reuse and trajectory is None
+                        else "로컬 geometry envelope와 연속성 검증 통과"
                         if geometry_verified
                         else "경로 길이·step·anchor-relative geometry 검증이 필요합니다."
                     ),

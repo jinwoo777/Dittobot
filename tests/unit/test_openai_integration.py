@@ -88,6 +88,9 @@ def test_all_semantic_motion_prompts_share_local_simplification_policy() -> None
         assert "classification thresholds" in prompt
         assert "minimum primitive sequence" in prompt
         assert "local motion fitter is authoritative" in prompt
+        assert "fixed-workspace pickup" in prompt
+        assert "gripper.open -> one approach motion -> gripper.close" in prompt
+        assert "Do not add repeated approach/retract motions" in prompt
 
     for prompt in (
         RECORDING_SKILL_INSTRUCTIONS,

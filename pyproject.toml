@@ -56,6 +56,18 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+# These pre-existing hardware/diagnostic utilities are kept under their legacy
+# lint baseline. Core code, tests, examples, and new ArUco utilities remain fully checked.
+[tool.ruff.lint.per-file-ignores]
+"aruco/_debug_detect.py" = ["B007", "F401"]
+"aruco/aruco_planar_coords.py" = ["B905", "I001"]
+"aruco/d435i_aruco_plane.py" = ["B905", "E501", "I001"]
+"aruco/d435i_plane_workspace_scan.py" = ["B905", "E501", "I001"]
+"aruco/d435i_stream_diagnostic.py" = ["E501", "F841", "SIM105"]
+"aruco/freeze_fixed_aruco_workspace.py" = ["SIM105"]
+"aruco/object_width_workspace.py" = ["SIM105"]
+"aruco/test_object_width_workspace.py" = ["SIM117"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true
@@ -66,3 +78,7 @@ warn_unused_ignores = true
 [[tool.mypy.overrides]]
 module = ["scipy.*", "pyrealsense2.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["aruco.object_width_workspace"]
+follow_imports = "skip"

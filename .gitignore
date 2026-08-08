@@ -26,3 +26,11 @@ data/skills/*/*/
 /Calibration_Tutorial.zip
 /dsr_bringup2.zip
 /T_gripper2camera.npy
+data/test/*
+data/experiments/*
+
+
+*.jpg
+*.png
+*.zip
+AGENTS.md
