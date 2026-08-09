@@ -176,30 +176,31 @@ def test_full_manifest_tracking_rejects_unaligned_depth_before_processing(
     assert controller.loaded_indices == []
 
 
-def test_recording_draft_capabilities_expose_single_rgb_contract(tmp_path: Path) -> None:
+def test_recording_draft_capabilities_expose_selectable_rgb_contract(
+    tmp_path: Path,
+) -> None:
     settings = _settings(tmp_path)
     service = _service(settings, _FrameController())
 
     capabilities = service.get_recording_skill_draft_capabilities()
-    assert capabilities["maximum_keyframes"] == 1
-    assert capabilities["legacy_configured_maximum_keyframes"] == (
-        settings.openai_max_keyframes
+    assert capabilities["maximum_keyframes"] == settings.openai_max_keyframes
+    assert capabilities["uploaded_rgb_frame_count"] == (
+        "operator_selected_1_to_maximum_keyframes"
     )
-    assert capabilities["uploaded_rgb_frame_count"] == 1
     assert capabilities["maximum_compact_trace_frames"] == 6_000
     assert capabilities["uploads_rgb_and_aligned_depth_pairs"] is False
     assert capabilities["depth_stays_local"] is True
     assert capabilities["local_finger_state_authoritative"] is True
-    assert capabilities["request_keyframe_count_is_deprecated_and_ignored"] is True
+    assert capabilities["request_keyframe_count_is_deprecated_and_ignored"] is False
 
     request = RecordingSkillDraftRequest(
         recording_id="rgbd_0123456789abcdef0123456789abcdef",
         operator_instruction="두 손가락으로 작업한다",
     )
-    assert request.model_dump()["keyframe_count"] == 1
-    assert RecordingSkillDraftRequest.model_json_schema()["properties"][
-        "keyframe_count"
-    ]["deprecated"] is True
+    assert request.model_dump()["keyframe_count"] == 8
+    assert "deprecated" not in RecordingSkillDraftRequest.model_json_schema()[
+        "properties"
+    ]["keyframe_count"]
 
 
 def test_complete_rgbd_promotion_evidence_requires_full_trace_coverage() -> None:

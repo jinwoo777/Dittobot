@@ -3,11 +3,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
-import pytest
 
 from robot_skill_system.capture import (
     HOST_UNIX_EPOCH_CLOCK_DOMAIN,
-    CaptureError,
     CaptureMode,
     CaptureRequest,
     RealSenseCapture,
@@ -175,7 +173,7 @@ def test_fake_realsense_capture_maps_to_epoch_and_retains_raw_clock_metadata() -
     assert np.allclose(first.depth_image_m, 1.0)
 
 
-def test_realsense_capture_skips_unsynchronized_startup_pairs() -> None:
+def test_realsense_capture_accepts_sdk_aligned_frameset_with_sensor_clock_offset() -> None:
     color = np.full((2, 2, 3), 7, dtype=np.uint8)
     depth = np.full((2, 2), 1000, dtype=np.uint16)
     unsynchronized = _FakeFrameSet(
@@ -201,8 +199,9 @@ def test_realsense_capture_skips_unsynchronized_startup_pairs() -> None:
 
     frame = capture.capture(CaptureRequest(mode=CaptureMode.SINGLE)).representative_frame
 
-    assert frame.frame_number == 2
-    assert abs(frame.color_timestamp_ns - frame.depth_timestamp_ns) == 400_000
+    assert frame.frame_number == 1
+    assert frame.color_timestamp_ns == frame.depth_timestamp_ns
+    assert abs(frame.raw_color_timestamp_ns - frame.raw_depth_timestamp_ns) == 250_000_000
 
 
 def test_realsense_default_accepts_one_30_fps_frame_period_of_skew() -> None:
@@ -230,10 +229,11 @@ def test_realsense_default_accepts_one_30_fps_frame_period_of_skew() -> None:
     frame = capture.capture(CaptureRequest(mode=CaptureMode.SINGLE)).representative_frame
 
     assert frame.maximum_timestamp_skew_ns == 50_000_000
-    assert abs(frame.color_timestamp_ns - frame.depth_timestamp_ns) == 33_400_000
+    assert frame.color_timestamp_ns == frame.depth_timestamp_ns
+    assert abs(frame.raw_color_timestamp_ns - frame.raw_depth_timestamp_ns) == 33_400_000
 
 
-def test_realsense_sync_error_reports_limit_and_observed_skew() -> None:
+def test_realsense_sdk_frameset_keeps_large_raw_skew_for_audit() -> None:
     color = np.full((2, 2, 3), 7, dtype=np.uint8)
     depth = np.full((2, 2), 1000, dtype=np.uint16)
     stale_pairs = [
@@ -262,5 +262,7 @@ def test_realsense_sync_error_reports_limit_and_observed_skew() -> None:
     capture._align = _FakeAlign()  # noqa: SLF001 - injected hardware boundary
     capture._depth_scale_m = 0.001  # noqa: SLF001 - injected hardware boundary
 
-    with pytest.raises(CaptureError, match=r"50 ms limit .*80\.000\.\.90\.000 ms"):
-        capture.capture(CaptureRequest(mode=CaptureMode.SINGLE))
+    frame = capture.capture(CaptureRequest(mode=CaptureMode.SINGLE)).representative_frame
+
+    assert frame.color_timestamp_ns == frame.depth_timestamp_ns
+    assert abs(frame.raw_color_timestamp_ns - frame.raw_depth_timestamp_ns) == 80_000_000

@@ -82,6 +82,32 @@ def test_auto_plane_hint_and_revision_mismatch_remain_blocking() -> None:
     assert any("동일 revision" in blocker for blocker in mismatch_decision.blockers)
 
 
+def test_fixed_workspace_reuse_skips_repeat_manual_task_plane_and_path_gates() -> None:
+    fixed_workspace = {
+        "calibration_id": "cal_fixed_workspace_example",
+        "transform_convention": "T_camera_task_plane",
+        "method": "fixed_workspace_npz_urdf_reuse",
+        "fixed_workspace_reuse": True,
+    }
+
+    decision = PromotionPolicy().evaluate_recording(
+        calibration=fixed_workspace,
+        trajectory=None,
+        has_rgbd_evidence=True,
+        has_semantic_schema=True,
+        gpt_fingertips_detected=True,
+        handeye_verified=False,
+    )
+
+    assert decision.eligible is True
+    assert decision.blockers == ()
+    checks = {item.check_id: item for item in decision.checks}
+    assert checks["operator_task_plane"].passed is True
+    assert checks["metric_trajectory"].passed is True
+    assert checks["anchor_geometry"].passed is True
+    assert "고정 workspace" in checks["operator_task_plane"].label
+
+
 def test_block_candidate_needs_only_explicit_confirmation() -> None:
     policy = PromotionPolicy()
     assert policy.evaluate_block_candidate(operator_confirmed=True).eligible is True

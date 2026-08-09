@@ -18,7 +18,7 @@ from robot_skill_system.settings import Settings
 from robot_skill_system.storage.artifact_store import LocalArtifactStore
 
 
-def test_first_rgb_full_trace_task_plane_and_candidate_direct_pipeline(
+def test_selected_rgb_full_trace_task_plane_and_candidate_direct_pipeline(
     tmp_path: Path,
 ) -> None:
     settings = Settings.from_env(
@@ -48,24 +48,48 @@ def test_first_rgb_full_trace_task_plane_and_candidate_direct_pipeline(
         time.sleep(0.45)
         stopped = service.stop_camera_recording(str(recording["recording_id"]))
         assert stopped["frame_count"] >= 4
+        second_recording = service.start_camera_recording({"maximum_duration_s": 1.0})
+        time.sleep(0.35)
+        second_stopped = service.stop_camera_recording(
+            str(second_recording["recording_id"])
+        )
+        assert second_stopped["frame_count"] >= 3
 
         draft = service.create_recording_skill_draft(
             {
                 "recording_id": recording["recording_id"],
+                "recording_ids": [
+                    recording["recording_id"],
+                    second_recording["recording_id"],
+                ],
                 "name_hint": "direct_rgbd_wipe",
                 "operator_instruction": "걸레로 테이블 표면을 닦는다",
-                "keyframe_count": 99,
+                "keyframe_count": 4,
             }
         )
-        assert draft["transport"] == {
-            "mode": "first_rgb_plus_compact_fingertip_trace",
-            "first_frame_index": 0,
-            "image_count": 1,
-            "depth_image_count": 0,
-            "trace_frame_count": stopped["frame_count"],
-            "requested_keyframe_count_ignored": 99,
-            "fallback_used": False,
-        }
+        transport = draft["transport"]
+        assert transport["mode"] == "rgb_keyframes_plus_compact_fingertip_trace"
+        assert transport["first_frame_index"] == 0
+        assert transport["image_count"] == 4
+        assert transport["demonstration_count"] == 2
+        assert [
+            item["recording_id"] for item in transport["demonstration_cases"]
+        ] == [recording["recording_id"], second_recording["recording_id"]]
+        assert [
+            len(item["local_keyframe_indices"])
+            for item in transport["demonstration_cases"]
+        ] == [2, 2]
+        assert len(transport["keyframe_indices"]) == 4
+        assert transport["keyframe_indices"][0] == 0
+        assert transport["keyframe_indices"][-1] == (
+            stopped["frame_count"] + second_stopped["frame_count"] - 1
+        )
+        assert transport["depth_image_count"] == 0
+        assert transport["trace_frame_count"] == (
+            stopped["frame_count"] + second_stopped["frame_count"]
+        )
+        assert transport["requested_keyframe_count"] == 4
+        assert transport["fallback_used"] is False
         tracking_metadata = draft["local_fingertip_tracking"]
         tracking = json.loads(
             service.store.read_bytes(

@@ -380,6 +380,101 @@ def test_mediapipe_hands_graph_is_persistent_and_configured_for_tracking(
     assert instance.closed is True
 
 
+def test_mediapipe_tasks_hand_landmarker_is_used_without_solutions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    landmarks = [SimpleNamespace(x=0.5, y=0.5) for _ in range(21)]
+    landmarks[0] = SimpleNamespace(x=0.5, y=0.7)
+    landmarks[4] = SimpleNamespace(x=0.4, y=0.5)
+    landmarks[5] = SimpleNamespace(x=0.5, y=0.4)
+    landmarks[8] = SimpleNamespace(x=0.6, y=0.5)
+    landmarks[17] = SimpleNamespace(x=0.7, y=0.7)
+    model_path = tmp_path / "hand_landmarker.task"
+    model_path.write_bytes(b"fake-model")
+
+    class FakeBaseOptions:
+        def __init__(self, *, model_asset_path: str) -> None:
+            self.model_asset_path = model_asset_path
+
+    class FakeOptions:
+        created: FakeOptions | None = None
+
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            FakeOptions.created = self
+
+    class FakeImage:
+        def __init__(self, *, image_format: object, data: np.ndarray) -> None:
+            self.image_format = image_format
+            self.data = data
+
+    class FakeLandmarker:
+        instance: FakeLandmarker | None = None
+
+        def __init__(self, options: FakeOptions) -> None:
+            self.options = options
+            self.timestamps_ms: list[int] = []
+            self.closed = False
+            FakeLandmarker.instance = self
+
+        @classmethod
+        def create_from_options(cls, options: FakeOptions) -> FakeLandmarker:
+            return cls(options)
+
+        def detect_for_video(self, image: FakeImage, timestamp_ms: int) -> object:
+            assert image.image_format == "srgb"
+            assert image.data.dtype == np.uint8
+            self.timestamps_ms.append(timestamp_ms)
+            return SimpleNamespace(
+                hand_landmarks=[landmarks],
+                handedness=[[SimpleNamespace(score=0.95)]],
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_module = SimpleNamespace(
+        Image=FakeImage,
+        ImageFormat=SimpleNamespace(SRGB="srgb"),
+        tasks=SimpleNamespace(
+            BaseOptions=FakeBaseOptions,
+            vision=SimpleNamespace(
+                HandLandmarker=FakeLandmarker,
+                HandLandmarkerOptions=FakeOptions,
+                RunningMode=SimpleNamespace(VIDEO="video"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(hand_pose, "_load_mediapipe", lambda: fake_module)
+    tracker = MediaPipeHandPoseEstimator(
+        minimum_detection_confidence=0.7,
+        minimum_tracking_confidence=0.8,
+        hand_landmarker_model_path=model_path,
+    )
+
+    first = tracker.track(_frame(frame_number=0))
+    second = tracker.track(_frame(frame_number=1))
+
+    options = FakeOptions.created
+    landmarker = FakeLandmarker.instance
+    assert options is not None
+    assert landmarker is not None
+    assert options.kwargs["running_mode"] == "video"
+    assert options.kwargs["num_hands"] == 1
+    assert options.kwargs["min_hand_detection_confidence"] == pytest.approx(0.7)
+    assert options.kwargs["min_hand_presence_confidence"] == pytest.approx(0.7)
+    assert options.kwargs["min_tracking_confidence"] == pytest.approx(0.8)
+    base_options = options.kwargs["base_options"]
+    assert isinstance(base_options, FakeBaseOptions)
+    assert base_options.model_asset_path == str(model_path.resolve())
+    assert landmarker.timestamps_ms == [1000, 1001]
+    assert first.observation.confidence == pytest.approx(0.95)
+    assert second.hand_pose is not None
+    tracker.close()
+    assert landmarker.closed is True
+
+
 def test_finger_tracking_settings_are_environment_backed(tmp_path: Path) -> None:
     settings = Settings.from_env(
         {

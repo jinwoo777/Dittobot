@@ -236,7 +236,6 @@ class RealSenseCapture:
             raise NotConfiguredError("RealSense capture has not been started")
         try:
             maximum_skew_ns = int(round(self.config.maximum_timestamp_skew_ms * 1.0e6))
-            observed_skews_ns: list[int] = []
             for attempt in range(self.config.synchronization_retry_count):
                 frames = self._pipeline.wait_for_frames(self.config.wait_timeout_ms)
                 observed_host_unix_epoch_ns = self._epoch_clock_ns()
@@ -255,23 +254,6 @@ class RealSenseCapture:
                 )
                 raw_color_clock_domain = _normalise_timestamp_clock_domain(color_frame)
                 raw_depth_clock_domain = _normalise_timestamp_clock_domain(depth_frame)
-                raw_skew_ns = abs(raw_color_timestamp_ns - raw_depth_timestamp_ns)
-                if (
-                    raw_color_clock_domain == raw_depth_clock_domain
-                    and raw_skew_ns > maximum_skew_ns
-                ):
-                    observed_skews_ns.append(raw_skew_ns)
-                    if attempt + 1 == self.config.synchronization_retry_count:
-                        minimum_skew_ms = min(observed_skews_ns) / 1.0e6
-                        maximum_observed_skew_ms = max(observed_skews_ns) / 1.0e6
-                        raise CaptureError(
-                            "RealSense RGB/depth frames did not synchronize within "
-                            f"the {self.config.maximum_timestamp_skew_ms:g} ms limit "
-                            f"(observed {minimum_skew_ms:.3f}.."
-                            f"{maximum_observed_skew_ms:.3f} ms across "
-                            f"{len(observed_skews_ns)} framesets)"
-                        )
-                    continue
                 for filter_object in self._filters:
                     depth_frame = filter_object.process(depth_frame)
                 color = np.asanyarray(color_frame.get_data()).astype(np.uint8, copy=True)
@@ -298,11 +280,19 @@ class RealSenseCapture:
                     depth_clock_domain=raw_depth_clock_domain,
                     observed_host_unix_epoch_ns=observed_host_unix_epoch_ns,
                 )
+                # `wait_for_frames` already returns one SDK-synchronized frameset and
+                # `align.process` produces its color-aligned depth image. Some D435i
+                # firmware reports a large persistent raw timestamp offset between the
+                # two sensors even for that valid pair. Use one canonical frameset time
+                # for replay/alignment while retaining both raw timestamps below.
+                frameset_timestamp_ns = (
+                    color_timestamp_ns + depth_timestamp_ns
+                ) // 2
                 return SynchronizedRGBDFrame(
                     color_image_rgb=color,
                     depth_image_m=depth_m,
-                    color_timestamp_ns=color_timestamp_ns,
-                    depth_timestamp_ns=depth_timestamp_ns,
+                    color_timestamp_ns=frameset_timestamp_ns,
+                    depth_timestamp_ns=frameset_timestamp_ns,
                     color_intrinsics=intrinsics,
                     frame_number=int(color_frame.get_frame_number()),
                     depth_scale_m=self._depth_scale_m,

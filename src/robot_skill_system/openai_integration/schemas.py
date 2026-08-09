@@ -327,6 +327,7 @@ class RecordingSkillDraftInput(StrictModel):
     """Bounded metadata paired with chronological aligned RGB-depth image pairs."""
 
     recording_id: str = Field(pattern=r"^rgbd_[A-Za-z0-9_-]{1,96}$")
+    demonstration_cases: list[dict[str, Any]] = Field(default_factory=list, max_length=8)
     name_hint: str = Field(pattern=r"^[a-z][a-z0-9_]{2,63}$")
     operator_instruction: str = Field(min_length=1, max_length=2000)
     recording_summary: dict[str, Any]
@@ -340,6 +341,7 @@ class RecordingSkillDraftInput(StrictModel):
     visual_input_policy: Literal[
         "rgbd_keyframes",
         "first_rgb_plus_local_fingertip_trace",
+        "rgb_keyframes_plus_local_fingertip_trace",
     ] = "rgbd_keyframes"
     image_pair_order: Literal["rgb_then_aligned_depth_per_keyframe"] = (
         "rgb_then_aligned_depth_per_keyframe"
@@ -357,9 +359,21 @@ class RecordingSkillDraftInput(StrictModel):
         if self.visual_input_policy == "rgbd_keyframes":
             return self
         if self.first_frame_index is None:
-            raise ValueError("first-frame trace analysis requires first_frame_index")
-        if self.keyframe_indices != [self.first_frame_index]:
-            raise ValueError("first-frame trace analysis supplies exactly the first RGB frame")
+            raise ValueError("RGB trace analysis requires first_frame_index")
+        if self.visual_input_policy == "first_rgb_plus_local_fingertip_trace":
+            if self.keyframe_indices != [self.first_frame_index]:
+                raise ValueError(
+                    "first-frame trace analysis supplies exactly the first RGB frame"
+                )
+        elif (
+            not self.keyframe_indices
+            or self.keyframe_indices[0] != self.first_frame_index
+            or len(set(self.keyframe_indices)) != len(self.keyframe_indices)
+            or self.keyframe_indices != sorted(self.keyframe_indices)
+        ):
+            raise ValueError(
+                "RGB trace keyframes must be unique, chronological, and start at first_frame_index"
+            )
         if not self.fingertip_trace:
             raise ValueError("first-frame trace analysis requires the full fingertip trace")
         indices = [item.frame_index for item in self.fingertip_trace]

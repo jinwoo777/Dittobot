@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -105,17 +105,27 @@ def _rigid_matrix(value: object, *, label: str) -> Matrix44:
 
 
 def _pose_values(value: object, *, label: str) -> CartesianPose:
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 6:
+    # ROS 2 generated fixed-size float arrays are numpy.ndarray instances, which
+    # are iterable but deliberately do not register as ``Sequence``.  Convert
+    # through numpy so the controller accepts both ordinary Python sequences and
+    # the Doosan service's ``float64[6]`` response without weakening the shape or
+    # finite-value validation below.
+    if isinstance(value, (str, bytes)):
         raise ValueError(f"{label} must contain six values")
-    result = tuple(float(item) for item in value)
+    try:
+        values = np.asarray(value, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must contain six values") from exc
+    if values.shape != (6,):
+        raise ValueError(f"{label} must contain six values")
+    result = tuple(float(item) for item in values)
     if not all(math.isfinite(item) for item in result):
         raise ValueError(f"{label} contains a non-finite value")
     return cast(CartesianPose, result)
 
 
 def _joint_values(value: object, *, label: str) -> JointVector:
-    result = _pose_values(value, label=label)
-    return cast(JointVector, result)
+    return _pose_values(value, label=label)
 
 
 def _validate_joint_limits(values_rad: JointVector) -> None:
@@ -241,12 +251,35 @@ class DoosanArucoExperimentRobot(DoosanHandEyeCalibrationRobot):
 
     adapter_name = "doosan_m0609_aruco_experiment"
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(
+        self, *, expected_tcp_name: str | None = None, **kwargs: Any
+    ) -> None:
         super().__init__(**kwargs)
+        self._expected_tcp_name = (expected_tcp_name or "").strip()
         self._move_line_client: Any | None = None
         self._move_line_type: Any | None = None
         self._ikin_client: Any | None = None
         self._ikin_type: Any | None = None
+
+    def get_active_tcp_name(self) -> str:
+        """Read TCP when the driver exposes it, otherwise reuse configured TCP.
+
+        The deployed M0609 driver returns an empty string from ``get_tcp()``
+        even while ``get_current_posx()`` reports the configured active TCP.
+        ArUco is already tied to one configured TCP, so an empty value is not a
+        name mismatch; use that explicit configured name.  A non-empty driver
+        answer still remains authoritative and is checked by the controller.
+        """
+
+        try:
+            return super().get_active_tcp_name()
+        except RuntimeError as exc:
+            if (
+                str(exc) == "Doosan did not return a valid active TCP name"
+                and self._expected_tcp_name
+            ):
+                return self._expected_tcp_name
+            raise
 
     def connect(self) -> None:
         super().connect()
@@ -509,7 +542,6 @@ class ArucoExperimentController:
                     )
                     tcp_base_xyz_m = _point_from_transform(tcp).tolist()
                     active_tcp_name = self._robot.get_active_tcp_name()
-                    self._last_error = None
                 except Exception as exc:
                     self._last_error = str(exc)
             runtime = self._runtime
@@ -541,6 +573,17 @@ class ArucoExperimentController:
                 ),
                 "capabilities": self._capabilities(),
             }
+
+    def acquire_runtime_session(self) -> tuple[ArucoExperimentRobot, Matrix44]:
+        """Lease the connected robot and captured base/plane transform for one skill run."""
+
+        with self._lock:
+            robot = self._require_enabled_robot()
+            if not self._reference_captured or self._base_to_plane is None:
+                raise ValueError("ArUco 기준 자세(1번)를 먼저 실행해 좌표계를 고정하세요")
+            if self.mode != "hardware" or not self.hardware_authorized:
+                raise ValueError("현재 ArUco 세션은 실제 하드웨어 세션이 아닙니다")
+            return robot, self._base_to_plane.copy()
 
     def enable(
         self,
@@ -608,6 +651,14 @@ class ArucoExperimentController:
             self._last_action_at_ns = time.time_ns()
             self._last_error = None
             return self.status()
+
+    def record_failure(self, action: str, exc: Exception) -> None:
+        """Keep a motion/enable failure visible across subsequent status polling."""
+
+        with self._lock:
+            self._last_action = f"{action}_failed"
+            self._last_action_at_ns = time.time_ns()
+            self._last_error = f"{type(exc).__name__}: {exc}"
 
     def move_to_reference(self) -> dict[str, Any]:
         with self._lock:
@@ -742,6 +793,7 @@ class ArucoExperimentController:
                     robot.disconnect()
             self._last_action = "stopped"
             self._last_action_at_ns = time.time_ns()
+            self._last_error = None
             return self.status()
 
     def close(self) -> None:

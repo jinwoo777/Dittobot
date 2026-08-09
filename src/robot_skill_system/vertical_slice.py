@@ -188,10 +188,10 @@ def build_wipe_skill_graph() -> tuple[SkillGraph, list[str]]:
                     node_id="validate_path",
                     operation="workspace.validate_path",
                     arguments={"path": [pre_approach, contact_start]},
-                    on_success="approach_joint",
+                    on_success="pre_approach_linear",
                 ),
                 SkillNode(
-                    node_id="approach_joint",
+                    node_id="pre_approach_linear",
                     operation="motion.move_l",
                     arguments={"target": pre_approach, "motion_profile_id": "linear_slow"},
                     on_success="approach_linear",
@@ -254,7 +254,7 @@ def build_wipe_skill_graph() -> tuple[SkillGraph, list[str]]:
             ],
             start_node="validate_path",
             terminal_nodes=["retract"],
-            motion_profiles=["joint_safe", "linear_slow", "linear_normal", "circular_normal"],
+            motion_profiles=["linear_slow", "linear_normal", "circular_normal"],
             force_profiles=["wipe_standard"],
             preconditions=["fresh_scene", "attached_wiper", "contact_target"],
             postconditions=["force_released", "surface_retracted"],
@@ -301,7 +301,6 @@ def run_offline_demo(settings: Settings | None = None) -> OfflineDemoResult:
                 item.operation_name for item in get_default_registry().catalog()
             ],
             approved_motion_profiles=[
-                "joint_safe",
                 "linear_slow",
                 "linear_normal",
                 "circular_normal",

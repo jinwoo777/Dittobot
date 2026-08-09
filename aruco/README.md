@@ -115,7 +115,79 @@ python3 aruco/object_width_workspace.py \
 fixed NPZ는 geometry reference이며 실제 로봇용 hardware 승인이나 현재 TCP 일치 검증을
 대신하지 않습니다.
 
-## 3. target 검사와 reject
+## 3. URDF로 base 좌표 후보 생성
+
+`urdf_reference_candidate.py`는 로봇·ROS·카메라를 호출하지 않고, 전개된 URDF의
+forward kinematics와 frozen NPZ의 raw `T_camera_plane`만 합성합니다. 행렬 규약은
+`T_A_B @ p_B = p_A`입니다. URDF에 `camera_color_optical_frame`으로 가는 체인이 있으면
+다음을 사용합니다.
+
+```text
+T_base_camera = FK_URDF(base_link, camera_color_optical_frame, q)
+T_base_plane  = T_base_camera * T_camera_plane
+```
+
+이 모드는 legacy `T_tcp_camera`/`T_tcp_plane`을 base 변환에 사용하지 않습니다. URDF에
+카메라 체인이 없으면 `flange == legacy TCP`라는 미검증 가정이 포함된 조건부
+fallback만 생성합니다. 두 모드 모두 `status=candidate`, `usable_for_motion=false`,
+`hardware_approved=false`입니다.
+
+이 워크스테이션의 결합 모델은 다음 경로에 있습니다. 이는 배포 환경 의존
+경로이며 Dittobot에 vendor URDF를 복사한 것은 아닙니다.
+
+```text
+/home/rokey/wok_wark/ws_cobot_pjt/ws_dsr/src/rg2/m0609_rg2_bringup/urdf/m0609_with_rg2_camera.urdf.xacro
+```
+
+현재 설치 본을 전개하고 기준 joint `[0, 0, 90, 0, 90, -90] deg`를 적용하는 재현
+명령은 다음과 같습니다. 출력 JSON은 create-only이므로 기존 파일을 덮어쓰지
+않습니다.
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/rokey/wok_wark/ws_cobot_pjt/ws_dsr/install/setup.bash
+xacro \
+  /home/rokey/wok_wark/ws_cobot_pjt/ws_dsr/src/rg2/m0609_rg2_bringup/urdf/m0609_with_rg2_camera.urdf.xacro \
+  -o /tmp/dittobot_m0609_rg2_d435_expanded.urdf
+
+python3 aruco/urdf_reference_candidate.py \
+  --urdf /tmp/dittobot_m0609_rg2_d435_expanded.urdf \
+  --reference-npz aruco/fixed_workspace_reference.npz \
+  --base-link base_link \
+  --flange-link link_6 \
+  --camera-link camera_color_optical_frame \
+  --joint-deg 0 0 90 0 90 -90 \
+  --output-json \
+    aruco/results/d435i_plane_scans/scan_20260807_123803/base_workspace_urdf_candidate.json
+```
+
+현재 expanded URDF SHA-256은
+`827517126f4d21a2246d0b9862b746357437a0c7e8f0f7d3fb108b4eb853e66c`입니다. 원본
+combined Xacro는 `0a60a23987295374d52aaa872ace359d21405d8356aa747217d51589b12f677c`,
+bracket Xacro는 `3a74eabaa16c93a2dd76ad2c92472ec87dac7ecb710e7ac3c86200af7f60498b`,
+M0609 URDF는 `05fa5a1ae173e1bf7a19a3bdaf2365b7c3d87b3e6289885b6e7eadb65c0d6b1b`입니다.
+
+생성된 `T_base_link_plane`은 다음과 같습니다. translation은 metre입니다.
+
+```text
+[[ 0.000358036, -0.999622542, -0.027470797,  0.403021311],
+ [ 0.999984096,  0.000203278,  0.005636138, -0.088195103],
+ [-0.005628426, -0.027472378,  0.999606717, -0.179744032],
+ [ 0.000000000,  0.000000000,  0.000000000,  1.000000000]]
+```
+
+plane normal은 base 좌표에서 `[-0.027470797, 0.005636138, 0.999606717]`, base XY
+plane 대비 기울기는 약 `1.606957 deg`입니다. 전체 행렬, `T_base_flange`,
+`T_base_camera`, 4개 workspace 경계점과 source checksum은
+[`base_workspace_urdf_candidate.json`](results/d435i_plane_scans/scan_20260807_123803/base_workspace_urdf_candidate.json)에
+보존했습니다.
+
+이 값은 bracket 설계치와 RealSense nominal extrinsics에 기대며 hand-eye 실측값이 아닙니다.
+또한 ROS `base_link`와 controller `DR_BASE`의 일치를 실기로 검증하지 않았습니다.
+따라서 시각화·재현성 확인에만 사용하고 target 생성, preflight 통과, 로봇 동작
+허가의 근거로 사용하면 안 됩니다.
+
+## 4. target 검사와 reject
 
 아래 TCP 옵션은 점을 보정하지 않습니다. XY 또는 동적 TCP Z가 범위를 벗어나면 usable runtime을
 publish하지 않고 종료 코드 `2`를 반환합니다. 기존 runtime을 잘못 재사용하지 않도록 표준 출력
@@ -171,6 +243,7 @@ python3 aruco/object_width_workspace.py \
 python3 -m py_compile \
   aruco/freeze_fixed_aruco_workspace.py \
   aruco/object_width_workspace.py \
+  aruco/urdf_reference_candidate.py \
   aruco/test_object_width_workspace.py
 
 PYTHONDONTWRITEBYTECODE=1 python3 aruco/test_object_width_workspace.py

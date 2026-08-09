@@ -21,6 +21,20 @@ from robot_skill_system.exceptions import NotConfiguredError
 Matrix44 = NDArray[np.float64]
 JointVector = tuple[float, float, float, float, float, float]
 
+DOOSAN_ROBOT_STATE_NAMES = {
+    0: "STATE_INITIALIZING",
+    1: "STATE_STANDBY",
+    2: "STATE_MOVING",
+    3: "STATE_SAFE_OFF",
+    4: "STATE_TEACHING",
+    5: "STATE_SAFE_STOP",
+    6: "STATE_EMERGENCY_STOP",
+    7: "STATE_HOMMING",
+    8: "STATE_RECOVERY",
+    9: "STATE_SAFE_STOP2",
+    10: "STATE_SAFE_OFF2",
+}
+
 
 def _set_module_attribute(module: ModuleType, name: str, value: Any) -> None:
     """Set a runtime-only vendor module attribute without static stub assumptions."""
@@ -304,7 +318,16 @@ class DoosanHandEyeCalibrationRobot:
 
     def get_base_to_tcp_matrix(self) -> Matrix44:
         function = self._required(self._get_current_posx, "get_current_posx")
-        value = function()
+        try:
+            value = function()
+        except IndexError as exc:
+            # DSR_ROBOT2 indexes the service response internally.  Some
+            # controller/ROS timing failures surface as this bare IndexError;
+            # turn it into an actionable API response instead of a 500.
+            raise NotConfiguredError(
+                "Doosan get_current_posx returned an empty active-TCP response; "
+                "wait for the controller pose service and retry"
+            ) from exc
         pose = value[0] if isinstance(value, tuple) and len(value) == 2 else value
         return _cartesian_pose_matrix(pose, label="active TCP pose")
 
@@ -365,7 +388,11 @@ class DoosanHandEyeCalibrationRobot:
         function = self._required(self._get_robot_state, "get_robot_state")
         state = int(function())
         if state != 1:  # DRFC.STATE_STANDBY
-            raise RuntimeError(f"Doosan robot must be in STATE_STANDBY, received state {state}")
+            state_name = DOOSAN_ROBOT_STATE_NAMES.get(state, f"UNKNOWN_STATE_{state}")
+            raise ValueError(
+                "Doosan robot must be in STATE_STANDBY; "
+                f"current state is {state_name} ({state})"
+            )
 
     @staticmethod
     def _required(value: Callable[..., Any] | None, name: str) -> Callable[..., Any]:

@@ -86,3 +86,12 @@ def test_jog_ui_builds_one_validated_six_axis_movej_target() -> None:
     assert "api.moveJogJoints(targets)" in app_source
     assert '"/jog/movej"' in api_source
     assert "target_joint_positions_deg" in api_source
+
+
+def test_skill_run_button_stays_available_and_stops_jog_automatically() -> None:
+    app_source = (REPOSITORY_ROOT / "dittobot-design/app.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'run.disabled = state.apiStatus !== "connected";' in app_source
+    assert 'api.stopJog("automatic_skill_execution_transition")' in app_source

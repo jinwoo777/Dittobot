@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import queue
@@ -13,7 +14,7 @@ from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import replace
 from functools import partial
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
 import numpy as np
@@ -438,16 +439,25 @@ class RGBDCameraController:
         """List finalized recordings discovered from checksum-bearing manifests on disk."""
 
         root = self._store.root / "demonstrations"
-        recordings: list[dict[str, Any]] = []
+        recordings_by_id: dict[str, dict[str, Any]] = {}
+        duplicate_ids: set[str] = set()
         invalid_recording_count = 0
         if root.is_dir():
-            for manifest_path in root.glob("rgbd_*/rgbd_manifest.json"):
+            for manifest_path in sorted(root.glob("*/rgbd_manifest.json")):
                 try:
-                    manifest = self._load_recording_manifest(manifest_path.parent.name)
+                    manifest = self._load_recording_manifest_path(manifest_path)
                 except (KeyError, OSError, ValueError):
                     invalid_recording_count += 1
                     continue
-                recordings.append(self._recording_summary(manifest))
+                recording_id = str(manifest["recording_id"])
+                if recording_id in recordings_by_id:
+                    duplicate_ids.add(recording_id)
+                    invalid_recording_count += 1
+                    continue
+                recordings_by_id[recording_id] = self._recording_summary(manifest)
+        for recording_id in duplicate_ids:
+            recordings_by_id.pop(recording_id, None)
+        recordings = list(recordings_by_id.values())
         recordings.sort(
             key=lambda item: int(item.get("started_at_ns") or 0), reverse=True
         )
@@ -592,7 +602,10 @@ class RGBDCameraController:
             raise ValueError("RGB-D recording contains no frames")
         selected_count = min(maximum_count, frame_count)
         if selected_count == 1:
-            indices = [frame_count // 2]
+            # The semantic trace contract always starts at the first manifest frame.
+            # Keeping the one-image case at index 0 also preserves compatibility with
+            # recordings authored under the former first-frame-only policy.
+            indices = [0]
         else:
             indices = sorted(
                 {
@@ -603,14 +616,14 @@ class RGBDCameraController:
         result: list[tuple[int, Path]] = []
         for index in indices:
             frame = self._validated_frame(frames[index], index)
-            self._read_frame_artifact(
+            path, _payload = self._verified_frame_artifact(
                 recording_id,
                 frame,
                 uri_field="rgb_uri",
                 checksum_field="rgb_checksum_sha256",
                 directory="rgb",
             )
-            result.append((index, self._store.path_for(str(frame["rgb_uri"]))))
+            result.append((index, path))
         return result
 
     def select_recording_rgbd_keyframes(
@@ -638,7 +651,7 @@ class RGBDCameraController:
         result: list[tuple[int, Path, Path]] = []
         for index in indices:
             frame = self._validated_frame(frames[index], index)
-            self._read_frame_artifact(
+            rgb_path, _rgb_payload = self._verified_frame_artifact(
                 recording_id,
                 frame,
                 uri_field="rgb_uri",
@@ -666,7 +679,7 @@ class RGBDCameraController:
             result.append(
                 (
                     index,
-                    self._store.path_for(str(frame["rgb_uri"])),
+                    rgb_path,
                     self._store.path_for(depth_preview.uri),
                 )
             )
@@ -769,13 +782,50 @@ class RGBDCameraController:
 
     def _load_recording_manifest(self, recording_id: str) -> dict[str, Any]:
         safe_id = self._validate_recording_id(recording_id)
-        manifest_uri = f"demonstrations/{safe_id}/rgbd_manifest.json"
-        path = self._store.path_for(manifest_uri)
-        if not path.is_file():
+        path = self._find_recording_manifest_path(safe_id)
+        return self._load_recording_manifest_path(path, expected_recording_id=safe_id)
+
+    def _find_recording_manifest_path(self, recording_id: str) -> Path:
+        canonical = self._store.path_for(
+            f"demonstrations/{recording_id}/rgbd_manifest.json"
+        )
+        if canonical.is_file():
+            return canonical
+        root = self._store.root / "demonstrations"
+        matches: list[Path] = []
+        if root.is_dir():
+            for candidate in sorted(root.glob("*/rgbd_manifest.json")):
+                try:
+                    payload = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(payload, dict) and payload.get("recording_id") == recording_id:
+                    matches.append(candidate)
+        if not matches:
             raise KeyError(f"unknown RGB-D recording {recording_id!r}")
+        if len(matches) > 1:
+            raise ValueError(f"multiple RGB-D manifests declare {recording_id!r}")
+        return matches[0]
+
+    def _load_recording_manifest_path(
+        self,
+        path: Path,
+        *,
+        expected_recording_id: str | None = None,
+    ) -> dict[str, Any]:
+        root = (self._store.root / "demonstrations").resolve()
+        resolved_path = path.resolve()
+        if resolved_path.parent.parent != root or resolved_path.name != "rgbd_manifest.json":
+            raise ValueError("RGB-D manifest must be directly below demonstrations")
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or payload.get("recording_id") != safe_id:
-            raise ValueError("RGB-D manifest recording_id does not match its directory")
+        if not isinstance(payload, dict):
+            raise ValueError("RGB-D manifest must be an object")
+        manifest_recording_id = payload.get("recording_id")
+        if not isinstance(manifest_recording_id, str):
+            raise ValueError("RGB-D manifest recording_id is missing")
+        safe_id = self._validate_recording_id(manifest_recording_id)
+        if expected_recording_id is not None and safe_id != expected_recording_id:
+            raise ValueError("RGB-D manifest recording_id does not match the request")
         frames = payload.get("frames")
         if not isinstance(frames, list):
             raise ValueError("RGB-D manifest frames must be a list")
@@ -786,7 +836,10 @@ class RGBDCameraController:
         normalized["recording_fps"] = float(
             payload.get("recording_fps") or payload.get("raw_capture_fps") or 1.0
         )
-        normalized["manifest_uri"] = manifest_uri
+        normalized["manifest_uri"] = resolved_path.relative_to(
+            self._store.root
+        ).as_posix()
+        normalized["source_label"] = resolved_path.parent.name
         normalized["frames"] = frames
         return normalized
 
@@ -818,14 +871,48 @@ class RGBDCameraController:
         checksum_field: str,
         directory: str,
     ) -> bytes:
+        _path, payload = self._verified_frame_artifact(
+            recording_id,
+            frame,
+            uri_field=uri_field,
+            checksum_field=checksum_field,
+            directory=directory,
+        )
+        return payload
+
+    def _verified_frame_artifact(
+        self,
+        recording_id: str,
+        frame: dict[str, Any],
+        *,
+        uri_field: str,
+        checksum_field: str,
+        directory: str,
+    ) -> tuple[Path, bytes]:
         uri = frame.get(uri_field)
         checksum = frame.get(checksum_field)
-        prefix = f"demonstrations/{recording_id}/{directory}/"
-        if not isinstance(uri, str) or not uri.startswith(prefix):
+        if not isinstance(uri, str):
+            raise ValueError(f"RGB-D frame {uri_field} is outside its recording directory")
+        relative_uri = PurePosixPath(uri)
+        expected_parent = PurePosixPath("demonstrations") / recording_id / directory
+        if relative_uri.parent != expected_parent or relative_uri.name in {"", ".", ".."}:
             raise ValueError(f"RGB-D frame {uri_field} is outside its recording directory")
         if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
             raise ValueError(f"RGB-D frame {checksum_field} is invalid")
-        return self._store.read_bytes(uri, expected_checksum_sha256=checksum)
+        canonical_path = self._store.path_for(uri)
+        if canonical_path.is_file():
+            payload = self._store.read_bytes(uri, expected_checksum_sha256=checksum)
+            return canonical_path, payload
+
+        manifest_path = self._find_recording_manifest_path(recording_id)
+        imported_path = (manifest_path.parent / directory / relative_uri.name).resolve()
+        imported_root = (manifest_path.parent / directory).resolve()
+        if not imported_path.is_relative_to(imported_root) or not imported_path.is_file():
+            raise FileNotFoundError(uri)
+        payload = imported_path.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != checksum:
+            raise ValueError(f"artifact checksum mismatch for {uri!r}")
+        return imported_path, payload
 
     def _run_capture(self) -> None:
         capture: RGBDCapture | None = None

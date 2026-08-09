@@ -7,11 +7,14 @@ import numpy as np
 import pytest
 
 from robot_skill_system.aruco_experiment.controller import (
-    ArucoExperimentController,
-    MockArucoExperimentRobot,
     PLANE_Z_TEST_DISTANCE_M,
     REFERENCE_JOINT_DEG,
+    ArucoExperimentController,
+    DoosanArucoExperimentRobot,
+    MockArucoExperimentRobot,
+    _joint_values,
 )
+from robot_skill_system.exceptions import NotConfiguredError
 
 
 def _controller(
@@ -47,6 +50,62 @@ def _enable(controller: ArucoExperimentController, *, width_mm: float = 80.0) ->
         object_width_mm=width_mm,
         width_model="full-opening",
     )
+
+
+def test_joint_values_accept_ros_fixed_size_numpy_array() -> None:
+    response = np.asarray([0.0, 1.0, -2.0, 3.0, -4.0, 5.0], dtype=np.float64)
+
+    assert _joint_values(response, label="Doosan IK response") == (
+        0.0,
+        1.0,
+        -2.0,
+        3.0,
+        -4.0,
+        5.0,
+    )
+
+
+def test_aruco_robot_uses_configured_tcp_when_driver_returns_empty_name() -> None:
+    robot = DoosanArucoExperimentRobot(
+        robot_id="dsr01",
+        robot_model="m0609",
+        execution_mode="hardware",
+        hardware_enabled=True,
+        expected_tcp_name="GripperDA_v1",
+    )
+    robot._get_tcp = lambda: ""
+
+    assert robot.get_active_tcp_name() == "GripperDA_v1"
+
+
+def test_aruco_robot_reports_named_non_standby_controller_state() -> None:
+    robot = DoosanArucoExperimentRobot(
+        robot_id="dsr01",
+        robot_model="m0609",
+        execution_mode="hardware",
+        hardware_enabled=True,
+    )
+    robot._get_robot_state = lambda: 3
+
+    with pytest.raises(ValueError, match=r"STATE_SAFE_OFF \(3\)"):
+        robot._require_standby()
+
+
+def test_aruco_robot_reports_empty_vendor_tcp_pose_response() -> None:
+    robot = DoosanArucoExperimentRobot(
+        robot_id="dsr01",
+        robot_model="m0609",
+        execution_mode="hardware",
+        hardware_enabled=True,
+    )
+
+    def empty_vendor_response() -> object:
+        raise IndexError("list index out of range")
+
+    robot._get_current_posx = empty_vendor_response
+
+    with pytest.raises(NotConfiguredError, match="empty active-TCP response"):
+        robot.get_base_to_tcp_matrix()
 
 
 def test_mock_two_step_experiment_uses_camera_z_upper_bound(tmp_path: Path) -> None:
@@ -100,6 +159,27 @@ def test_enable_rejects_active_tcp_mismatch(tmp_path: Path) -> None:
     assert robot.connected is False
 
 
+def test_recorded_failure_survives_status_poll_until_success_or_stop(
+    tmp_path: Path,
+) -> None:
+    controller = _controller(tmp_path)
+    _enable(controller)
+    controller.record_failure(
+        "move_to_reference", ValueError("motion interlock rejected the request")
+    )
+
+    failed = controller.status()
+    assert failed["last_action"] == "move_to_reference_failed"
+    assert failed["last_error"] == (
+        "ValueError: motion interlock rejected the request"
+    )
+
+    recovered = controller.move_to_reference()
+    assert recovered["last_error"] is None
+    controller.record_failure("move_plane_z_test", RuntimeError("adapter failure"))
+    assert controller.stop()["last_error"] is None
+
+
 def test_enable_rejects_tcp_outside_one_metre_base_radius(tmp_path: Path) -> None:
     robot = MockArucoExperimentRobot()
     robot.base_to_tcp[:3, 3] = [1.01, 0.0, 0.0]
@@ -114,4 +194,3 @@ def test_width_runtime_matches_requested_model(tmp_path: Path) -> None:
     runtime = controller.status()["runtime_workspace"]
     assert runtime["theta_deg"] == pytest.approx(math.degrees(math.asin(80.0 / 110.0)))
     assert runtime["z_min_plane_m"] < runtime["z_max_plane_m"]
-
