@@ -1,0 +1,40 @@
+{
+  "source": "/home/rokey/Desktop/Dittobot/ditto_ws/src/ditto_system/skills/smooth/hammering_1786105141_smoothed.json",
+  "segments": [
+    {
+      "index": 0,
+      "type": "arc",
+      "start_idx": 0,
+      "end_idx": 9,
+      "point_count": 10,
+      "start_pose": {
+        "time": 0.763,
+        "x": 204.24069999999998,
+        "y": 5.632133333333333,
+        "z": 280.9535,
+        "yaw": 92.14626849354623,
+        "gripper": "open"
+      },
+      "end_pose": {
+        "time": 7.338,
+        "x": 235.47389999999993,
+        "y": -6.7336,
+        "z": 282.0815,
+        "yaw": 89.15753333341414,
+        "gripper": "open"
+      },
+      "via_idx": 4,
+      "via_pose": {
+        "time": 4.771,
+        "x": 211.7446666666666,
+        "y": -40.38953333333334,
+        "z": 331.99673333333334,
+        "yaw": 86.29061462084873,
+        "gripper": "open"
+      },
+      "path_length_mm": 143.6,
+      "fit_radius_mm": 27.5,
+      "fit_residual_mm": 7.92
+    }
+  ]
+}

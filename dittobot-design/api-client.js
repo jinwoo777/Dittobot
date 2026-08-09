@@ -86,17 +86,6 @@
       return this.request("/skills");
     }
 
-    repairBuiltinWipeSurface(expectedParentChecksumSha256) {
-      return this.request("/skills/builtins/wipe-surface/repair", {
-        method: "POST",
-        body: {
-          expected_parent_checksum_sha256: expectedParentChecksumSha256,
-          acknowledge_mock_only: true,
-        },
-        timeoutMs: 120000,
-      });
-    }
-
     deleteSkill(skillId) {
       return this.request(`/skills/${encodeURIComponent(skillId)}`, {
         method: "DELETE",
@@ -198,10 +187,10 @@
       });
     }
 
-    captureScene(mode = "mock") {
+    captureScene() {
       return this.request("/scenes/capture", {
         method: "POST",
-        body: { mode },
+        body: { mode: "mock" },
       });
     }
 
@@ -364,14 +353,11 @@
       return this.request("/skills/draft-from-recording/capabilities");
     }
 
-    createRecordingSkillDraft({
-      recordingId, recordingIds, nameHint, operatorInstruction, keyframeCount,
-    }) {
+    createRecordingSkillDraft({ recordingId, nameHint, operatorInstruction, keyframeCount }) {
       return this.request("/skills/draft-from-recording", {
         method: "POST",
         body: {
           recording_id: recordingId,
-          recording_ids: recordingIds,
           name_hint: nameHint,
           operator_instruction: operatorInstruction,
           keyframe_count: keyframeCount,
@@ -380,7 +366,7 @@
       });
     }
 
-    bindRuntime(skillId, version, sceneId, mode = "mock") {
+    bindRuntime(skillId, version, sceneId) {
       return this.request("/runtime/bind", {
         method: "POST",
         body: {
@@ -388,12 +374,11 @@
           version,
           scene_id: sceneId,
           entity_hints: {},
-          mode,
         },
       });
     }
 
-    preflightRuntime(skillId, version, sceneId, bindings, mode = "mock") {
+    preflightRuntime(skillId, version, sceneId, bindings) {
       return this.request("/runtime/preflight", {
         method: "POST",
         body: {
@@ -401,12 +386,12 @@
           version,
           scene_id: sceneId,
           bindings,
-          mode,
+          mode: "mock",
         },
       });
     }
 
-    executeRuntime({ skillId, version, sceneId, bindings, runId, mode = "mock" }) {
+    executeRuntime({ skillId, version, sceneId, bindings, runId }) {
       return this.request("/runtime/execute", {
         method: "POST",
         body: {
@@ -414,7 +399,7 @@
           version,
           scene_id: sceneId,
           bindings,
-          mode,
+          mode: "mock",
           text: `UI에서 ${skillId} 실행`,
           run_id: runId,
         },

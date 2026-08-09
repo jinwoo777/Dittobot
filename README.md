@@ -3,22 +3,10 @@
 ## 실제 장치 실행: 터미널 2개
 
 아래 명령은 이 워크스테이션의 Doosan M0609(`192.168.1.100`), ROS namespace `dsr01`,
-로봇망 인터페이스 `enp2s0`, ROS domain `78` 기준입니다. 먼저 **터미널 1**에서 bringup을
+로봇망 인터페이스 `enp3s0`, ROS domain `78` 기준입니다. 먼저 **터미널 1**에서 bringup을
 실행하고 그대로 둡니다.
 
 ### 터미널 1 — Doosan bringup
-
-저장소 루트에서 먼저 연결 조건만 점검한 뒤 bringup/RViz launcher를 실행할 수
-있습니다. `--check`는 `ros2 launch`를 호출하지 않습니다.
-
-```bash
-./run_terminal1_doosan_rviz.sh --check
-./run_terminal1_doosan_rviz.sh
-```
-
-기본값을 바꾸려면 실행 전에 `DITTOBOT_ROBOT_INTERFACE`, `DITTOBOT_ROBOT_HOST`,
-`DITTOBOT_ROBOT_PORT`, `DITTOBOT_ROBOT_ID`, `DITTOBOT_ROS_DOMAIN_ID`를 export합니다. 아래는
-launcher가 내부에서 실행하는 동일한 수동 명령입니다.
 
 ```bash
 source /opt/ros/humble/setup.bash
@@ -27,8 +15,7 @@ source /home/rokey/cobot_ws/install/setup.bash
 export ROS_DOMAIN_ID=78
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export DITTOBOT_ROBOT_INTERFACE=enp2s0
-export CYCLONEDDS_URI="<CycloneDDS xmlns=\"https://cdds.io/config\"><Domain><General><Interfaces><NetworkInterface name=\"${DITTOBOT_ROBOT_INTERFACE}\"/></Interfaces></General></Domain></CycloneDDS>"
+export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
 
 ros2 launch dsr_bringup2 dsr_bringup2_rviz.launch.py \
   name:=dsr01 mode:=real host:=192.168.1.100 port:=12345 model:=m0609
@@ -40,14 +27,6 @@ bringup이 완료되면 새 **터미널 2**에서 API/UI를 실행합니다. 아
 
 ### 터미널 2 — Dittobot API/UI (8001)
 
-저장소 루트에서는 아래 한 줄로 같은 환경을 시작할 수 있습니다.
-
-```bash
-./run_terminal2_hardware_ui.sh
-```
-
-수동으로 시작하려면:
-
 ```bash
 cd /home/rokey/Dittobot
 source /opt/ros/humble/setup.bash
@@ -56,32 +35,20 @@ source /home/rokey/cobot_ws/install/setup.bash
 export ROS_DOMAIN_ID=78
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
-export DITTOBOT_ROBOT_INTERFACE=enp2s0
-export CYCLONEDDS_URI="<CycloneDDS xmlns=\"https://cdds.io/config\"><Domain><General><Interfaces><NetworkInterface name=\"${DITTOBOT_ROBOT_INTERFACE}\"/></Interfaces></General></Domain></CycloneDDS>"
-# 설치된 RG2 client를 경로에 추가할 뿐, 배포 패키지 버전은 변경하지 않습니다.
-export DITTOBOT_RG2_SITE=/home/rokey/wok_wark/ws_cobot_pjt/ws_dsr/install/rokey/lib/python3.10/site-packages
-export PYTHONPATH="$PWD/src:$DITTOBOT_RG2_SITE${PYTHONPATH:+:$PYTHONPATH}"
+export CYCLONEDDS_URI='<CycloneDDS xmlns="https://cdds.io/config"><Domain><General><Interfaces><NetworkInterface name="enp3s0"/></Interfaces></General></Domain></CycloneDDS>'
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 
 export ROBOT_EXECUTION_MODE=hardware
 export ENABLE_HARDWARE_EXECUTION=true
 export ROBOT_BACKEND=doosan
 export ENABLE_REAL_ROBOT=true
 export DRY_RUN=false
-export ENABLE_WEB_JOG=true
-export JOG_CELL_SAFETY_VERIFIED=true
-export ENABLE_ARUCO_EXPERIMENT=true
-export ARUCO_EXPERIMENT_CELL_SAFETY_VERIFIED=true
-export ARUCO_EXPERIMENT_EXPECTED_TCP=GripperDA_v1
-export RG2_MODBUS_HOST=192.168.1.1
-export RG2_MODBUS_PORT=502
-export RG2_MODBUS_UNIT_ID=65
-export RG2_GRIP_FORCE_N=20
 export ENABLE_HANDEYE_CALIBRATION=true
 export CALIBRATION_POSE_PLAN_APPROVED=true
 export CALIBRATION_CELL_SAFETY_VERIFIED=true
 export DOOSAN_ROBOT_ID=dsr01
 export DOOSAN_ROBOT_MODEL=m0609
-export HANDEYE_LEGACY_NPY_PATH="$PWD/T_gripper2camera_orig.npy"
+export HANDEYE_LEGACY_NPY_PATH="$PWD/T_gripper2camera.npy"
 export HANDEYE_LEGACY_EXPECTED_TCP=2FG_TCP
 
 python3 -m uvicorn robot_skill_system.api.app:create_app \
@@ -93,16 +60,16 @@ python3 -m uvicorn robot_skill_system.api.app:create_app \
 Git에 포함하지 않습니다.
 
 작업자의 RGB-D 시연을 로컬 궤적 분석과 제한된 의미 분석으로 분해하고, 검증된
-`SkillGraph`를 결정론적으로 컴파일하는 Python 3.10 프로젝트입니다. 기본 End-to-End 경로는
-완전한 오프라인 `MockRobotAdapter`입니다. hardware 서버는 이미 고정한 `T_base_plane`과
-workspace 파일을 시작부터 재사용하므로 ArUco 활성화나 기준 자세 재캡처 없이 활성 스킬과 검증
-통과 Candidate를 Doosan MoveJ/MoveL/IK 및 설치된 RG2 Modbus client로 실행합니다.
-`simulation` 모드는 아직 별도 물리 시뮬레이터가 아니라 같은 Mock adapter의 별칭입니다.
+`SkillGraph`를 결정론적으로 컴파일하는 Python 3.10 프로젝트입니다. 현재 실행 가능한
+End-to-End 경로는 완전한 오프라인 `MockRobotAdapter`이며 로봇·카메라·OpenAI API가 없어도
+Teaching → Registry → Runtime → Update 흐름을 실행할 수 있습니다. `simulation` 모드는 아직
+별도 물리 시뮬레이터가 아니라 같은 Mock adapter의 별칭입니다.
 
 > RealSense D435i의 직접 `pyrealsense2` RGB-D preview/recording은 이 개발 장치에서 검증했지만,
-> 이 저장소의 자동 테스트에서는 실제 장치 경로를 가짜 장치 응답으로 검증했습니다. 수동 안전
-> 체크나 실행 확인 팝업은 스킬 실행 조건이 아닙니다. 장치 연결 손실, 보호정지, IK 거부는 실행 중
-> 자동 오류로 처리합니다. MoveIt 기반 링크 self-collision 검증은 포함하지 않습니다.
+> ROS 2 카메라 토픽과 Doosan M0609, OnRobot RG2, MoveIt 연동은 실제 장치에서 검증하지
+> 않았습니다. Doosan/RG2 adapter는 인터페이스 자리만 제공하며 gate가 닫혀 있으면 authorization
+> 오류, gate가 열려도 `NotConfiguredError`로 거부합니다. 환경 플래그만으로 실제 로봇을 움직일
+> 수 없습니다.
 
 ## 설치
 
@@ -113,14 +80,14 @@ cd <this-repository>
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[dev,api,perception]'
+python -m pip install -e '.[dev,api]'
 cp .env.example .env
 ```
 
 RealSense UI를 사용할 환경에는 카메라 extra도 설치합니다.
 
 ```bash
-python -m pip install -e '.[dev,api,perception,realsense]'
+python -m pip install -e '.[dev,api,realsense]'
 ```
 
 Ubuntu 22.04에서 `ensurepip is not available` 또는 `python3.10-venv` 누락 오류가 나면 운영자가
@@ -281,12 +248,8 @@ GPT의 정규화 fingertip 위치를 원본 Depth로 다시 deproject하며, 4�
 
 ## 검사
 
-전체 테스트는 FastAPI/Pillow와 OpenCV/SciPy를 직접 import하므로 위 개발 설치의
-`dev,api,perception` extra가 모두 필요합니다.
-
 ```bash
-bash -n run_terminal1_doosan_rviz.sh run_terminal2_hardware_ui.sh
-python3 -m compileall src tests aruco
+python3 -m compileall src tests
 python3 -m pytest -q
 python3 -m ruff check .
 python3 -m mypy src

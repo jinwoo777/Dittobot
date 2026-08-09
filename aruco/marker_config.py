@@ -1,7 +1,0 @@
-import cv2
-
-ARUCO_DICT = cv2.aruco.DICT_4X4_50
-
-MARKER_IDS = [2, 5, 7, 10, 12, 15]
-
-MARKER_LENGTH_M = 0.025

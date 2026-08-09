@@ -1,0 +1,20 @@
+{
+  "format": "v2",
+  "sequence": [
+    {
+      "move_type": "movel",
+      "vel_mm_s": 40.0,
+      "acc_mm_s2": 15.0,
+      "blend_radius_mm": 20.0,
+      "end_pose": {
+        "x": 235.47,
+        "y": -6.73,
+        "z": 282.08,
+        "yaw": 89.16
+      },
+      "via_pose": null,
+      "source": "manual_edit",
+      "reasoning": null
+    }
+  ]
+}
