@@ -26,3 +26,12 @@ data/skills/*/*/
 /Calibration_Tutorial.zip
 /dsr_bringup2.zip
 /T_gripper2camera.npy
+
+# ditto_ws (colcon 워크스페이스, ditto_system 패키지) 빌드 산출물 - regenerate 가능,
+# install/ 밑에는 resource/.env 사본도 생겨서 더더욱 커밋하면 안 됨
+ditto_ws/build/
+ditto_ws/install/
+ditto_ws/log/
+
+# 실제 API 키가 든 개인 사본 (커밋 금지)
+ditto_ws/src/ditto_system/resource/.env11

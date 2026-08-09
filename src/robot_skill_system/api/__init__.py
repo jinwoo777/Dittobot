@@ -1,1 +1,0 @@
-"""Optional FastAPI transport layer."""

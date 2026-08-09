@@ -1,8 +1,0 @@
-{
-  "tool_definition_id": "rg2_wiper_v1",
-  "tool_class": "wiper",
-  "gripper_class": "onrobot_rg2",
-  "tcp_frame": "tool_tcp",
-  "compatible_skills": ["wipe_surface"],
-  "hardware_verified": false
-}

@@ -1,0 +1,131 @@
+{
+  "source": "/home/rokey/Desktop/Dittobot/ditto_ws/src/ditto_system/skills/smooth/hammering_1786006891_smoothed.json",
+  "segments": [
+    {
+      "index": 0,
+      "type": "line",
+      "start_idx": 0,
+      "end_idx": 4,
+      "point_count": 5,
+      "start_pose": {
+        "time": 0.777,
+        "x": 478.2185,
+        "y": -59.5779,
+        "z": 65.5946,
+        "yaw": 119.6104666701954,
+        "gripper": "open"
+      },
+      "end_pose": {
+        "time": 2.773,
+        "x": 394.3854666666668,
+        "y": 160.26613333333333,
+        "z": 98.2161,
+        "yaw": 75.00057147928301,
+        "gripper": "open"
+      },
+      "via_idx": null,
+      "via_pose": null,
+      "path_length_mm": 240.3,
+      "fit_radius_mm": null,
+      "fit_residual_mm": null
+    },
+    {
+      "index": 1,
+      "type": "arc",
+      "start_idx": 5,
+      "end_idx": 12,
+      "point_count": 8,
+      "start_pose": {
+        "time": 3.285,
+        "x": 390.7961000000001,
+        "y": 198.1811,
+        "z": 93.83229999999999,
+        "yaw": 72.47100227756836,
+        "gripper": "open"
+      },
+      "end_pose": {
+        "time": 6.777,
+        "x": 552.9617666666668,
+        "y": 97.55826666666667,
+        "z": 84.47346666666667,
+        "yaw": 117.53518846853208,
+        "gripper": "open"
+      },
+      "via_idx": 8,
+      "via_pose": {
+        "time": 4.779,
+        "x": 496.99653333333345,
+        "y": 177.2345,
+        "z": 84.79543333333334,
+        "yaw": 101.81044381633644,
+        "gripper": "open"
+      },
+      "path_length_mm": 212.4,
+      "fit_radius_mm": 140.4,
+      "fit_residual_mm": 1.58
+    },
+    {
+      "index": 2,
+      "type": "line",
+      "start_idx": 13,
+      "end_idx": 16,
+      "point_count": 4,
+      "start_pose": {
+        "time": 7.279,
+        "x": 552.9617666666668,
+        "y": 72.99563333333334,
+        "z": 83.70206666666667,
+        "yaw": 119.45146829267105,
+        "gripper": "open"
+      },
+      "end_pose": {
+        "time": 8.777,
+        "x": 544.7237000000001,
+        "y": -1.4773333333333294,
+        "z": 81.35306666666666,
+        "yaw": 123.20403334078478,
+        "gripper": "open"
+      },
+      "via_idx": null,
+      "via_pose": null,
+      "path_length_mm": 75.1,
+      "fit_radius_mm": null,
+      "fit_residual_mm": null
+    },
+    {
+      "index": 3,
+      "type": "arc",
+      "start_idx": 17,
+      "end_idx": 23,
+      "point_count": 7,
+      "start_pose": {
+        "time": 9.277,
+        "x": 542.1754333333334,
+        "y": -15.990599999999995,
+        "z": 80.92633333333333,
+        "yaw": 123.24590000000002,
+        "gripper": "open"
+      },
+      "end_pose": {
+        "time": 13.813,
+        "x": 516.1324666666669,
+        "y": -93.37919999999998,
+        "z": 63.117499999999986,
+        "yaw": 112.70226675904058,
+        "gripper": "open"
+      },
+      "via_idx": 20,
+      "via_pose": {
+        "time": 10.791,
+        "x": 529.1126666666669,
+        "y": -74.04946666666667,
+        "z": 77.01436666666666,
+        "yaw": 119.5616435856169,
+        "gripper": "open"
+      },
+      "path_length_mm": 91.4,
+      "fit_radius_mm": 79.1,
+      "fit_residual_mm": 1.75
+    }
+  ]
+}

@@ -1,0 +1,1232 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="dittobot-api-base" content="">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; img-src 'self' http://127.0.0.1:8000 http://localhost:8000 data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
+  <title>Dittobot Operator Console</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f8f7fb;
+      --panel: #f2f0f6;
+      --panel-strong: #ebe8f1;
+      --border: #ded9e6;
+      --text: #292333;
+      --muted: #706979;
+      --accent: #7752d6;
+      --accent-soft: #eee8fb;
+      --ok: #27835c;
+      --ok-soft: #e7f5ee;
+      --warn: #a26916;
+      --warn-soft: #fff3dc;
+      --danger: #bd3d3d;
+      --danger-soft: #fdeaea;
+      font-family: Inter, Pretendard, "Noto Sans KR", system-ui, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: var(--bg); color: var(--text); }
+    button { font: inherit; }
+    button:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 32%, transparent); outline-offset: 2px; }
+    .shell { display: grid; grid-template-columns: 270px minmax(0, 1fr); min-height: 100vh; }
+    .sidebar { position: sticky; top: 0; height: 100vh; padding: 30px 22px; display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--panel); }
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
+    .brand-logo {
+      height: 50px;
+      width: 50px;
+      object-fit: contain;
+      transform: translateY(-10px);
+    }
+    .sparkle {
+      position: absolute;
+      pointer-events: none;
+      opacity: 0;
+      z-index: 100;
+      animation: sparkleAnim var(--duration) ease-out forwards;
+    }
+
+    @keyframes sparkleAnim {
+      0% {
+        opacity: 0;
+        transform: translate(0,0) scale(0.2) rotate(0deg);
+      }
+
+      20% {
+        opacity: 1;
+      }
+
+      100% {
+        opacity: 0;
+        transform:
+          translate(var(--dx), var(--dy))
+          scale(1.3)
+          rotate(var(--rot));
+      }
+    }
+    .brand strong { display: block; font-size: 19px; }
+    .brand small { display: block; margin-top: 3px; color: var(--muted); font: 12px ui-monospace, monospace; }
+    .nav { display: grid; gap: 4px; }
+    .nav button { border: 0; border-radius: 11px; padding: 12px 14px; text-align: left; color: var(--muted); background: transparent; cursor: pointer; }
+    .nav button[aria-current="page"] { color: #5736aa; background: var(--accent-soft); font-weight: 650; }
+    .connection { margin-top: auto; display: grid; gap: 10px; }
+    .mode { width: fit-content; padding: 7px 10px; border-radius: 9px; color: var(--warn); background: var(--warn-soft); font: 700 11px ui-monospace, monospace; letter-spacing: .04em; }
+    .mini-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: 0 0 auto; }
+    .dot.ok { background: var(--ok); }
+    .dot.danger { background: var(--danger); }
+    main { width: min(1120px, 100%); padding: 46px 54px 72px; }
+    .page[hidden] { display: none; }
+    .eyebrow { margin: 0 0 9px; color: var(--accent); font: 700 12px ui-monospace, monospace; letter-spacing: .11em; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 36px); letter-spacing: -.025em; }
+    .subtitle { max-width: 680px; margin: 9px 0 0; color: var(--muted); line-height: 1.6; }
+    .toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; flex-wrap: wrap; margin-bottom: 28px; }
+    .filters { display: flex; gap: 7px; }
+    .chip { padding: 8px 16px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: var(--panel); cursor: pointer; }
+    .chip[aria-pressed="true"] { color: #5736aa; border-color: var(--accent); background: var(--accent-soft); }
+    .banner { margin-bottom: 20px; padding: 11px 14px; border-radius: 10px; color: var(--warn); background: var(--warn-soft); font: 12px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+    .banner.ok { color: var(--ok); background: var(--ok-soft); }
+    .banner.danger { color: var(--danger); background: var(--danger-soft); }
+    .list { display: grid; gap: 10px; }
+    .skill-card { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 15px; background: var(--panel); cursor: pointer; }
+    .skill-card:hover { border-color: #c8bfd8; background: var(--panel-strong); }
+    .skill-card h2 { margin: 0 0 6px; font: 650 17px ui-monospace, monospace; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .tag { display: inline-block; margin-left: 8px; padding: 3px 8px; border-radius: 6px; font: 700 11px ui-monospace, monospace; }
+    .tag.candidate { color: var(--warn); background: var(--warn-soft); }
+    .tag.draft { color: #3d669f; background: #e7f0fb; }
+    .tag.tested { color: var(--ok); background: var(--ok-soft); }
+    .tag.active { color: #5736aa; background: var(--accent-soft); }
+    .button { border: 1px solid var(--border); border-radius: 10px; padding: 9px 15px; color: var(--text); background: var(--panel); cursor: pointer; }
+    .button.primary { color: white; border-color: var(--accent); background: var(--accent); font-weight: 700; }
+    .button.danger { color: var(--danger); border-color: var(--danger); background: transparent; }
+    .button:disabled { opacity: .45; cursor: not-allowed; }
+    .empty { padding: 42px 18px; border: 1px dashed var(--border); border-radius: 15px; color: var(--muted); text-align: center; }
+    .detail-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 28px; }
+    .nodes { display: grid; gap: 8px; margin-bottom: 24px; }
+    .node { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; padding: 15px 18px; border: 1px solid var(--border); border-left: 3px solid var(--border); border-radius: 0 13px 13px 0; background: var(--panel); }
+    .node.running { border-left-color: var(--accent); }
+    .node.ok { border-left-color: var(--ok); }
+    .node.error { border-left-color: var(--danger); }
+    .node.movel { border-left-color: #4c77d9; }
+    .node.movec { border-left-color: #c43c78; }
+    .node strong { font: 650 14px ui-monospace, monospace; }
+    .node p { margin: 5px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .node-state { align-self: center; padding: 4px 9px; border-radius: 7px; color: var(--muted); background: var(--panel-strong); font: 700 11px ui-monospace, monospace; text-transform: uppercase; }
+    .node-state.movel { color: #2f5cb8; background: #e7edfb; }
+    .node-state.movec { color: #a12f61; background: #fbe7f0; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    .safety { display: flex; gap: 9px; flex-wrap: wrap; margin: 24px 0; }
+    .safety span { padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--muted); font: 11px ui-monospace, monospace; }
+    .safety span.ok { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+    .safety span.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-soft); }
+    .safety span.danger { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+    .monitor-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, .8fr); gap: 18px; }
+    .panel { padding: 22px; border: 1px solid var(--border); border-radius: 17px; background: var(--panel); }
+    .camera-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .camera-view { position: relative; min-height: 220px; display: grid; place-items: center; overflow: hidden; border-radius: 13px; color: #cfc4e6; background: linear-gradient(#7957c715 1px, transparent 1px), linear-gradient(90deg, #7957c715 1px, transparent 1px), #25222b; background-size: 12.5% 12.5%; font: 12px ui-monospace, monospace; }
+    .camera-view img { width: 100%; height: 100%; min-height: 220px; object-fit: contain; background: #111; }
+    .camera-label { position: absolute; left: 10px; top: 9px; z-index: 1; padding: 4px 7px; border-radius: 6px; color: white; background: #17131fc9; font: 700 10px ui-monospace, monospace; }
+    .camera-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .camera-controls label { color: var(--muted); font-size: 12px; }
+    .camera-controls input { width: 70px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+    .run-exec-card { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 13px; background: #fffdfd99; }
+    .run-exec-card h3 { margin: 0 0 7px; font-size: 14px; }
+    p.muted { margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+    .run-exec-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .run-exec-controls select { flex: 1 1 260px; min-width: 220px; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font: 12px ui-monospace, monospace; }
+    .run-frame:not([hidden]) { display: block; width: 100%; max-height: 260px; object-fit: contain; margin-top: 10px; border-radius: 10px; background: #111; }
+    .run-graph:not([hidden]) { display: block; width: 100%; height: auto; margin-top: 10px; border-radius: 10px; }
+    .voice-status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .recording-status { margin: 10px 0 0; color: var(--muted); font: 11px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+    .run-title { margin: 4px 0 14px; font: 650 16px ui-monospace, monospace; }
+    .run-status { display: inline-block; padding: 5px 10px; border-radius: 999px; color: var(--muted); background: var(--panel-strong); font-size: 12px; }
+    .run-steps { min-height: 96px; margin: 18px 0; padding: 0; list-style: none; color: var(--muted); font: 12px/1.8 ui-monospace, monospace; }
+    .run-steps .done { color: var(--ok); }
+    .run-steps .current { color: var(--accent); font-weight: 700; }
+    .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .jog-layout { display: grid; grid-template-columns: minmax(280px, .75fr) minmax(420px, 1.25fr); gap: 18px; margin-top: 22px; }
+    .jog-safety-list { display: grid; gap: 11px; margin: 18px 0; }
+    .jog-safety-list label { display: flex; align-items: flex-start; gap: 9px; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    .jog-safety-list input[type="checkbox"] { margin-top: 3px; accent-color: var(--accent); }
+    .jog-operator { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+    .jog-operator input, .jog-step input, .jog-target-angle { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .jog-operator select { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .jog-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+    .jog-step { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .jog-step input { width: 100px; }
+    .jog-joints { display: grid; gap: 9px; }
+    .jog-joint { display: grid; grid-template-columns: 44px minmax(118px, 1fr) 108px 76px 76px; align-items: center; gap: 9px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+    .jog-joint strong { font: 700 14px ui-monospace, monospace; }
+    .jog-angle { color: var(--muted); text-align: right; font: 13px ui-monospace, monospace; }
+    .jog-target-angle { width: 100%; text-align: right; font: 13px ui-monospace, monospace; }
+    .jog-target-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 14px; }
+    .jog-gates { max-height: 150px; margin: 12px 0 0; overflow: auto; color: var(--muted); white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; }
+    .create-layout { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(320px, .85fr); gap: 18px; margin-top: 26px; }
+    .form-grid { display: grid; gap: 12px; }
+    .form-grid label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+    .form-grid input, .form-grid select, .form-grid textarea { width: 100%; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; color: var(--text); background: var(--bg); font: inherit; }
+    .form-grid textarea { min-height: 108px; resize: vertical; line-height: 1.5; }
+    .recording-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; margin-bottom: 12px; }
+    .recording-picker select { min-width: 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 9px; color: var(--text); background: var(--bg); }
+    .playback-controls { display: grid; grid-template-columns: auto minmax(100px, 1fr) auto; align-items: center; gap: 9px; margin-top: 12px; }
+    .playback-controls input { width: 100%; }
+    .playback-position { min-width: 74px; color: var(--muted); text-align: right; font: 11px ui-monospace, monospace; }
+    .draft-result { max-height: 330px; margin: 12px 0 0; padding: 13px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; color: var(--muted); background: var(--bg); white-space: pre-wrap; overflow-wrap: anywhere; font: 11px/1.55 ui-monospace, monospace; }
+    .notice { margin: 0; padding: 10px 12px; border-radius: 9px; color: var(--warn); background: var(--warn-soft); font-size: 12px; line-height: 1.55; }
+    .draft-card { border-left: 4px solid #7aa0d8; }
+    .draft-card p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .draft-inspector { margin-top: 18px; }
+    .draft-inspector[hidden] { display: none; }
+    .draft-inspector-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
+    .draft-inspector h2 { margin: 0; font: 700 20px ui-monospace, monospace; }
+    .draft-evidence { display: flex; gap: 7px; flex-wrap: wrap; margin: 12px 0 18px; }
+    .evidence-chip { padding: 6px 9px; border-radius: 8px; color: var(--muted); background: var(--panel-strong); font: 11px ui-monospace, monospace; }
+    .evidence-chip.ok { color: var(--ok); background: var(--ok-soft); }
+    .readiness-list { display: grid; gap: 8px; margin: 12px 0 16px; padding: 0; list-style: none; }
+    .readiness-item { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+    .readiness-item strong { display: block; font-size: 13px; }
+    .readiness-item small { display: block; margin-top: 3px; color: var(--muted); line-height: 1.45; }
+    .readiness-mark { color: var(--danger); font-weight: 800; }
+    .readiness-item.passed .readiness-mark { color: var(--ok); }
+    .readiness-item.advisory .readiness-mark { color: var(--muted); }
+    .draft-next-action { margin: 0 0 16px; padding: 11px 13px; border-radius: 10px; color: var(--warn); background: var(--warn-soft); font-size: 12px; line-height: 1.55; }
+    .draft-semantic-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+    .draft-semantic-list { margin: 0; padding: 0; list-style: none; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .draft-semantic-list li { padding: 7px 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+    .teaching-image { cursor: crosshair; }
+    .point-overlay { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+    .point-marker { position: absolute; width: 22px; height: 22px; display: grid; place-items: center; transform: translate(-50%, -50%); border: 2px solid white; border-radius: 50%; color: white; background: var(--accent); box-shadow: 0 1px 6px #0009; font: 800 10px ui-monospace, monospace; }
+    .geometry-teaching { margin-top: 14px; padding: 16px; border: 1px solid #cbbbea; border-radius: 13px; background: var(--accent-soft); }
+    .geometry-teaching[hidden] { display: none; }
+    .geometry-teaching h3 { margin: 0 0 7px; font-size: 16px; }
+    .geometry-teaching p { margin: 6px 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    .geometry-teaching label { display: grid; gap: 5px; margin: 10px 0; color: var(--muted); font-size: 12px; }
+    .geometry-teaching input { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .skill-node-block {
+      border: 1px solid var(--border, #d9dee7);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 16px;
+      background: var(--surface, #ffffff);
+    }
+
+    .skill-node-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+    }
+
+    .skill-node-header > div {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .skill-node-number {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+
+      width: 30px;
+      height: 30px;
+
+      border-radius: 50%;
+
+      background: var(--primary, #2563eb);
+      color: white;
+
+      font-weight: 700;
+    }
+
+    .skill-node-operation {
+      font-size: 18px;
+    }
+
+    .skill-node-parameters {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .parameter-row {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .parameter-label {
+      font-weight: 600;
+      color: var(--text-secondary, #667085);
+    }
+
+    .parameter-input {
+      width: 100%;
+      box-sizing: border-box;
+
+      border: 1px solid #d0d5dd;
+      border-radius: 8px;
+
+      padding: 10px 12px;
+
+      font-size: 14px;
+      background: #fff;
+    }
+
+    .parameter-input:focus {
+      outline: none;
+      border-color: #2563eb;
+    }
+
+    .parameter-object {
+      min-height: 100px;
+      resize: vertical;
+      font-family: monospace;
+    }
+
+    .skill-node-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 18px;
+    }
+
+    .empty-parameters {
+      color: #98a2b3;
+      padding: 10px 0;
+    }
+
+    @media (max-width: 800px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { position: static; width: 100%; height: auto; padding: 18px; }
+      .brand { margin-bottom: 16px; }
+      .nav { grid-template-columns: repeat(2, 1fr); }
+      .nav button { text-align: center; padding-inline: 7px; }
+      .connection { margin-top: 18px; }
+      main { padding: 32px 18px 56px; }
+      .monitor-grid { grid-template-columns: 1fr; }
+      .jog-layout { grid-template-columns: 1fr; }
+      .jog-joint { grid-template-columns: 40px minmax(100px, 1fr) 92px; }
+      .jog-joint .button { grid-column: span 1; }
+      .create-layout { grid-template-columns: 1fr; }
+      .camera-grid { grid-template-columns: 1fr; }
+      .draft-semantic-grid { grid-template-columns: 1fr; }
+    }
+    /* =========================================================
+      DITTOBOT UI REFRESH
+      ========================================================= */
+
+    :root {
+      --bg: #f5f6f8;
+      --surface: #ffffff;
+      --surface-soft: #f8f9fb;
+      --surface-dark: #17191d;
+
+      --border: #e2e5e9;
+      --border-strong: #cfd4da;
+
+      --text: #17191d;
+      --text-secondary: #69717d;
+      --text-tertiary: #969da7;
+
+      --accent: #4f46e5;
+      --accent-hover: #4338ca;
+      --accent-soft: #eef0ff;
+
+      --ok: #16845b;
+      --ok-soft: #e9f7f0;
+
+      --warn: #a16207;
+      --warn-soft: #fff7df;
+
+      --danger: #c24141;
+      --danger-soft: #fff0f0;
+
+      --shadow-sm: 0 1px 2px rgba(16, 24, 40, .04);
+      --shadow-md: 0 5px 18px rgba(16, 24, 40, .06);
+    }
+
+
+    /* ---------------------------------------------------------
+      전체
+      --------------------------------------------------------- */
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family:
+        Inter,
+        Pretendard,
+        "Noto Sans KR",
+        system-ui,
+        sans-serif;
+    }
+
+    .shell {
+      grid-template-columns: 238px minmax(0, 1fr);
+    }
+
+
+    /* ---------------------------------------------------------
+      Sidebar
+      --------------------------------------------------------- */
+
+    .sidebar {
+      padding: 24px 16px;
+      background: #fff;
+      border-right: 1px solid var(--border);
+    }
+
+    .brand {
+      padding: 4px 8px;
+      margin-bottom: 28px;
+    }
+
+    .brand-mark {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: var(--accent);
+      box-shadow: none;
+    }
+
+    .brand strong {
+      font-size: 17px;
+      letter-spacing: -.02em;
+    }
+
+    .brand small {
+      color: var(--text-tertiary);
+    }
+
+    .nav {
+      gap: 3px;
+    }
+
+    .nav button {
+      padding: 11px 12px;
+      border-radius: 8px;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+
+    .nav button:hover {
+      background: var(--surface-soft);
+      color: var(--text);
+    }
+
+    .nav button[aria-current="page"] {
+      color: var(--accent);
+      background: var(--accent-soft);
+      font-weight: 700;
+    }
+
+    .connection {
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-soft);
+    }
+
+    .mode {
+      padding: 5px 8px;
+      border-radius: 5px;
+      font-size: 10px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Main
+      --------------------------------------------------------- */
+
+    main {
+      width: min(1280px, 100%);
+      padding: 38px 46px 70px;
+    }
+
+    h1 {
+      font-size: 30px;
+      letter-spacing: -.035em;
+    }
+
+    .subtitle {
+      color: var(--text-secondary);
+    }
+
+
+    /* ---------------------------------------------------------
+      Filter
+      --------------------------------------------------------- */
+
+    .filters {
+      gap: 5px;
+    }
+
+    .chip {
+      padding: 7px 13px;
+      border-radius: 7px;
+      background: #fff;
+      font-size: 12px;
+    }
+
+    .chip:hover {
+      border-color: var(--border-strong);
+    }
+
+    .chip[aria-pressed="true"] {
+      color: var(--accent);
+      border-color: #c7cbff;
+      background: var(--accent-soft);
+    }
+
+
+    /* ---------------------------------------------------------
+      Banner
+      --------------------------------------------------------- */
+
+    .banner {
+      border: 1px solid #eadfbf;
+      border-radius: 8px;
+    }
+
+    .banner.ok {
+      border-color: #c8eadb;
+    }
+
+    .banner.danger {
+      border-color: #f1cccc;
+    }
+
+
+    /* ---------------------------------------------------------
+      Skill List
+      --------------------------------------------------------- */
+
+    .list {
+      gap: 8px;
+    }
+
+    .skill-card {
+      padding: 16px 18px;
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+      transition:
+        border-color .15s ease,
+        box-shadow .15s ease,
+        transform .15s ease;
+    }
+
+    .skill-card:hover {
+      border-color: #c9ced6;
+      background: #fff;
+      box-shadow: var(--shadow-md);
+      transform: translateY(-1px);
+    }
+
+    .skill-card h2 {
+      margin-bottom: 5px;
+      font-size: 15px;
+      color: var(--text);
+    }
+
+    .meta {
+      color: var(--text-secondary);
+      font-size: 12px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Tags
+      --------------------------------------------------------- */
+
+    .tag {
+      margin-left: 6px;
+      padding: 3px 7px;
+      border-radius: 5px;
+      font-size: 10px;
+    }
+
+    .tag.draft {
+      color: #475569;
+      background: #eef2f7;
+    }
+
+    .tag.candidate {
+      color: var(--warn);
+      background: var(--warn-soft);
+    }
+
+    .tag.tested {
+      color: var(--ok);
+      background: var(--ok-soft);
+    }
+
+    .tag.active {
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+
+    /* ---------------------------------------------------------
+      Buttons
+      --------------------------------------------------------- */
+
+    .button {
+      padding: 8px 13px;
+      border-radius: 7px;
+      background: #fff;
+      font-size: 12px;
+      transition: all .15s ease;
+    }
+
+    .button:hover:not(:disabled) {
+      border-color: var(--border-strong);
+      background: var(--surface-soft);
+    }
+
+    .button.primary {
+      border-color: var(--accent);
+      background: var(--accent);
+    }
+
+    .button.primary:hover:not(:disabled) {
+      border-color: var(--accent-hover);
+      background: var(--accent-hover);
+    }
+
+
+    /* ---------------------------------------------------------
+      Panels
+      --------------------------------------------------------- */
+
+    .panel {
+      padding: 20px;
+      border-radius: 12px;
+      border-color: var(--border);
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+    }
+
+
+    /* ---------------------------------------------------------
+      Skill Detail
+      --------------------------------------------------------- */
+
+    .detail-head {
+      padding-bottom: 20px;
+      margin-bottom: 22px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .detail-head h1 {
+      font-size: 24px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Skill Node
+      --------------------------------------------------------- */
+
+    .skill-node-block {
+      margin-bottom: 12px;
+      padding: 0;
+      overflow: hidden;
+
+      border: 1px solid var(--border);
+      border-radius: 12px;
+
+      background: #fff;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .skill-node-header {
+      margin: 0;
+      padding: 13px 16px;
+
+      border-bottom: 1px solid var(--border);
+
+      background: #fafbfc;
+    }
+
+    .skill-node-header > div {
+      gap: 10px;
+    }
+
+    .skill-node-number {
+      width: 27px;
+      height: 27px;
+
+      border-radius: 7px;
+
+      background: var(--accent);
+
+      font-size: 12px;
+    }
+
+    .skill-node-operation {
+      font: 700 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--text);
+    }
+
+
+    /* ---------------------------------------------------------
+      Parameters
+      --------------------------------------------------------- */
+
+    .skill-node-parameters {
+      padding: 17px 18px;
+      gap: 10px;
+    }
+
+    .parameter-row {
+      grid-template-columns: 170px minmax(0, 1fr);
+      gap: 14px;
+
+      min-height: 40px;
+      padding: 5px 0;
+    }
+
+    .parameter-label {
+      color: var(--text-secondary);
+      font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .parameter-input {
+      min-height: 36px;
+
+      border: 1px solid var(--border);
+      border-radius: 7px;
+
+      padding: 8px 10px;
+
+      color: var(--text);
+      background: var(--surface-soft);
+
+      font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+
+      transition:
+        border-color .15s ease,
+        box-shadow .15s ease,
+        background .15s ease;
+    }
+
+    .parameter-input:hover {
+      border-color: var(--border-strong);
+    }
+
+    .parameter-input:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, .10);
+    }
+
+    .parameter-object {
+      min-height: 120px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Node Actions
+      --------------------------------------------------------- */
+
+    .skill-node-actions {
+      justify-content: flex-end;
+
+      padding: 11px 18px;
+
+      border-top: 1px solid var(--border);
+
+      background: #fafbfc;
+    }
+
+    .skill-node-actions .button {
+      min-width: 110px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Empty
+      --------------------------------------------------------- */
+
+    .empty-parameters {
+      padding: 16px;
+
+      border: 1px dashed var(--border);
+      border-radius: 7px;
+
+      color: var(--text-tertiary);
+      background: var(--surface-soft);
+
+      text-align: center;
+      font-size: 12px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Form
+      --------------------------------------------------------- */
+
+    .form-grid input,
+    .form-grid select,
+    .form-grid textarea {
+      border-color: var(--border);
+      border-radius: 7px;
+      background: var(--surface-soft);
+    }
+
+    .form-grid input:focus,
+    .form-grid select:focus,
+    .form-grid textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(79, 70, 229, .10);
+    }
+
+    .create-tabs { display: flex; gap: 8px; margin-top: 22px; }
+    .create-mode[hidden] { display: none; }
+    .block-layout { display: grid; grid-template-columns: minmax(250px, .7fr) minmax(0, 1.3fr); gap: 18px; margin-top: 18px; }
+    .block-palette { display: grid; gap: 8px; }
+    .block-palette select { width: 100%; padding: 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
+    .block-list { display: grid; gap: 10px; }
+    .blockly-workspace {
+      width: 100%;
+      height: min(68vh, 720px);
+      min-height: 480px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      background: #fff;
+    }
+    .blockly-workspace .blocklyToolboxDiv { background: var(--surface-soft); }
+    .blockly-parameter-editor { display: grid; gap: 12px; margin-top: 14px; }
+    .blockly-parameter-editor[hidden] { display: none; }
+    .blockly-status { margin: 10px 0 0; }
+    .blockly-status.danger { color: var(--danger); }
+    .block-card { padding: 14px; border: 1px solid #cbbbea; border-left: 4px solid var(--accent); border-radius: 11px; background: var(--accent-soft); }
+    .block-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+    .block-card-head strong { font: 650 13px ui-monospace, monospace; }
+    .block-parameters { display: grid; gap: 9px; }
+    .joint-angle-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+    .binding-editor { display: grid; gap: 9px; padding-top: 10px; border-top: 1px solid var(--border); }
+    .binding-list { display: grid; gap: 9px; }
+    .binding-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .binding-grid .wide { grid-column: 1 / -1; }
+    .schema-field { display: grid; gap: 5px; padding-left: 10px; border-left: 2px solid var(--border); color: var(--muted); font-size: 12px; }
+    .schema-field > input, .schema-field > select { width: 100%; padding: 8px 9px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
+    .schema-object { display: grid; gap: 8px; }
+    .schema-array { display: grid; gap: 8px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; }
+    .schema-array-item { padding: 8px; border-radius: 8px; background: #ffffff70; }
+    .editor-result { max-height: 260px; overflow: auto; white-space: pre-wrap; font: 11px/1.5 ui-monospace, monospace; }
+    .parameter-editor { margin-top: 24px; }
+    .parameter-editor[hidden] { display: none; }
+    .task-flow-catalog { margin: 18px 0; }
+    .task-flow-catalog[hidden] { display: none; }
+    .task-flow-tree { display: grid; gap: 10px; margin-top: 12px; }
+    .task-flow-object { padding: 14px; border: 1px solid var(--border); border-radius: 11px; background: var(--panel); }
+    .task-flow-object h3 { margin: 0 0 8px; }
+    .task-flow-actions { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+    .task-flow-actions li { display: flex; justify-content: space-between; gap: 12px; padding: 7px 9px; border-radius: 8px; background: var(--panel-strong); font: 12px/1.4 ui-monospace, monospace; }
+    .task-flow-actions .blocked { color: var(--warn); }
+    .task-flow-actions .ready { color: var(--ok); }
+    .finger-marker { position: absolute; min-width: 112px; padding: 4px 7px; transform: translate(-50%, -50%); border: 2px solid white; border-radius: 999px; color: white; box-shadow: 0 1px 7px #000b; font: 800 10px ui-monospace, monospace; white-space: nowrap; }
+    .finger-marker.thumb { background: #d65a88e8; }
+    .finger-marker.index { background: #2783bce8; }
+    .finger-readout { position: absolute; left: 10px; right: 10px; bottom: 10px; padding: 7px 9px; border-radius: 8px; color: white; background: #17131fe8; font: 700 10px/1.45 ui-monospace, monospace; text-align: left; }
+    .finger-readout.uncertain { color: #ffd58f; }
+
+
+    /* ---------------------------------------------------------
+      Camera
+      --------------------------------------------------------- */
+
+    .camera-view {
+      border-radius: 10px;
+    }
+
+    .camera-label {
+      border-radius: 5px;
+      font-size: 9px;
+    }
+
+
+    /* ---------------------------------------------------------
+      Responsive
+      --------------------------------------------------------- */
+
+    @media (max-width: 800px) {
+      main {
+        padding: 28px 18px 50px;
+      }
+
+      .parameter-row {
+        grid-template-columns: 1fr;
+        gap: 5px;
+      }
+
+      .skill-node-parameters {
+        padding: 14px;
+      }
+
+      .block-layout,
+      .joint-angle-grid,
+      .binding-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img id="normal-logo" src="assets/ditto.png" alt="Dittobot Logo" class="brand-logo">
+        <img id="shiny-logo" src="assets/shiny_ditto.png" alt="Dittobot Logo" class="brand-logo", hidden>
+
+        <div><strong>dittobot</strong><small>M0609 · RG2 · D435i</small></div>
+      </div>
+      <nav class="nav" aria-label="주요 화면">
+        <button type="button" data-page="skills" aria-current="page">스킬 관리</button>
+        <button type="button" data-page="create">스킬 만들기</button>
+        <button type="button" data-page="detail">스킬 상세</button>
+        <button type="button" data-page="monitor">실시간 모니터링</button>
+        <button type="button" data-page="jog">조그</button>
+        <button type="button" data-page="aruco-experiment">ArUco 실험</button>
+      </nav>
+      <div class="connection">
+        <span id="execution-mode" class="mode">MOCK API</span>
+        <div class="mini-status"><span id="connection-dot" class="dot"></span><span id="connection-label">FastAPI 연결 확인 중</span></div>
+      </div>
+    </aside>
+
+    <main>
+      <section id="page-skills" class="page">
+        <div class="toolbar">
+          <header><p class="eyebrow">01 · REGISTRY</p><h1>스킬 관리</h1><p class="subtitle">"스킬 생성"에서 만든 스킬 목록입니다. 상세를 누르면 세그먼트를 볼 수 있고, 실행을 누르면 실시간 모니터링으로 이동해 그 스킬을 재생할 수 있습니다.</p></header>
+        </div>
+        <div id="api-banner" class="banner" role="status" aria-live="polite">FastAPI 연결 확인 중…</div>
+        <section id="task-flow-catalog" class="panel task-flow-catalog" hidden>
+          <p class="eyebrow">GRIP → ACTION → END</p>
+          <h2>컴포넌트 계층</h2>
+          <p class="subtitle">활성 GripProfile과 ActionDefinition, Action에 고정된 End Motion을 표시합니다.</p>
+          <div id="task-flow-list" class="task-flow-tree"></div>
+        </section>
+        <div id="skill-list" class="list"></div>
+        <div id="skill-empty" class="empty" hidden>등록된 스킬이 없습니다.</div>
+        <section id="draft-inspector" class="panel draft-inspector" hidden aria-live="polite">
+          <div class="draft-inspector-head">
+            <div><p class="eyebrow">PROMOTION READINESS</p><h2 id="draft-inspector-title">분석 초안</h2><p id="draft-inspector-summary" class="subtitle"></p></div>
+            <button id="close-draft-inspector" type="button" class="button" aria-label="초안 상세 닫기">닫기</button>
+          </div>
+          <div id="draft-evidence" class="draft-evidence"></div>
+          <div class="draft-semantic-grid">
+            <div><p class="eyebrow">SEMANTIC PRIMITIVES</p><ul id="draft-primitive-list" class="draft-semantic-list"></ul></div>
+            <div><p class="eyebrow">UNRESOLVED EVIDENCE</p><ul id="draft-ambiguity-list" class="draft-semantic-list"></ul></div>
+          </div>
+          <p class="eyebrow">승격 체크리스트</p>
+          <ul id="draft-readiness-list" class="readiness-list"></ul>
+          <p id="draft-next-action" class="draft-next-action"></p>
+          <div class="actions">
+            <button id="review-draft-recording" type="button" class="button">녹화 다시 보기</button>
+            <button id="auto-surface-calibration" type="button" class="button">Depth 평면 보조 힌트</button>
+            <button id="start-surface-calibration" type="button" class="button">수동 3점 task-plane TF</button>
+            <button id="start-path-teaching" type="button" class="button">경로 티칭 시작</button>
+            <button id="auto-tcp-path" type="button" class="button">MediaPipe RGB-D 경로 적용</button>
+            <button id="register-draft-candidate" type="button" class="button primary" disabled>Candidate로 등록</button>
+          </div>
+        </section>
+      </section>
+
+      <section id="page-create" class="page" hidden>
+        <header><p class="eyebrow">02 · SKILL AUTHORING</p><h1>스킬 만들기</h1><p class="subtitle">RGB-D 시연을 Grip → Action → End로 분리하거나, 승인된 primitive를 순서대로 조립해 Mock-only Candidate를 만듭니다.</p></header>
+        <div class="create-tabs" role="tablist" aria-label="스킬 생성 방식">
+          <button id="create-coords-tab" type="button" class="chip" role="tab" aria-selected="true">좌표 생성</button>
+          <button id="create-skillgen-tab" type="button" class="chip" role="tab" aria-selected="false">스킬 생성</button>
+          <button id="create-block-tab" type="button" class="chip" role="tab" aria-selected="false">순차 블록</button>
+        </div>
+        <!-- 옛 RGB-D+LLM 방식 UI. 더 이상 화면에 노출하지 않지만(탭 목록에서 뺌), app.js가
+             이 요소들에 무조건(초기화 시점에) addEventListener를 붙이는 코드가 아직 많이
+             남아 있어서, 완전히 지우면 그 시점에 null 참조로 스크립트 전체가 죽는다.
+             그래서 지우지 않고 항상 hidden 상태로만 유지한다. -->
+        <div id="legacy-recording-ui" hidden>
+          <div class="create-tabs">
+            <button id="create-recording-tab" type="button" class="chip" role="tab" aria-selected="false">RGB-D 녹화(사용 안 함)</button>
+          </div>
+          <div class="recording-picker">
+            <select id="recording-select" aria-label="저장된 RGB-D 녹화 선택"><option value="">녹화를 불러오는 중…</option></select>
+            <button id="refresh-recordings" type="button" class="button">새로고침</button>
+          </div>
+          <div class="camera-grid">
+            <div id="recorded-rgb-view" class="camera-view"><span class="camera-label">RECORDED RGB</span><span id="recorded-rgb-placeholder">녹화를 선택해 주세요</span><img id="recorded-rgb-frame" alt="선택한 녹화의 RGB 프레임" hidden><div id="recorded-point-overlay" class="point-overlay"></div></div>
+            <div class="camera-view"><span class="camera-label">RECORDED DEPTH · 0–3m</span><span id="recorded-depth-placeholder">녹화를 선택해 주세요</span><img id="recorded-depth-frame" alt="선택한 녹화의 depth 프레임" hidden></div>
+          </div>
+          <div class="playback-controls">
+            <button id="toggle-recording-playback" type="button" class="button" disabled>재생</button>
+            <input id="recording-frame-index" type="range" min="0" max="0" step="1" value="0" disabled aria-label="녹화 프레임 위치">
+            <output id="recording-frame-label" class="playback-position">0 / 0</output>
+          </div>
+          <p id="recording-review-status" class="recording-status" role="status" aria-live="polite"></p>
+          <section id="geometry-teaching" hidden aria-live="polite">
+            <p class="eyebrow">LOCAL RGB-D GEOMETRY</p>
+            <h3 id="geometry-teaching-title">표면 TF 보정</h3>
+            <p id="geometry-teaching-instruction"></p>
+            <label id="surface-anchor-label">표면 anchor ID
+              <input id="surface-anchor-id" type="text" value="teaching_surface" pattern="[A-Za-z][A-Za-z0-9_\-]{0,63}" maxlength="64">
+            </label>
+            <p id="geometry-point-summary"></p>
+            <div class="actions">
+              <button id="reset-geometry-points" type="button" class="button">현재 점 초기화</button>
+              <button id="add-path-sample" type="button" class="button" hidden>현재 프레임 샘플 추가</button>
+              <button id="save-geometry-evidence" type="button" class="button primary" disabled>증거 저장</button>
+              <button id="cancel-geometry-teaching" type="button" class="button">취소</button>
+            </div>
+          </section>
+          <form id="recording-skill-form">
+            <p id="openai-capability" class="notice"></p>
+            <input id="draft-skill-name" type="text" value="recorded_skill" pattern="[a-z][a-z0-9_]{2,63}" maxlength="64">
+            <textarea id="draft-instruction" maxlength="2000"></textarea>
+            <input id="draft-keyframe-count" type="number" min="1" max="1" step="1" value="1" readonly>
+            <button id="analyze-recording" type="submit" class="button primary" disabled>GPT로 분석해 스킬 초안 만들기</button>
+            <p id="draft-status" class="recording-status" role="status" aria-live="polite"></p>
+            <pre id="draft-result" class="draft-result" hidden></pre>
+          </form>
+        </div>
+        <div id="coords-create-mode" class="create-mode create-layout">
+          <div class="panel">
+            <p class="eyebrow">COORDINATE GENERATION</p>
+            <p class="subtitle">좌표 생성을 누르면 record_trajectory가 실행됩니다. 카메라 창에서
+              도구를 쥐고 궤적을 움직인 뒤 손을 펴서 놓으면, 저장 직후 자동으로 스무딩·검증까지
+              이어서 실행되고 그 결과가 아래에 표시됩니다.</p>
+            <div class="actions">
+              <button id="coords-start" type="button" class="button primary">좌표 생성 시작</button>
+              <button id="coords-stop" type="button" class="button" disabled>정지</button>
+              <button id="coords-refresh" type="button" class="button">결과 새로고침</button>
+            </div>
+            <p id="coords-status" class="recording-status" role="status" aria-live="polite">대기 중</p>
+            <img id="coords-frame" class="run-frame" alt="좌표 생성 인식 화면" hidden>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">SMOOTHED JSON</p>
+            <pre id="coords-smooth-json" class="draft-result">아직 결과가 없습니다.</pre>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">SMOOTH 비교 그래프</p>
+            <img id="coords-compare-img" class="run-graph" alt="smoothing 비교 그래프" hidden>
+            <p id="coords-compare-empty" class="recording-status">아직 없음</p>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">VERIFY 궤적 그래프</p>
+            <img id="coords-verify-img" class="run-graph" alt="verify 궤적 그래프" hidden>
+            <p id="coords-verify-empty" class="recording-status">아직 없음</p>
+          </div>
+        </div>
+        <div id="skillgen-create-mode" class="create-mode create-layout" hidden>
+          <div class="panel">
+            <p class="eyebrow">SKILL GENERATION</p>
+            <p class="muted">아래 드롭다운은 ①에서 만든 원본 좌표(smooth) 파일 중 스킬로 변환할 것을
+              고르는 곳입니다 - 생성된 스킬 목록은 이 밑 패널에 따로 있습니다.</p>
+            <div class="recording-picker">
+              <select id="skillgen-source-select" aria-label="스무딩된 궤적 선택"></select>
+              <button id="skillgen-generate" type="button" class="button primary">스킬 생성</button>
+              <button id="skillgen-refresh" type="button" class="button">새로고침</button>
+            </div>
+            <p id="skillgen-status" class="recording-status" role="status" aria-live="polite">대기 중</p>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">생성된 스킬 목록</p>
+            <select id="skillgen-list-select" aria-label="생성된 스킬 선택"></select>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">세그먼트 (속도·동기/비동기는 바로 저장됩니다)</p>
+            <table>
+              <thead><tr><th>#</th><th>타입</th><th>속도(mm/s)</th><th>동기/비동기</th></tr></thead>
+              <tbody id="skillgen-segments-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <section id="block-create-mode" class="create-mode block-layout" hidden>
+          <form id="block-skill-form" class="panel form-grid">
+            <p class="eyebrow">SEQUENTIAL BLOCK SKILL</p>
+            <label>스킬 선택
+              <select id="block-skill-select"></select>
+            </label>
+            <div class="block-palette" aria-label="Blockly 접근성용 primitive 추가">
+              <label for="block-operation-select">승인 primitive 추가</label>
+              <select id="block-operation-select"><option value="">catalog 로딩 중…</option></select>
+              <button id="add-skill-block" type="button" class="button">블록 추가</button>
+            </div>
+            <section class="binding-editor" aria-labelledby="block-binding-title">
+              <div><p id="block-binding-title" class="eyebrow">TYPED BINDINGS</p><p class="notice">블록 인수의 $placeholder를 자동 수집합니다. 각 placeholder의 Scene entity 종류와 선택 제약을 지정하세요.</p></div>
+              <div id="block-binding-list" class="binding-list"><p class="empty">블록을 추가하면 binding 항목이 표시됩니다.</p></div>
+            </section>
+            <p class="notice">loop·분기·임의 함수·Python·JSON 코드 입력은 지원하지 않습니다. 속도·가속도·힘은 숫자가 아니라 로컬 승인 profile ID만 선택합니다.</p>
+          </form>
+          <div class="panel">
+            <div class="detail-head">
+              <div><p class="eyebrow">BLOCKLY WORKSPACE</p><p class="subtitle">"스킬 생성" 탭에서 고른 스킬의 세그먼트가 toolbox에 나옵니다. 끌어와서 순서를 바꾸거나
+                지우고, 다른 스킬의 세그먼트도 끌어와 끼워넣을 수 있습니다. 저장하면 다음 robot_replay 실행에 바로 반영됩니다.</p></div>
+              <div class="actions">
+                <button id="save-block-sequence" type="button" class="button primary">이 순서로 저장</button>
+              </div>
+            </div>
+            <p id="block-sequence-status" class="recording-status" role="status" aria-live="polite"></p>
+            <div id="skill-block-list" class="block-list">
+              <div id="blocklyDiv" class="blockly-workspace" aria-label="순차 primitive Blockly 작업공간"></div>
+              <p id="blockly-status" class="notice blockly-status" role="status" aria-live="polite">primitive 블록을 추가해 주세요.</p>
+              <section id="blockly-parameter-editor" class="blockly-parameter-editor" hidden>
+                <div><p class="eyebrow">SELECTED BLOCK PARAMETERS</p><h3 id="blockly-parameter-title">블록을 선택하세요</h3></div>
+                <div id="blockly-parameter-fields" class="block-parameters"></div>
+              </section>
+            </div>
+            <pre id="block-editor-result" class="draft-result editor-result" hidden></pre>
+          </div>
+        </section>
+      </section>
+
+      <section id="page-detail" class="page" hidden>
+        <div class="detail-head">
+          <header><p class="eyebrow">03 · SKILL VIEWER</p><h1 id="detail-title">스킬을 선택하세요</h1><p id="detail-subtitle" class="subtitle">스킬 관리 화면에서 스킬을 선택해 주세요.</p></header>
+        </div>
+        <div id="detail-nodes" class="nodes"></div>
+        <div class="actions">
+          <button type="button" class="button" data-page="skills">목록으로</button>
+        </div>
+      </section>
+
+      <section id="page-monitor" class="page" hidden>
+        <header><p class="eyebrow">04 · RUNTIME</p><h1>실시간 모니터링</h1><p class="subtitle">상단 표시는 RealSense, frozen ArUco workspace와 현재 실행 세션 상태입니다. E-stop 표시는 물리 신호가 아니라 ArUco 활성화 때 작업자가 확인한 상태입니다.</p></header>
+        <div class="safety"><span id="estop-chip">○ E-STOP CHECK REQUIRED</span><span id="camera-chip">○ REALSENSE STOPPED</span><span id="workspace-chip">○ FIXED WORKSPACE CHECKING</span><span id="mode-chip">○ MODE CHECKING</span></div>
+        <div class="monitor-grid">
+          <div class="panel">
+            <p class="eyebrow">REALSENSE RGB-D</p>
+            <div class="camera-grid">
+              <div class="camera-view"><span class="camera-label">RGB</span><span id="rgb-placeholder">카메라를 시작해 주세요</span><img id="rgb-stream" alt="RealSense RGB 실시간 영상" hidden></div>
+              <div class="camera-view"><span class="camera-label">DEPTH · 0–3m</span><span id="depth-placeholder">정렬 Depth 대기 중</span><img id="depth-stream" alt="RealSense 정렬 depth 컬러맵" hidden></div>
+            </div>
+            <div class="camera-controls">
+              <button id="start-camera" type="button" class="button primary">RGB-D 켜기</button>
+              <button id="stop-camera" type="button" class="button" disabled>카메라 끄기</button>
+            </div>
+            <p id="camera-status" class="recording-status" role="status" aria-live="polite">RealSense 정지됨 · 사용자가 시작할 때만 카메라가 열립니다.</p>
+            <div class="run-exec-card">
+              <h3>스킬 실행</h3>
+              <p class="muted">smooth.json 파일을 선택하고 실행을 누르면 robot_replay가 실제 로봇을 움직여
+                (음성으로 도구 요청 -&gt; 도구 집기 -&gt; 궤적 재생까지) 한 번에 끝까지 실행합니다.</p>
+              <div class="run-exec-controls">
+                <select id="run-skill-select"></select>
+                <button id="run-skill-start" type="button" class="button primary">실행</button>
+              </div>
+              <img id="run-frame" class="run-frame" alt="실행 중 인식 화면" hidden>
+              <p id="run-phase-status" class="recording-status" role="status" aria-live="polite">대기 중</p>
+            </div>
+            <div class="run-exec-card">
+              <h3>음성 인식 상태 (자동 표시 · 버튼 아님)</h3>
+              <div class="voice-status">
+                <span class="dot" id="voice-rec-dot"></span>
+                <span id="voice-state-text">음성 대기 중</span>
+              </div>
+              <p id="voice-transcript" class="recording-status"></p>
+            </div>
+          </div>
+          <div class="panel">
+            <span id="run-status" class="run-status">대기</span>
+            <p id="run-title" class="run-title">실행 중인 스킬 없음</p>
+            <ul id="run-steps" class="run-steps"><li>왼쪽 "스킬 실행" 카드에서 파일을 선택하고 실행 버튼을 누르세요.</li></ul>
+            <div class="control-grid">
+              <button id="abort-run" type="button" class="button danger">정지</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="page-jog" class="page" hidden>
+        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그 · MOVEJ</h1><p class="subtitle">M0609의 J1–J6 목표각을 degree로 직접 입력한 뒤, MOVEJ 한 번으로 6축을 함께 이동합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
+        <div class="jog-layout">
+          <section class="panel">
+            <p class="eyebrow">SAFETY ENABLE</p>
+            <p id="jog-mode-notice" class="notice">조그 상태 확인 중…</p>
+            <label class="jog-operator" for="jog-operator-id">작업자 ID
+              <input id="jog-operator-id" type="text" value="ui_operator" maxlength="64" autocomplete="off">
+            </label>
+            <div class="jog-safety-list">
+              <label><input id="jog-workspace-cleared" type="checkbox"> 로봇 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
+              <label><input id="jog-estop-ready" type="checkbox"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
+              <label><input id="jog-direct-motion-ack" type="checkbox"> 아래 버튼을 누르면 로봇 관절이 직접 움직일 수 있음을 이해했습니다.</label>
+            </div>
+            <div class="actions">
+              <button id="jog-enable" type="button" class="button primary">조그 활성화</button>
+              <button id="jog-refresh" type="button" class="button">상태 새로고침</button>
+              <button id="jog-stop" type="button" class="button danger" disabled>정지 · 비활성화</button>
+            </div>
+            <p id="jog-status" class="recording-status" role="status" aria-live="polite">비활성</p>
+            <pre id="jog-gates" class="jog-gates"></pre>
+          </section>
+          <section class="panel">
+            <div class="jog-toolbar">
+              <div><p class="eyebrow">JOINT TARGET · J1–J6</p><p class="subtitle">현재각을 참고해 목표각을 직접 입력하세요. ± 설정은 목표값만 바꾸며 로봇을 움직이지 않습니다.</p></div>
+              <label class="jog-step" for="jog-step-deg">± 설정 간격 (0.1–5°)
+                <input id="jog-step-deg" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
+              </label>
+            </div>
+            <div id="jog-joint-list" class="jog-joints"></div>
+            <div class="jog-target-actions">
+              <button id="jog-load-current" type="button" class="button">현재각 불러오기</button>
+              <button id="jog-movej" type="button" class="button primary" disabled>MOVEJ · 6축 이동</button>
+            </div>
+            <p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p>
+          </section>
+        </div>
+      </section>
+
+      <section id="page-aruco-experiment" class="page" hidden>
+        <header><p class="eyebrow">06 · FIXED PLANE EXPERIMENT</p><h1>ArUco 안전 범위 실험</h1><p class="subtitle">고정된 기준 자세 [0, 0, 90, 0, 90, -90]°와 frozen ArUco plane을 사용합니다. 물체 폭은 TCP의 동적 Z 하한만 바꾸며, 상한은 평면에서 기준 카메라 위치까지입니다.</p></header>
+        <div class="jog-layout">
+          <section class="panel">
+            <p class="eyebrow">SAFETY ENABLE</p>
+            <p id="aruco-experiment-mode-notice" class="notice">실험 상태 확인 중…</p>
+            <label class="jog-operator" for="aruco-experiment-operator-id">작업자 ID
+              <input id="aruco-experiment-operator-id" type="text" value="ui_operator" maxlength="64" autocomplete="off">
+            </label>
+            <label class="jog-operator" for="aruco-object-width-mm">물체 폭 (mm)
+              <input id="aruco-object-width-mm" type="number" min="0" max="110" step="0.1" value="80" inputmode="decimal">
+            </label>
+            <label class="jog-operator" for="aruco-width-model">폭 모델
+              <select id="aruco-width-model">
+                <option value="full-opening">w = R·sin(θ)</option>
+                <option value="legacy-half-factor">w = R·sin(θ)/2 (legacy)</option>
+              </select>
+            </label>
+            <div class="jog-safety-list">
+              <label><input id="aruco-workspace-cleared" type="checkbox"> Joint 1 기준 1 m 안의 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
+              <label><input id="aruco-estop-ready" type="checkbox"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
+              <label><input id="aruco-direct-motion-ack" type="checkbox"> 기준 자세 MoveJ와 plane +Z 20 mm MoveL이 즉시 실행될 수 있음을 이해했습니다.</label>
+            </div>
+            <div class="actions">
+              <button id="aruco-experiment-enable" type="button" class="button primary">폭 적용 · 실험 활성화</button>
+              <button id="aruco-experiment-refresh" type="button" class="button">상태 새로고침</button>
+              <button id="aruco-experiment-stop" type="button" class="button danger" disabled>정지 · 비활성화</button>
+            </div>
+            <p id="aruco-experiment-status" class="recording-status" role="status" aria-live="polite">비활성</p>
+            <pre id="aruco-experiment-gates" class="jog-gates"></pre>
+          </section>
+          <section class="panel">
+            <p class="eyebrow">TWO-STEP DEMO</p>
+            <p class="notice">순서를 바꿀 수 없습니다. 먼저 기준 자세에 도달하여 현장 T_base_plane을 고정한 뒤, 같은 TCP 자세로 plane +Z 방향 20 mm를 한 번만 이동합니다. 범위를 벗어난 목표는 자동 보정하지 않고 거절합니다.</p>
+            <div class="actions" style="margin-top: 18px">
+              <button id="aruco-move-reference" type="button" class="button primary" disabled>1. 기준 자세 [0,0,90,0,90,-90]°</button>
+              <button id="aruco-move-z-test" type="button" class="button primary" disabled>2. Plane +Z 20 mm 검증</button>
+            </div>
+            <pre id="aruco-workspace-summary" class="draft-result">frozen workspace 확인 중…</pre>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="./vendor/blockly/blockly.min.js"></script>
+  <script src="./api-client.js?v=ws-def-jog-movej-1"></script>
+  <script src="./app.js?v=ws-def-jog-movej-1"></script>
+</body>
+</html>
