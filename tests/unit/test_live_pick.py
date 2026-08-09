@@ -100,9 +100,9 @@ def test_live_pick_graph_uses_rgbd_mean_depth_object_relative_targets() -> None:
     grasp = graph.nodes[5].arguments["target"]
     pregrasp = graph.nodes[3].arguments["target"]
     assert grasp["anchor_id"] == "$object"
-    assert grasp["position_m"]["z"] == pytest.approx(0.191)
+    assert grasp["position_m"]["z"] == pytest.approx(0.183)
     assert pregrasp["position_m"]["z"] == pytest.approx(
-        0.191 + 0.050
+        0.183 + 0.050
     )
     assert graph.nodes[6].arguments["width_m"] == pytest.approx(0.025)
     assert graph.uncertainty["live_pick"]["safety_margin_m"] == pytest.approx(0.005)
@@ -114,7 +114,7 @@ def test_live_pick_graph_uses_rgbd_mean_depth_object_relative_targets() -> None:
         pytest.approx(0.196)
     )
     assert graph.uncertainty["live_pick"]["grasp_depth_offset_m"] == pytest.approx(
-        -0.005
+        -0.013
     )
     assert graph.uncertainty["live_pick"]["workspace_xy_tolerance_m"] == pytest.approx(
         0.001
@@ -217,7 +217,7 @@ def test_live_pick_rejects_depth_offset_outside_local_envelope() -> None:
             object_anchor=_anchor(),
             reference=reference,
             runtime=runtime,
-            grasp_depth_offset_m=-0.011,
+            grasp_depth_offset_m=-0.014,
         )
 
 

@@ -28,7 +28,7 @@ from robot_skill_system.skills.models import (
 LIVE_OBJECT_BINDING = "$object"
 LIVE_TOOL_BINDING = "$tool"
 DEFAULT_PREGRASP_DISTANCE_M = 0.050
-DEFAULT_GRASP_DEPTH_OFFSET_M = -0.005
+DEFAULT_GRASP_DEPTH_OFFSET_M = -0.013
 DEFAULT_WORKSPACE_XY_TOLERANCE_M = 0.001
 
 
@@ -102,8 +102,8 @@ def build_live_pick_graph(
 
     if not 0.010 <= pregrasp_distance_m <= 0.150:
         raise ValueError("pregrasp distance must be within [10, 150] mm")
-    if not math.isfinite(grasp_depth_offset_m) or not -0.010 <= grasp_depth_offset_m <= 0.010:
-        raise ValueError("grasp depth offset must be finite and within [-10, 10] mm")
+    if not math.isfinite(grasp_depth_offset_m) or not -0.013 <= grasp_depth_offset_m <= 0.010:
+        raise ValueError("grasp depth offset must be finite and within [-13, 10] mm")
     if (
         not math.isfinite(workspace_xy_tolerance_m)
         or not 0.0 <= workspace_xy_tolerance_m <= 0.003

@@ -94,7 +94,7 @@ class Settings(BaseModel):
     live_grasp_profile_path: Path
     live_object_detection_confidence: float = Field(default=0.60, gt=0.0, le=1.0)
     live_pick_pregrasp_distance_m: float = Field(default=0.050, ge=0.010, le=0.150)
-    live_pick_grasp_depth_offset_m: float = Field(default=-0.005, ge=-0.010, le=0.010)
+    live_pick_grasp_depth_offset_m: float = Field(default=-0.013, ge=-0.013, le=0.010)
     live_pick_workspace_xy_tolerance_m: float = Field(default=0.001, ge=0.0, le=0.003)
     doosan_robot_id: str = Field(default="dsr01", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
     doosan_robot_model: Literal["m0609"] = "m0609"
@@ -325,7 +325,7 @@ class Settings(BaseModel):
                 env.get("LIVE_PICK_PREGRASP_DISTANCE_M", "0.050")
             ),
             live_pick_grasp_depth_offset_m=float(
-                env.get("LIVE_PICK_GRASP_DEPTH_OFFSET_M", "-0.005")
+                env.get("LIVE_PICK_GRASP_DEPTH_OFFSET_M", "-0.013")
             ),
             live_pick_workspace_xy_tolerance_m=float(
                 env.get("LIVE_PICK_WORKSPACE_XY_TOLERANCE_M", "0.001")
