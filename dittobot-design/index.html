@@ -64,6 +64,7 @@
           rotate(var(--rot));
       }
     }
+    
     .brand strong { display: block; font-size: 19px; }
     .brand small { display: block; margin-top: 3px; color: var(--muted); font: 12px ui-monospace, monospace; }
     .nav { display: grid; gap: 4px; }
@@ -870,6 +871,18 @@
         grid-template-columns: 1fr;
       }
     }
+    body.ditto-cursor {
+      cursor: var(--ditto-cursor), auto;
+    }
+
+    body.ditto-cursor button,
+    body.ditto-cursor a,
+    body.ditto-cursor [role="button"],
+    body.ditto-cursor input[type="checkbox"],
+    body.ditto-cursor input[type="radio"],
+    body.ditto-cursor select {
+      cursor: var(--ditto-hand-cursor), pointer;
+    }
   </style>
 </head>
 <body>
@@ -1130,9 +1143,9 @@
               <input id="jog-operator-id" type="text" value="ui_operator" maxlength="64" autocomplete="off">
             </label>
             <div class="jog-safety-list">
-              <label><input id="jog-workspace-cleared" type="checkbox"> 로봇 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
-              <label><input id="jog-estop-ready" type="checkbox"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
-              <label><input id="jog-direct-motion-ack" type="checkbox"> 아래 버튼을 누르면 로봇 관절이 직접 움직일 수 있음을 이해했습니다.</label>
+              <label><input id="jog-workspace-cleared" type="checkbox" autocomplete="off"> 로봇 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
+              <label><input id="jog-estop-ready" type="checkbox" autocomplete="off"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
+              <label><input id="jog-direct-motion-ack" type="checkbox" autocomplete="off"> 아래 버튼을 누르면 로봇 관절이 직접 움직일 수 있음을 이해했습니다.</label>
             </div>
             <div class="actions">
               <button id="jog-enable" type="button" class="button primary">조그 활성화</button>
@@ -1178,9 +1191,9 @@
               </select>
             </label>
             <div class="jog-safety-list">
-              <label><input id="aruco-workspace-cleared" type="checkbox"> Joint 1 기준 1 m 안의 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
-              <label><input id="aruco-estop-ready" type="checkbox"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
-              <label><input id="aruco-direct-motion-ack" type="checkbox"> 기준 자세 MoveJ와 plane +Z 20 mm MoveL이 즉시 실행될 수 있음을 이해했습니다.</label>
+              <label><input id="aruco-workspace-cleared" type="checkbox" autocomplete="off"> Joint 1 기준 1 m 안의 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
+              <label><input id="aruco-estop-ready" type="checkbox" autocomplete="off"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
+              <label><input id="aruco-direct-motion-ack" type="checkbox" autocomplete="off"> 기준 자세 MoveJ와 plane +Z 20 mm MoveL이 즉시 실행될 수 있음을 이해했습니다.</label>
             </div>
             <div class="actions">
               <button id="aruco-experiment-enable" type="button" class="button primary">폭 적용 · 실험 활성화</button>

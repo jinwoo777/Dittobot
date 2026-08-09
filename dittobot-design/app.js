@@ -1708,6 +1708,17 @@
     }
   }
 
+  function resetJogSafetyCheckboxes() {
+    [
+      "jog-workspace-cleared",
+      "jog-estop-ready",
+      "jog-direct-motion-ack",
+    ].forEach(id => {
+      const checkbox = document.getElementById(id);
+      if (checkbox) checkbox.checked = false;
+    });
+  }
+
   async function stopJog() {
     const hardware = state.jog.status?.capabilities?.mode === "hardware";
     if (hardware && !window.confirm("로봇 stop을 요청하고 조그를 비활성화할까요?")) return;
@@ -3202,6 +3213,70 @@
     sparkle.addEventListener("animationend", () => sparkle.remove());
   }
 
+  function resizeCursorImage(src, hotspotX, hotspotY) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = 32;
+        canvas.height = 32;
+
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, 32, 32);
+
+        // 원본 이미지를 32×32로 축소
+        ctx.drawImage(img, 0, 0, 32, 32);
+
+        resolve({
+          url: canvas.toDataURL("image/png"),
+          hotspotX,
+          hotspotY,
+        });
+      };
+
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+
+  async function setDittoCursor() {
+    try {
+      const normal = await resizeCursorImage(
+        "assets/metamon_cursor.png",
+        3,
+        3
+      );
+
+      const hand = await resizeCursorImage(
+        "assets/metamon_point.png",
+        3,
+        3
+      );
+
+      document.body.style.setProperty(
+        "--ditto-cursor",
+        `url("${normal.url}") ${normal.hotspotX} ${normal.hotspotY}`
+      );
+
+      document.body.style.setProperty(
+        "--ditto-hand-cursor",
+        `url("${hand.url}") ${hand.hotspotX} ${hand.hotspotY}`
+      );
+
+      document.body.classList.add("ditto-cursor");
+    } catch (error) {
+      console.error("커서 이미지 로드 실패:", error);
+    }
+  }
+
+  function resetDittoCursor() {
+    document.body.classList.remove("ditto-cursor");
+
+    document.body.style.removeProperty("--ditto-cursor");
+    document.body.style.removeProperty("--ditto-hand-cursor");
+  }
+
   function toggleShinyLogo() {
     const shiny = shinyLogo.hidden;
 
@@ -3210,17 +3285,22 @@
 
     // 일반 → Shiny로 바뀔 때만 반짝이 생성
     if (shiny) {
+      setDittoCursor();
       spawnSparkle("left");
 
       setTimeout(() => {
         spawnSparkle("right");
       }, 120);
+    } else {
+      resetDittoCursor();
     }
   }
+
   normalLogo?.addEventListener("dblclick", toggleShinyLogo);
   shinyLogo?.addEventListener("dblclick", toggleShinyLogo);
 
   renderAll();
+  resetJogSafetyCheckboxes();
   loadRegistry().then(() => Promise.all([
     refreshCameraStatus(),
     refreshHandeyeCalibrationStatus(),
