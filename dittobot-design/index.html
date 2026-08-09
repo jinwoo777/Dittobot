@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="dittobot-api-base" content="">
+  <meta name="dittobot-api-base" content="http://127.0.0.1:8000">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:8000 http://localhost:8000; img-src 'self' http://127.0.0.1:8000 http://localhost:8000 data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
   <title>Dittobot Operator Console</title>
   <style>
@@ -128,12 +128,21 @@
     .camera-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
     .camera-controls label { color: var(--muted); font-size: 12px; }
     .camera-controls input { width: 70px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); }
+    .pipeline-frame:not([hidden]) { display: block; width: 100%; max-height: 260px; margin-top: 10px; object-fit: contain; border-radius: 10px; background: #111; }
+    .pipeline-graph:not([hidden]) { display: block; width: 100%; height: auto; margin-top: 10px; border-radius: 10px; }
+    .pipeline-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .pipeline-table th, .pipeline-table td { padding: 9px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+    .pipeline-table th { color: var(--muted); font: 700 11px ui-monospace, monospace; }
     .calibration-card { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 13px; background: #fffdfd99; }
     .calibration-card h3 { margin: 0 0 7px; font-size: 14px; }
     .calibration-card p { margin: 6px 0; }
     .calibration-progress { width: 100%; accent-color: var(--primary); }
     .calibration-result { max-height: 220px; margin: 9px 0 0; overflow: auto; white-space: pre-wrap; font-size: 11px; }
     .recording-status { margin: 10px 0 0; color: var(--muted); font: 11px/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+    .voice-card { margin-top: 14px; padding: 14px; border: 1px solid var(--border); border-radius: 13px; background: #fffdfd99; }
+    .voice-card h3 { margin: 0 0 7px; font-size: 14px; }
+    .voice-status { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--muted); font-size: 12px; }
+    .voice-transcript { max-height: 180px; overflow: auto; white-space: pre-wrap; }
     .run-title { margin: 4px 0 14px; font: 650 16px ui-monospace, monospace; }
     .run-status { display: inline-block; padding: 5px 10px; border-radius: 999px; color: var(--muted); background: var(--panel-strong); font-size: 12px; }
     .run-steps { min-height: 96px; margin: 18px 0; padding: 0; list-style: none; color: var(--muted); font: 12px/1.8 ui-monospace, monospace; }
@@ -148,6 +157,8 @@
     .jog-operator input, .jog-step input, .jog-target-angle { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
     .jog-operator select { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
     .jog-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+    .jog-mode-switch { display: inline-flex; gap: 8px; margin-bottom: 18px; padding: 5px; border: 1px solid var(--border); border-radius: 11px; background: var(--bg); }
+    .jog-mode-switch .button { min-width: 110px; }
     .jog-step { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
     .jog-step input { width: 100px; }
     .jog-joints { display: grid; gap: 9px; }
@@ -963,10 +974,64 @@
       <section id="page-create" class="page" hidden>
         <header><p class="eyebrow">02 · SKILL AUTHORING</p><h1>스킬 만들기</h1><p class="subtitle">RGB-D 시연을 Grip → Action → End로 분리하거나, 승인된 primitive를 순서대로 조립해 Mock-only Candidate를 만듭니다.</p></header>
         <div class="create-tabs" role="tablist" aria-label="스킬 생성 방식">
-          <button id="create-recording-tab" type="button" class="chip" role="tab" aria-selected="true">RGB-D 녹화</button>
+          <button id="create-coords-tab" type="button" class="chip" role="tab" aria-selected="true">좌표 생성</button>
+          <button id="create-skillgen-tab" type="button" class="chip" role="tab" aria-selected="false">스킬 생성</button>
+          <button id="create-recording-tab" type="button" class="chip" role="tab" aria-selected="false" hidden>RGB-D 녹화</button>
           <button id="create-block-tab" type="button" class="chip" role="tab" aria-selected="false">순차 블록</button>
         </div>
-        <div id="recording-create-mode" class="create-mode create-layout">
+        <div id="coords-create-mode" class="create-mode create-layout">
+          <div class="panel">
+            <p class="eyebrow">COORDINATE GENERATION</p>
+            <p class="subtitle">좌표 생성을 누르면 추가된 ditto_ws의 record_trajectory가 바로 실행됩니다. 도구를 쥐고 궤적을 움직인 뒤 손을 펴면 스무딩·검증 결과가 자동으로 표시됩니다.</p>
+            <div class="actions">
+              <button id="coords-start" type="button" class="button primary">좌표 생성 시작</button>
+              <button id="coords-stop" type="button" class="button" disabled>정지</button>
+              <button id="coords-refresh" type="button" class="button">결과 새로고침</button>
+            </div>
+            <p id="coords-status" class="recording-status" role="status" aria-live="polite">RGB-D 녹화 결과 확인 대기 중</p>
+            <img id="coords-frame" class="pipeline-frame" alt="좌표 생성 인식 화면" hidden>
+            <p class="notice">ditto_ws 소스는 읽기 전용이며 생성 결과는 robot_skill_system artifact 폴더에 별도로 저장됩니다.</p>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">SMOOTHED JSON</p>
+            <pre id="coords-smooth-json" class="draft-result">아직 결과가 없습니다.</pre>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">SMOOTH 비교 그래프</p>
+            <img id="coords-compare-img" class="pipeline-graph" alt="smoothing 비교 그래프" hidden>
+            <p id="coords-compare-empty" class="recording-status">아직 없음</p>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">VERIFY 궤적 그래프</p>
+            <img id="coords-verify-img" class="pipeline-graph" alt="verify 궤적 그래프" hidden>
+            <p id="coords-verify-empty" class="recording-status">아직 없음</p>
+          </div>
+        </div>
+        <div id="skillgen-create-mode" class="create-mode create-layout" hidden>
+          <div class="panel">
+            <p class="eyebrow">SKILL GENERATION</p>
+            <p class="subtitle">분석 초안과 현재 SkillGraph Candidate를 확인하고 Blockly 편집기로 새 Candidate를 만듭니다.</p>
+            <div class="recording-picker">
+              <select id="skillgen-source-select" aria-label="분석 초안 선택"><option value="">불러오는 중…</option></select>
+              <button id="skillgen-generate" type="button" class="button primary">Blockly Candidate 만들기</button>
+              <button id="skillgen-refresh" type="button" class="button">새로고침</button>
+            </div>
+            <p id="skillgen-status" class="recording-status" role="status" aria-live="polite">SkillGraph 확인 대기 중</p>
+            <p class="notice">속도·가속도·힘은 승인 profile만 사용하며 결과는 Mock-only Candidate로 생성됩니다.</p>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">현재 SkillGraph 목록</p>
+            <select id="skillgen-list-select" aria-label="생성된 스킬 선택"><option value="">생성된 스킬 없음</option></select>
+          </div>
+          <div class="panel">
+            <p class="eyebrow">세그먼트</p>
+            <table class="pipeline-table">
+              <thead><tr><th>#</th><th>Primitive</th><th>승인 Profile</th><th>상태</th></tr></thead>
+              <tbody id="skillgen-segments-body"><tr><td colspan="4">세그먼트 정보 없음</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="recording-create-mode" class="create-mode create-layout" hidden>
           <div class="panel">
             <p class="eyebrow">RECORDED RGB-D</p>
             <div class="recording-picker">
@@ -1027,6 +1092,20 @@
         <section id="block-create-mode" class="create-mode block-layout" hidden>
           <form id="block-skill-form" class="panel form-grid">
             <p class="eyebrow">SEQUENTIAL BLOCK SKILL</p>
+            <div class="panel">
+              <p class="eyebrow">EXISTING SKILL</p>
+              <label>기존 스킬 불러오기
+                <select id="existing-skill-select" aria-label="기존 스킬 선택">
+                  <option value="">기존 스킬을 선택하세요</option>
+                </select>
+              </label>
+              <div class="actions">
+                <button id="load-skill-to-blockly" type="button" class="button">Blockly로 불러오기</button>
+                <button id="new-block-skill" type="button" class="button">새 스킬로 초기화</button>
+              </div>
+              <p id="loaded-skill-status" class="notice" role="status" aria-live="polite">스킬 버전을 선택하면 primitive와 인수를 Blockly 작업공간으로 불러옵니다.</p>
+              <p class="notice">원본 스킬은 변경되지 않으며, 수정 결과는 checksum으로 보호된 새 child Candidate로 생성됩니다.</p>
+            </div>
             <label>스킬 ID
               <input id="block-skill-id" type="text" value="block_skill" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}" maxlength="64" required autocomplete="off">
             </label>
@@ -1117,6 +1196,21 @@
               <button id="stop-recording" type="button" class="button" disabled>녹화 중지</button>
             </div>
             <p id="camera-status" class="recording-status" role="status" aria-live="polite">RealSense 정지됨 · 사용자가 시작할 때만 카메라가 열립니다.</p>
+            <div class="voice-card">
+              <h3>음성 인식</h3>
+              <p class="muted">ditto_ws의 음성 상태 UI를 참고해 브라우저 마이크와 현재 OpenAI 전사 API를 연결합니다. 인식 결과는 표시만 하며 로봇이나 스킬을 자동 실행하지 않습니다.</p>
+              <div class="camera-controls">
+                <button id="voice-start" type="button" class="button primary" disabled>음성 녹음 시작</button>
+                <button id="voice-finish" type="button" class="button danger" disabled>녹음 종료 · 인식</button>
+              </div>
+              <div class="voice-status">
+                <span class="dot" id="voice-rec-dot"></span>
+                <span id="voice-state-text">음성 연결 확인 중</span>
+              </div>
+              <p id="voice-capabilities" class="recording-status">음성 API 연결 확인 중…</p>
+              <pre id="voice-transcript" class="draft-result voice-transcript" hidden></pre>
+              <p class="notice">LIVE 모드에서는 녹음 종료 후 확인 대화상자에 동의해야만 OpenAI 요청이 전송되고 크레딧이 사용됩니다.</p>
+            </div>
             <div class="calibration-card">
               <h3>Eye-in-hand Calibration (선택적 재보정)</h3>
               <p class="muted">현재 ArUco 실험은 검증 후 freeze한 fixed_workspace_reference.npz를 사용하므로 이 재보정 기능을 실행할 필요가 없습니다.</p>
@@ -1146,7 +1240,7 @@
       </section>
 
       <section id="page-jog" class="page" hidden>
-        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그 · MOVEJ</h1><p class="subtitle">M0609의 J1–J6 목표각을 degree로 직접 입력한 뒤, MOVEJ 한 번으로 6축을 함께 이동합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
+        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그 · MOVEJ / MOVEL</h1><p class="subtitle">관절 목표각 또는 DR_BASE 기준 TCP pose를 직접 입력하고 MOVEJ와 MOVEL을 전환해 사용합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
         <div class="jog-layout">
           <section class="panel">
             <p class="eyebrow">SAFETY ENABLE</p>
@@ -1157,7 +1251,7 @@
             <div class="jog-safety-list">
               <label><input id="jog-workspace-cleared" type="checkbox" autocomplete="off"> 로봇 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
               <label><input id="jog-estop-ready" type="checkbox" autocomplete="off"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
-              <label><input id="jog-direct-motion-ack" type="checkbox" autocomplete="off"> 아래 버튼을 누르면 로봇 관절이 직접 움직일 수 있음을 이해했습니다.</label>
+              <label><input id="jog-direct-motion-ack" type="checkbox" autocomplete="off"> MOVEJ 또는 MOVEL 버튼을 누르면 로봇이 직접 움직일 수 있음을 이해했습니다.</label>
             </div>
             <div class="actions">
               <button id="jog-enable" type="button" class="button primary">조그 활성화</button>
@@ -1168,18 +1262,38 @@
             <pre id="jog-gates" class="jog-gates"></pre>
           </section>
           <section class="panel">
-            <div class="jog-toolbar">
-              <div><p class="eyebrow">JOINT TARGET · J1–J6</p><p class="subtitle">현재각을 참고해 목표각을 직접 입력하세요. ± 설정은 목표값만 바꾸며 로봇을 움직이지 않습니다.</p></div>
-              <label class="jog-step" for="jog-step-deg">± 설정 간격 (0.1–5°)
-                <input id="jog-step-deg" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
-              </label>
+            <div class="jog-mode-switch" role="group" aria-label="조그 이동 방식">
+              <button id="jog-mode-movej" type="button" class="button primary" aria-pressed="true">MOVEJ</button>
+              <button id="jog-mode-movel" type="button" class="button" aria-pressed="false">MOVEL</button>
             </div>
-            <div id="jog-joint-list" class="jog-joints"></div>
-            <div class="jog-target-actions">
-              <button id="jog-load-current" type="button" class="button">현재각 불러오기</button>
-              <button id="jog-movej" type="button" class="button primary" disabled>MOVEJ · 6축 이동</button>
+            <div id="jog-joint-panel">
+              <div class="jog-toolbar">
+                <div><p class="eyebrow">JOINT TARGET · J1–J6</p><p class="subtitle">현재각을 참고해 목표각을 직접 입력하세요. ± 설정은 목표값만 바꾸며 로봇을 움직이지 않습니다.</p></div>
+                <label class="jog-step" for="jog-step-deg">± 설정 간격 (0.1–5°)
+                  <input id="jog-step-deg" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
+                </label>
+              </div>
+              <div id="jog-joint-list" class="jog-joints"></div>
+              <div class="jog-target-actions">
+                <button id="jog-load-current" type="button" class="button">현재각 불러오기</button>
+                <button id="jog-movej" type="button" class="button primary" disabled>MOVEJ · 6축 이동</button>
+              </div>
+              <p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p>
             </div>
-            <p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p>
+            <div id="jog-linear-panel" hidden>
+              <div class="jog-toolbar">
+                <div><p class="eyebrow">TCP TARGET · DR_BASE</p><p class="subtitle">X/Y/Z는 mm, Rx/Ry/Rz는 degree입니다. ± 설정은 목표값만 변경합니다.</p></div>
+                <label class="jog-step" for="jog-linear-step">± 설정 간격 (0.1–5)
+                  <input id="jog-linear-step" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
+                </label>
+              </div>
+              <div id="jog-linear-list" class="jog-joints"></div>
+              <div class="jog-target-actions">
+                <button id="jog-load-current-tcp" type="button" class="button">현재 TCP 불러오기</button>
+                <button id="jog-movel" type="button" class="button primary" disabled>MOVEL · 직선 이동</button>
+              </div>
+              <p class="subtitle">위치: mm · 자세: degree · 기준: DR_BASE · 프로파일: linear_slow · 1회 최대 100 mm / 축별 5°</p>
+            </div>
           </section>
         </div>
       </section>
@@ -1229,7 +1343,7 @@
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js?v=direct-skill-run-1"></script>
-  <script src="./app.js?v=direct-skill-run-1"></script>
+  <script src="./api-client.js?v=monitor-voice-1"></script>
+  <script src="./app.js?v=monitor-voice-1"></script>
 </body>
 </html>

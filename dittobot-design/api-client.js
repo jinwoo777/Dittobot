@@ -82,6 +82,49 @@
       return this.request("/health");
     }
 
+    voiceCapabilities() {
+      return this.request("/voice/capabilities");
+    }
+
+    async transcribeVoiceAudio(audioBlob, { acknowledgeOpenAICharges = false } = {}) {
+      const controller = new AbortController();
+      const timeoutMs = 180000;
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await window.fetch(`${this.baseUrl}/voice/transcribe`, {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": audioBlob.type || "audio/webm",
+            "X-Acknowledge-OpenAI-Charges": String(acknowledgeOpenAICharges),
+          },
+          body: audioBlob,
+          signal: controller.signal,
+          credentials: "same-origin",
+        });
+        const contentType = response.headers.get("content-type") || "";
+        const payload = contentType.includes("application/json")
+          ? await response.json()
+          : await response.text();
+        if (!response.ok) {
+          const detail = payload && typeof payload === "object" ? payload.detail : payload;
+          throw new DittobotApiError(
+            typeof detail === "string" ? detail : `음성 인식 요청 실패 (${response.status})`,
+            { status: response.status, detail },
+          );
+        }
+        return payload;
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          throw new DittobotApiError("음성 인식 응답 제한 시간 180초를 초과했습니다.");
+        }
+        if (error instanceof DittobotApiError) throw error;
+        throw new DittobotApiError("음성 인식 API에 연결할 수 없습니다.", { detail: error });
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    }
+
     listSkills() {
       return this.request("/skills");
     }
@@ -126,6 +169,17 @@
         body: { ...payload, acknowledge_mock_only: true },
         timeoutMs: 120000,
       });
+    }
+
+    createSkillBlockRevisionCandidate(skillId, version, payload) {
+      return this.request(
+        `/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}/block-candidates`,
+        {
+          method: "POST",
+          body: { ...payload, acknowledge_mock_only: true },
+          timeoutMs: 120000,
+        },
+      );
     }
 
     createSkillParameterCandidate(skillId, version, payload) {
@@ -209,6 +263,52 @@
       return this.request("/camera/status");
     }
 
+    dittoCoordinateStatus() {
+      return this.request("/coordinates/ditto/status");
+    }
+
+    startDittoCoordinates() {
+      return this.request("/coordinates/ditto/start", {
+        method: "POST",
+        body: {},
+        timeoutMs: 30000,
+      });
+    }
+
+    stopDittoCoordinates() {
+      return this.request("/coordinates/ditto/stop", {
+        method: "POST",
+        body: {},
+        timeoutMs: 15000,
+      });
+    }
+
+    latestDittoCoordinates() {
+      return this.request("/coordinates/ditto/latest");
+    }
+
+    dittoCoordinateResult(stage, filename) {
+      const allowedStages = new Set(["raw", "smooth", "verify"]);
+      if (!allowedStages.has(stage) || !filename) {
+        throw new DittobotApiError("좌표 결과 경로가 올바르지 않습니다.");
+      }
+      return this.request(
+        `/coordinates/ditto/results/${encodeURIComponent(stage)}/${encodeURIComponent(filename)}`,
+      );
+    }
+
+    dittoCoordinateFrameUrl() {
+      return `${this.baseUrl}/coordinates/ditto/frame.jpg?ts=${Date.now()}`;
+    }
+
+    dittoCoordinateResultUrl(stage, filename) {
+      const allowedStages = new Set(["smooth", "verify"]);
+      if (!allowedStages.has(stage) || !filename) {
+        throw new DittobotApiError("좌표 그래프 경로가 올바르지 않습니다.");
+      }
+      return `${this.baseUrl}/coordinates/ditto/results/${encodeURIComponent(stage)}/${encodeURIComponent(filename)}`;
+    }
+
     handeyeCalibrationStatus() {
       return this.request("/calibration/hand-eye/status");
     }
@@ -255,6 +355,14 @@
       return this.request("/jog/movej", {
         method: "POST",
         body: { target_joint_positions_deg: targetJointPositionsDeg },
+        timeoutMs: 120000,
+      });
+    }
+
+    moveJogLinear(targetTcpPoseBaseMmZyzDeg) {
+      return this.request("/jog/movel", {
+        method: "POST",
+        body: { target_tcp_pose_base_mm_zyz_deg: targetTcpPoseBaseMmZyzDeg },
         timeoutMs: 120000,
       });
     }

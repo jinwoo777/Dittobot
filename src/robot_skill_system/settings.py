@@ -85,6 +85,9 @@ class Settings(BaseModel):
     jog_cell_safety_verified: bool = False
     enable_aruco_experiment: bool = False
     aruco_experiment_cell_safety_verified: bool = False
+    enable_ditto_coordinate_capture: bool = False
+    ditto_coordinate_cell_safety_verified: bool = False
+    ditto_workspace_root: Path | None = None
     aruco_experiment_expected_tcp: str = Field(
         default="GripperDA_v1", min_length=1, max_length=64
     )
@@ -138,6 +141,13 @@ class Settings(BaseModel):
             raise ValueError("configured legacy NPY path must be absolute after resolution")
         return value
 
+    @field_validator("ditto_workspace_root")
+    @classmethod
+    def _optional_ditto_workspace_is_absolute(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("DITTO_WORKSPACE_ROOT must resolve to an absolute path")
+        return value
+
     @field_validator("log_level")
     @classmethod
     def _known_log_level(cls, value: str) -> str:
@@ -186,6 +196,14 @@ class Settings(BaseModel):
             raise ValueError("ArUco fixed reference and runtime workspace paths must differ")
         return self
 
+    @model_validator(mode="after")
+    def _ditto_workspace_stays_within_repository(self) -> Settings:
+        path = self.ditto_workspace_root
+        expected = self.repo_root / "ditto_ws"
+        if path is not None and path != expected:
+            raise ValueError("DITTO_WORKSPACE_ROOT must point to repo_root/ditto_ws")
+        return self
+
     @classmethod
     def from_env(
         cls,
@@ -225,6 +243,11 @@ class Settings(BaseModel):
         ).expanduser()
         if not aruco_runtime_path.is_absolute():
             aruco_runtime_path = resolved_root / aruco_runtime_path
+        ditto_workspace_path = Path(
+            env.get("DITTO_WORKSPACE_ROOT", "ditto_ws")
+        ).expanduser()
+        if not ditto_workspace_path.is_absolute():
+            ditto_workspace_path = resolved_root / ditto_workspace_path
         raw_key = env.get("OPENAI_API_KEY", "").strip()
         image_detail = env.get("OPENAI_IMAGE_DETAIL", "auto").lower()
         if image_detail not in {"auto", "low", "high"}:
@@ -289,6 +312,13 @@ class Settings(BaseModel):
             aruco_experiment_cell_safety_verified=_bool_value(
                 env.get("ARUCO_EXPERIMENT_CELL_SAFETY_VERIFIED"), default=False
             ),
+            enable_ditto_coordinate_capture=_bool_value(
+                env.get("ENABLE_DITTO_COORDINATE_CAPTURE"), default=False
+            ),
+            ditto_coordinate_cell_safety_verified=_bool_value(
+                env.get("DITTO_COORDINATE_CELL_SAFETY_VERIFIED"), default=False
+            ),
+            ditto_workspace_root=ditto_workspace_path.resolve(),
             aruco_experiment_expected_tcp=env.get(
                 "ARUCO_EXPERIMENT_EXPECTED_TCP", "GripperDA_v1"
             ),
@@ -370,6 +400,15 @@ class Settings(BaseModel):
                 self.aruco_experiment_cell_safety_verified
             ),
             "aruco_experiment_expected_tcp": self.aruco_experiment_expected_tcp,
+            "enable_ditto_coordinate_capture": self.enable_ditto_coordinate_capture,
+            "ditto_coordinate_cell_safety_verified": (
+                self.ditto_coordinate_cell_safety_verified
+            ),
+            "ditto_workspace_root": (
+                str(self.ditto_workspace_root)
+                if self.ditto_workspace_root is not None
+                else None
+            ),
             "aruco_fixed_reference_npz": str(self.aruco_fixed_reference_npz),
             "aruco_runtime_workspace_npz": str(self.aruco_runtime_workspace_npz),
             "doosan_robot_id": self.doosan_robot_id,
@@ -421,6 +460,16 @@ class Settings(BaseModel):
             and self.enable_handeye_calibration
             and self.calibration_pose_plan_approved
             and self.calibration_cell_safety_verified
+        )
+
+    @property
+    def ditto_coordinate_hardware_enabled(self) -> bool:
+        """Require explicit capture and cell gates on top of hardware authorization."""
+
+        return (
+            self.hardware_enabled
+            and self.enable_ditto_coordinate_capture
+            and self.ditto_coordinate_cell_safety_verified
         )
 
     @property

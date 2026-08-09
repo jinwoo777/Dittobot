@@ -11,6 +11,7 @@ def create_app(service: Any | None = None) -> Any:
 
     try:
         from fastapi import FastAPI, HTTPException, Request
+        from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import JSONResponse, RedirectResponse
         from fastapi.staticfiles import StaticFiles
     except ImportError as exc:  # pragma: no cover - environment-dependent guard
@@ -21,12 +22,14 @@ def create_app(service: Any | None = None) -> Any:
         calibration,
         camera,
         catalog,
+        coordinates,
         jog,
         runtime,
         scenes,
         skills,
         task_planes,
         teaching,
+        voice,
     )
     from robot_skill_system.capture.rgbd_recording import CameraStateError
     from robot_skill_system.exceptions import HardwareExecutionDenied, NotConfiguredError
@@ -41,6 +44,20 @@ def create_app(service: Any | None = None) -> Any:
         version="0.1.0",
         description="Safety-bounded teaching, skill registry, and runtime API",
     )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://127.0.0.1:8010",
+            "http://localhost:8010",
+        ],
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Accept",
+            "Content-Type",
+            "X-Acknowledge-OpenAI-Charges",
+        ],
+    )
     app.state.service = service
 
     @app.get("/health", tags=["system"])
@@ -53,10 +70,12 @@ def create_app(service: Any | None = None) -> Any:
     app.include_router(runtime.router)
     app.include_router(catalog.router)
     app.include_router(camera.router)
+    app.include_router(coordinates.router)
     app.include_router(calibration.router)
     app.include_router(jog.router)
     app.include_router(aruco_experiment.router)
     app.include_router(task_planes.router)
+    app.include_router(voice.router)
 
     settings = getattr(service, "settings", None)
     repository_root = getattr(settings, "repo_root", None)

@@ -16,6 +16,17 @@
       status: "idle",
       completedSteps: 0,
     },
+    voice: {
+      capabilities: null,
+      state: "checking",
+      mediaRecorder: null,
+      mediaStream: null,
+      chunks: [],
+      transcript: "",
+      tools: [],
+      destinations: [],
+      lastError: null,
+    },
     camera: {
       state: "stopped",
       recording: null,
@@ -37,8 +48,11 @@
       status: null,
       loading: false,
       lastError: null,
+      motionMode: "movej",
       targetPositionsDeg: null,
       targetDirty: false,
+      targetTcpPose: null,
+      targetTcpDirty: false,
     },
     arucoExperiment: {
       status: null,
@@ -68,7 +82,7 @@
       busy: false,
     },
     editor: {
-      createMode: "recording",
+      createMode: "coords",
       catalog: [],
       blocks: [],
       bindings: {},
@@ -77,6 +91,7 @@
       selectedBlocklyBlockId: null,
       blocklyError: null,
       blocklyCatalogSignature: "",
+      loadedParent: null,
       parameterNodeId: null,
       parameterArguments: null,
     },
@@ -138,6 +153,12 @@
     startRecording: element("start-recording"),
     stopRecording: element("stop-recording"),
     cameraStatus: element("camera-status"),
+    voiceStart: element("voice-start"),
+    voiceFinish: element("voice-finish"),
+    voiceRecDot: element("voice-rec-dot"),
+    voiceStateText: element("voice-state-text"),
+    voiceCapabilities: element("voice-capabilities"),
+    voiceTranscript: element("voice-transcript"),
     startHandeyeCalibration: element("start-handeye-calibration"),
     abortHandeyeCalibration: element("abort-handeye-calibration"),
     importLegacyHandeye: element("import-legacy-handeye"),
@@ -158,6 +179,14 @@
     jogJointList: element("jog-joint-list"),
     jogLoadCurrent: element("jog-load-current"),
     jogMoveJ: element("jog-movej"),
+    jogModeMoveJ: element("jog-mode-movej"),
+    jogModeMoveL: element("jog-mode-movel"),
+    jogJointPanel: element("jog-joint-panel"),
+    jogLinearPanel: element("jog-linear-panel"),
+    jogLinearStep: element("jog-linear-step"),
+    jogLinearList: element("jog-linear-list"),
+    jogLoadCurrentTcp: element("jog-load-current-tcp"),
+    jogMoveL: element("jog-movel"),
     arucoExperimentModeNotice: element("aruco-experiment-mode-notice"),
     arucoExperimentOperatorId: element("aruco-experiment-operator-id"),
     arucoObjectWidthMm: element("aruco-object-width-mm"),
@@ -205,10 +234,34 @@
     draftStatus: element("draft-status"),
     draftResult: element("draft-result"),
     createRecordingTab: element("create-recording-tab"),
+    createCoordsTab: element("create-coords-tab"),
+    createSkillgenTab: element("create-skillgen-tab"),
     createBlockTab: element("create-block-tab"),
     recordingCreateMode: element("recording-create-mode"),
+    coordsCreateMode: element("coords-create-mode"),
+    skillgenCreateMode: element("skillgen-create-mode"),
+    coordsStart: element("coords-start"),
+    coordsStop: element("coords-stop"),
+    coordsRefresh: element("coords-refresh"),
+    coordsStatus: element("coords-status"),
+    coordsFrame: element("coords-frame"),
+    coordsSmoothJson: element("coords-smooth-json"),
+    coordsCompareImg: element("coords-compare-img"),
+    coordsCompareEmpty: element("coords-compare-empty"),
+    coordsVerifyImg: element("coords-verify-img"),
+    coordsVerifyEmpty: element("coords-verify-empty"),
+    skillgenSourceSelect: element("skillgen-source-select"),
+    skillgenGenerate: element("skillgen-generate"),
+    skillgenRefresh: element("skillgen-refresh"),
+    skillgenStatus: element("skillgen-status"),
+    skillgenListSelect: element("skillgen-list-select"),
+    skillgenSegmentsBody: element("skillgen-segments-body"),
     blockCreateMode: element("block-create-mode"),
     blockSkillForm: element("block-skill-form"),
+    existingSkillSelect: element("existing-skill-select"),
+    loadSkillToBlockly: element("load-skill-to-blockly"),
+    newBlockSkill: element("new-block-skill"),
+    loadedSkillStatus: element("loaded-skill-status"),
     blockSkillId: element("block-skill-id"),
     blockSkillName: element("block-skill-name"),
     blockSkillDescription: element("block-skill-description"),
@@ -361,6 +414,9 @@
 
   function showPage(page) {
     if (page !== "create") stopRecordingPlayback();
+    if (page !== "monitor" && state.voice.state === "recording") {
+      discardVoiceRecording();
+    }
     state.page = page;
     document.querySelectorAll(".page").forEach((section) => {
       section.hidden = section.id !== `page-${page}`;
@@ -371,7 +427,10 @@
       }
     });
     if (page === "detail") renderDetail();
-    if (page === "monitor") renderMonitor();
+    if (page === "monitor") {
+      renderMonitor();
+      refreshVoiceCapabilities({ quiet: true });
+    }
     if (page === "jog") {
       renderJog();
       refreshJogStatus({ quiet: true });
@@ -1151,15 +1210,156 @@
     });
   }
 
+  async function refreshCoordinateResults() {
+    dom.coordsStatus.textContent = "ditto_ws 좌표 생성 상태 확인 중…";
+    try {
+      const [captureStatus, latest] = await Promise.all([
+        api.dittoCoordinateStatus(),
+        api.latestDittoCoordinates(),
+      ]);
+      const running = captureStatus.running === true;
+      const ready = captureStatus.ready === true;
+      dom.coordsStart.disabled = state.apiStatus !== "connected"
+        || running
+        || !ready;
+      dom.coordsStop.disabled = !running;
+      const missing = [
+        ...(captureStatus.missing_gates || []),
+        ...(captureStatus.source_problems || []),
+      ];
+      dom.coordsStatus.textContent = running
+        ? "ditto_ws record_trajectory 실행 중 · 도구를 쥐고 움직인 뒤 손을 펴세요."
+        : !ready
+          ? `실행 준비 필요 · ${missing.join(" · ")}`
+          : captureStatus.return_code && captureStatus.return_code !== 0
+            ? `이전 실행 종료 코드 ${captureStatus.return_code} · ${(captureStatus.log_tail || []).slice(-1)[0] || "로그 확인 필요"}`
+            : latest.raw?.exists
+              ? `최신 좌표 ${latest.raw.filename}`
+              : "좌표 생성 대기 중";
+
+      dom.coordsFrame.hidden = !running;
+      if (running) dom.coordsFrame.src = api.dittoCoordinateFrameUrl();
+
+      if (latest.smooth_json?.exists) {
+        const payload = await api.dittoCoordinateResult(
+          latest.smooth_json.stage,
+          latest.smooth_json.filename,
+        );
+        dom.coordsSmoothJson.textContent = JSON.stringify(payload, null, 2);
+      } else {
+        dom.coordsSmoothJson.textContent = "아직 결과가 없습니다.";
+      }
+
+      if (latest.compare_png?.exists) {
+        dom.coordsCompareImg.src = `${api.dittoCoordinateResultUrl(
+          latest.compare_png.stage,
+          latest.compare_png.filename,
+        )}?ts=${Date.now()}`;
+        dom.coordsCompareImg.hidden = false;
+        dom.coordsCompareEmpty.hidden = true;
+      } else {
+        dom.coordsCompareImg.hidden = true;
+        dom.coordsCompareEmpty.hidden = false;
+        dom.coordsCompareEmpty.textContent = "아직 없음";
+      }
+
+      if (latest.verify_png?.exists) {
+        dom.coordsVerifyImg.src = `${api.dittoCoordinateResultUrl(
+          latest.verify_png.stage,
+          latest.verify_png.filename,
+        )}?ts=${Date.now()}`;
+        dom.coordsVerifyImg.hidden = false;
+        dom.coordsVerifyEmpty.hidden = true;
+      } else {
+        dom.coordsVerifyImg.hidden = true;
+        dom.coordsVerifyEmpty.hidden = false;
+        dom.coordsVerifyEmpty.textContent = "아직 없음";
+      }
+    } catch (error) {
+      dom.coordsStart.disabled = state.apiStatus !== "connected";
+      dom.coordsStop.disabled = true;
+      dom.coordsStatus.textContent = `ditto_ws 좌표 결과 조회 실패: ${errorText(error)}`;
+      dom.coordsSmoothJson.textContent = "robot_skill_system API(127.0.0.1:8000)를 확인해 주세요.";
+    }
+  }
+
+  function renderPipelineSegments(skill) {
+    dom.skillgenSegmentsBody.replaceChildren();
+    if (!skill?.nodes.length) {
+      const row = create("tr");
+      const cell = create("td", { text: "세그먼트 정보 없음" });
+      cell.colSpan = 4;
+      row.append(cell);
+      dom.skillgenSegmentsBody.append(row);
+      return;
+    }
+    skill.nodes.forEach((node, index) => {
+      const row = create("tr");
+      const profile = node.arguments.motion_profile_id
+        || node.arguments.force_profile_id
+        || node.arguments.verification_profile_id
+        || "-";
+      [index + 1, node.operation, profile, skill.status].forEach((value) => {
+        row.append(create("td", { text: String(value) }));
+      });
+      dom.skillgenSegmentsBody.append(row);
+    });
+  }
+
+  function loadPipelineSkillDetail(skillKey) {
+    renderPipelineSegments(
+      state.skills.find((skill) => skill.key === skillKey) || null,
+    );
+  }
+
+  function refreshPipelineSkills() {
+    dom.skillgenSourceSelect.replaceChildren();
+    state.drafts.forEach((draft) => {
+      const option = create("option", {
+        text: `${draft.displayName} · confidence ${(draft.confidence * 100).toFixed(0)}%`,
+      });
+      option.value = draft.draftId;
+      dom.skillgenSourceSelect.append(option);
+    });
+    if (!dom.skillgenSourceSelect.options.length) {
+      const option = create("option", { text: "분석 초안 없음 · 좌표 생성부터 진행하세요" });
+      option.value = "";
+      dom.skillgenSourceSelect.append(option);
+    }
+
+    const selectedKey = dom.skillgenListSelect.value;
+    dom.skillgenListSelect.replaceChildren();
+    state.skills.forEach((skill) => {
+      const option = create("option", {
+        text: `${skill.id}@${skill.version} · ${skill.nodes.length}개 primitive · ${skill.status}`,
+      });
+      option.value = skill.key;
+      option.selected = skill.key === selectedKey;
+      dom.skillgenListSelect.append(option);
+    });
+    dom.skillgenStatus.textContent = state.skills.length
+      ? `현재 SkillGraph ${state.skills.length}개 버전 · Mock/검증 경로 연결됨`
+      : "등록된 SkillGraph가 없습니다.";
+    loadPipelineSkillDetail(dom.skillgenListSelect.value);
+  }
+
   function renderCreateMode() {
-    const blockMode = state.editor.createMode === "block";
-    dom.recordingCreateMode.hidden = blockMode;
-    dom.blockCreateMode.hidden = !blockMode;
-    dom.createRecordingTab.setAttribute("aria-selected", String(!blockMode));
-    dom.createRecordingTab.setAttribute("aria-pressed", String(!blockMode));
-    dom.createBlockTab.setAttribute("aria-selected", String(blockMode));
-    dom.createBlockTab.setAttribute("aria-pressed", String(blockMode));
-    if (blockMode) {
+    const mode = state.editor.createMode;
+    dom.recordingCreateMode.hidden = mode !== "recording";
+    dom.coordsCreateMode.hidden = mode !== "coords";
+    dom.skillgenCreateMode.hidden = mode !== "skillgen";
+    dom.blockCreateMode.hidden = mode !== "block";
+    dom.createRecordingTab.setAttribute("aria-selected", String(mode === "recording"));
+    dom.createRecordingTab.setAttribute("aria-pressed", String(mode === "recording"));
+    dom.createCoordsTab.setAttribute("aria-selected", String(mode === "coords"));
+    dom.createCoordsTab.setAttribute("aria-pressed", String(mode === "coords"));
+    dom.createSkillgenTab.setAttribute("aria-selected", String(mode === "skillgen"));
+    dom.createSkillgenTab.setAttribute("aria-pressed", String(mode === "skillgen"));
+    dom.createBlockTab.setAttribute("aria-selected", String(mode === "block"));
+    dom.createBlockTab.setAttribute("aria-pressed", String(mode === "block"));
+    if (mode === "coords") refreshCoordinateResults();
+    if (mode === "skillgen") refreshPipelineSkills();
+    if (mode === "block") {
       renderSkillBlocks();
       window.requestAnimationFrame(() => {
         if (state.editor.workspace && window.Blockly) {
@@ -1353,7 +1553,202 @@
     });
   }
 
+  function renderExistingSkillOptions() {
+    const selectedKey = dom.existingSkillSelect.value
+      || state.editor.loadedParent?.key
+      || "";
+    dom.existingSkillSelect.replaceChildren();
+    const placeholder = create("option", { text: "기존 스킬 버전을 선택하세요" });
+    placeholder.value = "";
+    dom.existingSkillSelect.append(placeholder);
+    state.skills.forEach((skill) => {
+      const option = create("option", {
+        text: `${skill.id} · v${skill.version} · ${skill.graph.name || skill.uiState}`,
+      });
+      option.value = skill.key;
+      option.selected = skill.key === selectedKey;
+      dom.existingSkillSelect.append(option);
+    });
+    if (!state.skills.some((skill) => skill.key === selectedKey)) {
+      dom.existingSkillSelect.value = "";
+    }
+    const parent = state.editor.loadedParent;
+    dom.loadSkillToBlockly.disabled = state.apiStatus !== "connected"
+      || state.editor.loading
+      || !dom.existingSkillSelect.value;
+    dom.newBlockSkill.disabled = state.editor.loading;
+    dom.blockSkillId.disabled = Boolean(parent);
+    dom.blockSkillName.disabled = Boolean(parent);
+    dom.blockSkillDescription.disabled = Boolean(parent);
+    dom.blockSkillType.disabled = Boolean(parent);
+    dom.createBlockCandidate.textContent = parent
+      ? "수정 Candidate 생성"
+      : "Candidate 생성";
+    dom.loadedSkillStatus.textContent = parent
+      ? `${parent.id}@${parent.version} 불러옴 · checksum ${parent.checksum.slice(0, 12)}… · 원본 메타데이터는 잠겨 있습니다.`
+      : "스킬 버전을 선택하면 primitive와 인수를 Blockly 작업공간으로 불러옵니다.";
+  }
+
+  function sequentialNodesForBlockly(graph) {
+    const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+    if (!nodes.length || !graph.start_node) {
+      throw new Error("SkillGraph에 시작 노드가 없습니다.");
+    }
+    const byId = new Map(nodes.map((node) => [node.node_id, node]));
+    if (!byId.has(graph.start_node)) {
+      throw new Error("SkillGraph의 시작 노드를 찾을 수 없습니다.");
+    }
+    const transitions = new Map();
+    const addTransition = (source, target) => {
+      if (!target) return;
+      const targets = transitions.get(source) || new Set();
+      targets.add(target);
+      transitions.set(source, targets);
+    };
+    nodes.forEach((node) => {
+      if (node.on_failure) {
+        throw new Error(`${node.node_id}에 실패 분기가 있어 순차 Blockly로 표현할 수 없습니다.`);
+      }
+      if (node.timeout_s != null || node.timeout != null
+        || node.checkpoint != null || node.required_scene_freshness_ms != null) {
+        throw new Error(`${node.node_id}에 Blockly가 표시하지 못하는 실행 메타데이터가 있습니다.`);
+      }
+      if (!primitiveByOperation(node.operation)) {
+        throw new Error(`${node.operation}은 현재 승인 primitive catalog에 없습니다.`);
+      }
+      addTransition(node.node_id, node.on_success);
+    });
+    (graph.edges || []).forEach((edge) => {
+      if ((edge.condition || "success") !== "success") {
+        throw new Error("failure/always edge가 있어 순차 Blockly로 표현할 수 없습니다.");
+      }
+      addTransition(edge.source_node || edge.from_node, edge.target_node || edge.to_node);
+    });
+
+    const ordered = [];
+    const visited = new Set();
+    let nodeId = graph.start_node;
+    while (nodeId) {
+      if (visited.has(nodeId)) throw new Error("순환 경로는 Blockly로 불러올 수 없습니다.");
+      const node = byId.get(nodeId);
+      if (!node) throw new Error(`경로가 알 수 없는 노드 ${nodeId}를 참조합니다.`);
+      visited.add(nodeId);
+      ordered.push(node);
+      const targets = [...(transitions.get(nodeId) || [])];
+      if (targets.length > 1) {
+        throw new Error(`${nodeId}에서 경로가 분기되어 순차 Blockly로 표현할 수 없습니다.`);
+      }
+      nodeId = targets[0] || null;
+    }
+    if (visited.size !== nodes.length) {
+      throw new Error("시작 노드에서 연결되지 않은 노드가 있어 순차 Blockly로 표현할 수 없습니다.");
+    }
+    const terminals = new Set(graph.terminal_nodes || []);
+    if (terminals.size !== 1 || !terminals.has(ordered.at(-1).node_id)) {
+      throw new Error("종료 노드 구성이 단일 순차 체인과 일치하지 않습니다.");
+    }
+    return ordered;
+  }
+
+  function replaceBlocklyWorkspace(nodes) {
+    initializeBlockly();
+    const workspace = state.editor.workspace;
+    if (!workspace || !window.Blockly) {
+      throw new Error("Blockly 작업공간을 초기화하지 못했습니다.");
+    }
+    let first = null;
+    let previous = null;
+    window.Blockly.Events.disable();
+    try {
+      workspace.clear();
+      nodes.forEach((node) => {
+        const blocklyBlock = workspace.newBlock(blocklyTypeForOperation(node.operation));
+        writeBlocklyBlockData(blocklyBlock, {
+          operation: node.operation,
+          arguments: cloneValue(node.arguments || {}),
+        });
+        blocklyBlock.initSvg();
+        blocklyBlock.render();
+        if (previous?.nextConnection && blocklyBlock.previousConnection) {
+          previous.nextConnection.connect(blocklyBlock.previousConnection);
+        } else {
+          blocklyBlock.moveBy(48, 48);
+        }
+        first ||= blocklyBlock;
+        previous = blocklyBlock;
+      });
+    } finally {
+      window.Blockly.Events.enable();
+    }
+    state.editor.selectedBlocklyBlockId = first?.id || null;
+    if (first) first.select();
+    syncBlocksFromBlockly();
+  }
+
+  async function loadExistingSkillToBlockly() {
+    const selected = state.skills.find(
+      (skill) => skill.key === dom.existingSkillSelect.value,
+    );
+    if (!selected) return;
+    if (state.editor.blocks.length
+      && state.editor.loadedParent?.key !== selected.key
+      && !window.confirm("현재 Blockly 작업공간을 선택한 스킬로 교체할까요?")) return;
+    state.editor.loading = true;
+    renderSkillBlocks();
+    setBanner(`${selected.id}@${selected.version} SkillGraph 불러오는 중…`);
+    try {
+      const result = await api.getSkill(selected.id, selected.version);
+      const graph = result.skill_graph || {};
+      const orderedNodes = sequentialNodesForBlockly(graph);
+      replaceBlocklyWorkspace(orderedNodes);
+      dom.blockSkillId.value = graph.skill_id;
+      dom.blockSkillName.value = graph.name;
+      dom.blockSkillDescription.value = graph.description;
+      dom.blockSkillType.value = graph.skill_type;
+      state.editor.bindings = cloneValue(graph.bindings || {});
+      state.editor.loadedParent = {
+        key: `${result.skill_id}@${result.version}`,
+        id: result.skill_id,
+        version: result.version,
+        checksum: result.graph_checksum_sha256,
+      };
+      dom.blockEditorResult.hidden = true;
+      setBanner(
+        `${result.skill_id}@${result.version}의 primitive ${orderedNodes.length}개를 Blockly로 불러왔습니다.`,
+        "ok",
+      );
+    } catch (error) {
+      setBanner(`Blockly 불러오기 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.editor.loading = false;
+      renderSkillBlocks();
+    }
+  }
+
+  function resetBlockEditorForNewSkill() {
+    if (state.editor.blocks.length
+      && !window.confirm("현재 Blockly 작업공간을 비우고 새 스킬을 만들까요?")) return;
+    state.editor.loadedParent = null;
+    state.editor.bindings = {};
+    state.editor.selectedBlocklyBlockId = null;
+    dom.blockSkillForm.reset();
+    if (state.editor.workspace && window.Blockly) {
+      window.Blockly.Events.disable();
+      try {
+        state.editor.workspace.clear();
+      } finally {
+        window.Blockly.Events.enable();
+      }
+    }
+    state.editor.blocks = [];
+    state.editor.blocklyError = null;
+    dom.blockEditorResult.hidden = true;
+    renderSkillBlocks();
+    setBanner("새 순차 블록 스킬 작업공간으로 초기화했습니다.", "ok");
+  }
+
   function renderSkillBlocks() {
+    renderExistingSkillOptions();
     renderPrimitiveOptions();
     initializeBlockly();
     if (!window.Blockly) {
@@ -1561,6 +1956,180 @@
     const canAbort = Boolean(state.run.runId) && ["starting", "running", "aborting"].includes(state.run.status);
     dom.abortRun.disabled = !canAbort;
     dom.estopRun.disabled = !canAbort;
+    renderVoiceMonitor();
+  }
+
+  const VOICE_STATE_LABELS = {
+    checking: "음성 연결 확인 중",
+    ready: "음성 녹음 준비됨",
+    recording: "녹음 중…",
+    processing: "OpenAI 음성 인식 처리 중…",
+    done: "음성 인식 완료",
+    cancelled: "전송 취소됨 · 과금 없음",
+    error: "음성 인식 오류",
+  };
+
+  function renderVoiceMonitor() {
+    const voice = state.voice;
+    const capabilities = voice.capabilities;
+    const recording = voice.state === "recording";
+    const processing = voice.state === "processing";
+    const available = capabilities?.available === true;
+    dom.voiceStart.disabled = !available || recording || processing;
+    dom.voiceFinish.disabled = !recording;
+    dom.voiceRecDot.classList.toggle("danger", recording || processing);
+    dom.voiceRecDot.classList.toggle(
+      "ok", available && !recording && !processing && voice.state !== "error",
+    );
+    dom.voiceStateText.textContent = voice.lastError
+      || VOICE_STATE_LABELS[voice.state]
+      || voice.state;
+    if (!capabilities) {
+      dom.voiceCapabilities.textContent = "음성 API 연결 확인 중…";
+    } else if (!available) {
+      dom.voiceCapabilities.textContent = "OPENAI_MODE=live이지만 API 키가 설정되지 않았습니다.";
+    } else if (capabilities.will_contact_openai) {
+      dom.voiceCapabilities.textContent = `${capabilities.model} LIVE · 녹음 종료 후 확인해야만 OpenAI 전사 1회 요청/과금이 발생합니다. 자동 재시도 없음.`;
+    } else {
+      dom.voiceCapabilities.textContent = `${capabilities.model} MOCK · OpenAI 네트워크 요청과 과금 없음`;
+    }
+    const entityParts = [];
+    if (voice.tools.length) entityParts.push(`도구: ${voice.tools.join(", ")}`);
+    if (voice.destinations.length) {
+      entityParts.push(`목적지: ${voice.destinations.join(", ")}`);
+    }
+    dom.voiceTranscript.hidden = !voice.transcript;
+    dom.voiceTranscript.textContent = voice.transcript
+      ? `인식된 문장: "${voice.transcript}"${entityParts.length ? `\n${entityParts.join(" · ")}` : ""}`
+      : "";
+  }
+
+  async function refreshVoiceCapabilities({ quiet = false } = {}) {
+    try {
+      const capabilities = await api.voiceCapabilities();
+      state.voice.capabilities = capabilities;
+      state.voice.lastError = null;
+      if (!["recording", "processing", "done"].includes(state.voice.state)) {
+        state.voice.state = capabilities.available ? "ready" : "error";
+      }
+    } catch (error) {
+      state.voice.state = "error";
+      state.voice.lastError = `음성 API 연결 실패: ${errorText(error)}`;
+      if (!quiet) setBanner(state.voice.lastError, "danger");
+    }
+    renderVoiceMonitor();
+  }
+
+  function releaseVoiceMedia() {
+    state.voice.mediaStream?.getTracks().forEach((track) => track.stop());
+    state.voice.mediaStream = null;
+    state.voice.mediaRecorder = null;
+  }
+
+  function discardVoiceRecording() {
+    const recorder = state.voice.mediaRecorder;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.addEventListener("stop", () => {
+        state.voice.chunks = [];
+      }, { once: true });
+      recorder.stop();
+    }
+    releaseVoiceMedia();
+    state.voice.state = "cancelled";
+    state.voice.lastError = null;
+    renderVoiceMonitor();
+  }
+
+  async function startVoiceRecording() {
+    if (!state.voice.capabilities) await refreshVoiceCapabilities();
+    if (state.voice.capabilities?.available !== true) return;
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      state.voice.state = "error";
+      state.voice.lastError = "이 브라우저는 마이크 녹음을 지원하지 않습니다.";
+      renderVoiceMonitor();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
+      const mimeType = candidates.find((value) => window.MediaRecorder.isTypeSupported(value));
+      const recorder = mimeType
+        ? new window.MediaRecorder(stream, { mimeType })
+        : new window.MediaRecorder(stream);
+      state.voice.mediaStream = stream;
+      state.voice.mediaRecorder = recorder;
+      state.voice.chunks = [];
+      state.voice.transcript = "";
+      state.voice.tools = [];
+      state.voice.destinations = [];
+      state.voice.lastError = null;
+      recorder.addEventListener("dataavailable", (event) => {
+        if (event.data?.size) state.voice.chunks.push(event.data);
+      });
+      recorder.addEventListener("error", () => {
+        state.voice.state = "error";
+        state.voice.lastError = "브라우저 마이크 녹음 중 오류가 발생했습니다.";
+        releaseVoiceMedia();
+        renderVoiceMonitor();
+      });
+      recorder.start();
+      state.voice.state = "recording";
+      setBanner("음성 녹음 중 · 아직 OpenAI 요청이나 과금은 발생하지 않았습니다.", "ok");
+    } catch (error) {
+      state.voice.state = "error";
+      state.voice.lastError = `마이크 시작 실패: ${errorText(error)}`;
+      releaseVoiceMedia();
+    }
+    renderVoiceMonitor();
+  }
+
+  async function finishVoiceRecording() {
+    const recorder = state.voice.mediaRecorder;
+    if (!recorder || recorder.state === "inactive") return;
+    const audioBlob = await new Promise((resolve) => {
+      recorder.addEventListener("stop", () => {
+        resolve(new Blob(state.voice.chunks, { type: recorder.mimeType || "audio/webm" }));
+      }, { once: true });
+      recorder.stop();
+    });
+    releaseVoiceMedia();
+    const live = state.voice.capabilities?.will_contact_openai === true;
+    if (live && !window.confirm(
+      "녹음 파일을 OpenAI 음성 인식 API로 전송합니다.\n실제 API 크레딧이 사용됩니다. 계속할까요?",
+    )) {
+      state.voice.state = "cancelled";
+      state.voice.chunks = [];
+      setBanner("음성 전송을 취소했습니다. OpenAI 요청과 과금은 발생하지 않았습니다.", "ok");
+      renderVoiceMonitor();
+      return;
+    }
+    state.voice.state = "processing";
+    state.voice.lastError = null;
+    renderVoiceMonitor();
+    try {
+      const result = await api.transcribeVoiceAudio(audioBlob, {
+        acknowledgeOpenAICharges: live,
+      });
+      state.voice.state = "done";
+      state.voice.transcript = result.transcript || "";
+      state.voice.tools = Array.isArray(result.tools) ? result.tools : [];
+      state.voice.destinations = Array.isArray(result.destinations)
+        ? result.destinations
+        : [];
+      setBanner(
+        result.openai_contacted
+          ? "음성 인식 완료 · OpenAI 전사 1회 요청됨 · 자동 실행 안 함"
+          : "Mock 음성 인식 연결 확인 완료 · OpenAI 요청 없음",
+        "ok",
+      );
+    } catch (error) {
+      state.voice.state = "error";
+      state.voice.lastError = `음성 인식 실패: ${errorText(error)}`;
+      setBanner(state.voice.lastError, "danger");
+    } finally {
+      state.voice.chunks = [];
+    }
+    renderVoiceMonitor();
   }
 
   function renderJog() {
@@ -1572,14 +2141,30 @@
     const positions = Array.isArray(payload?.joint_positions_deg)
       ? payload.joint_positions_deg
       : [0, 0, 0, 0, 0, 0];
+    const tcpPose = Array.isArray(payload?.tcp_pose_base_mm_zyz_deg)
+      ? payload.tcp_pose_base_mm_zyz_deg
+      : [0, 0, 0, 0, 0, 0];
     if (!Array.isArray(state.jog.targetPositionsDeg)
       || state.jog.targetPositionsDeg.length !== 6) {
       state.jog.targetPositionsDeg = positions.map((value) => Number(value));
       state.jog.targetDirty = false;
     }
+    if (!Array.isArray(state.jog.targetTcpPose)
+      || state.jog.targetTcpPose.length !== 6) {
+      state.jog.targetTcpPose = tcpPose.map((value) => Number(value));
+      state.jog.targetTcpDirty = false;
+    }
+
+    const moveLMode = state.jog.motionMode === "movel";
+    dom.jogModeMoveJ.classList.toggle("primary", !moveLMode);
+    dom.jogModeMoveL.classList.toggle("primary", moveLMode);
+    dom.jogModeMoveJ.setAttribute("aria-pressed", String(!moveLMode));
+    dom.jogModeMoveL.setAttribute("aria-pressed", String(moveLMode));
+    dom.jogJointPanel.hidden = moveLMode;
+    dom.jogLinearPanel.hidden = !moveLMode;
 
     dom.jogModeNotice.textContent = hardware
-      ? "실제 M0609 하드웨어 조그 모드입니다. MOVEJ를 누르면 입력한 6축 목표로 즉시 이동합니다."
+      ? `실제 M0609 하드웨어 조그 모드입니다. ${moveLMode ? "MOVEL" : "MOVEJ"}을 누르면 입력한 목표로 즉시 이동합니다.`
       : "MOCK 조그 모드입니다. 화면의 관절값만 변경되며 실제 로봇은 움직이지 않습니다.";
     renderConnection();
     dom.jogModeNotice.style.color = hardware ? "var(--danger)" : "";
@@ -1596,7 +2181,7 @@
       ? capabilities.failed_gates
       : [];
     dom.jogGates.textContent = hardware
-      ? `실제 로봇 gate: 모두 통과\nMOVEJ 속도/가속도: 승인된 ${capabilities.motion_profile_id || "joint_safe"} 프로파일`
+      ? `실제 로봇 gate: 모두 통과\nMOVEJ: ${capabilities.motion_profile_id || "joint_safe"}\nMOVEL: ${capabilities.movel_motion_profile_id || "사용 불가"}\nMOVEL 1회 제한: ${capabilities.maximum_movel_translation_mm || 100} mm / ${capabilities.maximum_movel_rotation_deg || 5}°`
       : `실제 로봇은 비활성화됨${failedGates.length ? `\n닫힌 gate:\n- ${failedGates.join("\n- ")}` : ""}\n현재 조작은 MOCK 전용`;
 
     dom.jogEnable.disabled = busy || enabled || state.apiStatus !== "connected";
@@ -1607,9 +2192,12 @@
     dom.jogEstopReady.disabled = enabled || busy;
     dom.jogDirectMotionAck.disabled = enabled || busy;
     dom.jogStepDeg.disabled = busy;
+    dom.jogLinearStep.disabled = busy;
     dom.jogLoadCurrent.disabled = busy || !payload;
     dom.jogMoveJ.disabled = busy || !enabled;
-    if (document.activeElement?.classList.contains("jog-target-angle")) return;
+    dom.jogLoadCurrentTcp.disabled = busy || !payload;
+    dom.jogMoveL.disabled = busy || !enabled || capabilities.movel_available !== true;
+    if (document.activeElement?.classList.contains("jog-target-input")) return;
     dom.jogJointList.replaceChildren();
     for (let jointIndex = 1; jointIndex <= 6; jointIndex += 1) {
       const row = create("div", { className: "jog-joint" });
@@ -1620,7 +2208,9 @@
         className: "jog-angle",
         text: `현재 ${Number(positions[jointIndex - 1] || 0).toFixed(3)}°`,
       });
-      const target = create("input", { className: "jog-target-angle" });
+      const target = create("input", {
+        className: "jog-target-angle jog-target-input",
+      });
       target.type = "number";
       target.step = "0.1";
       target.inputMode = "decimal";
@@ -1646,6 +2236,58 @@
       row.append(name, currentAngle, target, minus, plus);
       dom.jogJointList.append(row);
     }
+
+    const cartesianLabels = ["X", "Y", "Z", "Rx", "Ry", "Rz"];
+    dom.jogLinearList.replaceChildren();
+    cartesianLabels.forEach((label, index) => {
+      const unit = index < 3 ? "mm" : "deg";
+      const row = create("div", { className: "jog-joint" });
+      const name = create("strong", { text: label });
+      const currentValue = create("span", {
+        className: "jog-angle",
+        text: `현재 ${Number(tcpPose[index] || 0).toFixed(3)} ${unit}`,
+      });
+      const target = create("input", {
+        className: "jog-target-angle jog-target-input",
+      });
+      target.type = "number";
+      target.step = "0.1";
+      target.inputMode = "decimal";
+      target.min = index < 3 ? "-1000" : "-360";
+      target.max = index < 3 ? "1000" : "360";
+      target.value = String(state.jog.targetTcpPose[index]);
+      target.disabled = !enabled || busy;
+      target.setAttribute("aria-label", `${label} 목표 (${unit}, DR_BASE 기준)`);
+      target.addEventListener("input", () => {
+        state.jog.targetTcpPose[index] = target.value;
+        state.jog.targetTcpDirty = true;
+      });
+      const minus = create("button", { className: "button", text: "− 설정" });
+      const plus = create("button", { className: "button", text: "+ 설정" });
+      minus.type = "button";
+      plus.type = "button";
+      minus.disabled = !enabled || busy;
+      plus.disabled = !enabled || busy;
+      minus.addEventListener("click", () => moveJogCartesianAxis(index, -1));
+      plus.addEventListener("click", () => moveJogCartesianAxis(index, 1));
+      row.append(name, currentValue, target, minus, plus);
+      dom.jogLinearList.append(row);
+    });
+  }
+
+  function syncJogTargetsFromStatus({ force = false } = {}) {
+    const positions = state.jog.status?.joint_positions_deg;
+    const tcpPose = state.jog.status?.tcp_pose_base_mm_zyz_deg;
+    if ((force || !state.jog.targetDirty)
+      && Array.isArray(positions) && positions.length === 6) {
+      state.jog.targetPositionsDeg = positions.map(Number);
+      state.jog.targetDirty = false;
+    }
+    if ((force || !state.jog.targetTcpDirty)
+      && Array.isArray(tcpPose) && tcpPose.length === 6) {
+      state.jog.targetTcpPose = tcpPose.map(Number);
+      state.jog.targetTcpDirty = false;
+    }
   }
 
   async function refreshJogStatus({ quiet = false } = {}) {
@@ -1653,10 +2295,7 @@
     try {
       const wasEnabled = state.jog.status?.enabled === true;
       state.jog.status = await api.jogStatus();
-      if (!state.jog.targetDirty
-        && Array.isArray(state.jog.status?.joint_positions_deg)) {
-        state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      }
+      syncJogTargetsFromStatus();
       if (wasEnabled && state.jog.status?.enabled !== true) {
         dom.jogWorkspaceCleared.checked = false;
         dom.jogEstopReady.checked = false;
@@ -1691,8 +2330,7 @@
         estop_ready: true,
         acknowledge_direct_motion: true,
       });
-      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      state.jog.targetDirty = false;
+      syncJogTargetsFromStatus({ force: true });
       const hardware = state.jog.status?.capabilities?.mode === "hardware";
       setBanner(
         hardware ? "실제 로봇 조그가 활성화되었습니다. 로봇 주변에 접근하지 마세요." : "MOCK 조그가 활성화되었습니다.",
@@ -1769,12 +2407,104 @@
     renderJog();
     try {
       state.jog.status = await api.moveJogJoints(targets);
-      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      state.jog.targetDirty = false;
+      syncJogTargetsFromStatus({ force: true });
       setBanner(`MOVEJ 완료 · [${targets.join(", ")}]°`, "ok");
     } catch (error) {
       state.jog.lastError = errorText(error);
       setBanner(`MOVEJ 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.jog.loading = false;
+      renderJog();
+    }
+  }
+
+  function setJogMotionMode(mode) {
+    if (!new Set(["movej", "movel"]).has(mode)) return;
+    state.jog.motionMode = mode;
+    renderJog();
+  }
+
+  function moveJogCartesianAxis(axisIndex, direction) {
+    const step = Number(dom.jogLinearStep.value);
+    if (!Number.isFinite(step) || step < 0.1 || step > 5) {
+      setBanner("MOVEL 설정 간격은 0.1 이상 5 이하여야 합니다.", "danger");
+      return;
+    }
+    const currentTarget = Number(state.jog.targetTcpPose[axisIndex]);
+    const nextTarget = Number((currentTarget + direction * step).toFixed(3));
+    const maximum = axisIndex < 3 ? 1000 : 360;
+    if (!Number.isFinite(nextTarget) || Math.abs(nextTarget) > maximum) {
+      setBanner("MOVEL 목표값이 입력 허용 범위를 벗어납니다.", "danger");
+      return;
+    }
+    state.jog.targetTcpPose[axisIndex] = nextTarget;
+    state.jog.targetTcpDirty = true;
+    renderJog();
+  }
+
+  function loadCurrentJogTcpTarget() {
+    const tcpPose = state.jog.status?.tcp_pose_base_mm_zyz_deg;
+    if (!Array.isArray(tcpPose) || tcpPose.length !== 6) return;
+    state.jog.targetTcpPose = tcpPose.map(Number);
+    state.jog.targetTcpDirty = false;
+    renderJog();
+    setBanner("현재 TCP pose를 MOVEL 목표로 불러왔습니다.");
+  }
+
+  async function executeJogMoveL() {
+    const rawTargets = state.jog.targetTcpPose;
+    const hasBlankTarget = rawTargets?.some(
+      (value) => typeof value === "string" && value.trim() === "",
+    );
+    const targets = rawTargets?.map(Number);
+    if (hasBlankTarget || !Array.isArray(targets) || targets.length !== 6
+      || targets.some((value) => !Number.isFinite(value))) {
+      setBanner("X, Y, Z, Rx, Ry, Rz 목표를 모두 숫자로 입력하세요.", "danger");
+      return;
+    }
+    const current = state.jog.status?.tcp_pose_base_mm_zyz_deg?.map(Number);
+    if (!Array.isArray(current) || current.length !== 6) {
+      setBanner("현재 TCP pose를 읽은 뒤 다시 시도하세요.", "danger");
+      return;
+    }
+    const capabilities = state.jog.status?.capabilities || {};
+    const maximumTranslation = Number(capabilities.maximum_movel_translation_mm || 100);
+    const maximumRotation = Number(capabilities.maximum_movel_rotation_deg || 30);
+    const translation = Math.hypot(
+      targets[0] - current[0],
+      targets[1] - current[1],
+      targets[2] - current[2],
+    );
+    const rotationDeltas = targets.slice(3).map((value, index) => (
+      Math.abs(((value - current[index + 3] + 180) % 360 + 360) % 360 - 180)
+    ));
+    if (translation > maximumTranslation) {
+      setBanner(`MOVEL 1회 이동은 ${maximumTranslation} mm 이하여야 합니다.`, "danger");
+      return;
+    }
+    if (Math.max(...rotationDeltas) > maximumRotation) {
+      setBanner(`MOVEL 1회 자세 변경은 축별 ${maximumRotation}° 이하여야 합니다.`, "danger");
+      return;
+    }
+    const maximumRadius = Number(capabilities.maximum_tcp_base_radius_mm || 1000);
+    if (Math.hypot(targets[0], targets[1], targets[2]) > maximumRadius) {
+      setBanner(`TCP 목표는 base 반경 ${maximumRadius} mm 안이어야 합니다.`, "danger");
+      return;
+    }
+    const hardware = capabilities.mode === "hardware";
+    if (hardware && !window.confirm(
+      `DR_BASE 기준 [${targets.join(", ")}]으로 MOVEL을 실행할까요?`,
+    )) return;
+    state.jog.loading = true;
+    state.jog.lastError = null;
+    renderJog();
+    try {
+      state.jog.status = await api.moveJogLinear(targets);
+      syncJogTargetsFromStatus({ force: true });
+      setBanner(`MOVEL 완료 · [${targets.join(", ")}]`, "ok");
+    } catch (error) {
+      state.jog.lastError = errorText(error);
+      setBanner(`MOVEL 실패: ${errorText(error)}`, "danger");
     } finally {
       state.jog.loading = false;
       renderJog();
@@ -1800,8 +2530,7 @@
     try {
       state.jog.status = await api.stopJog("ui_operator_request");
       state.jog.lastError = null;
-      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      state.jog.targetDirty = false;
+      syncJogTargetsFromStatus({ force: true });
       dom.jogWorkspaceCleared.checked = false;
       dom.jogEstopReady.checked = false;
       dom.jogDirectMotionAck.checked = false;
@@ -2525,6 +3254,30 @@
     renderCreateMode();
   }
 
+  async function startCoordinateGeneration() {
+    if (state.apiStatus !== "connected") return;
+    dom.coordsStart.disabled = true;
+    dom.coordsStatus.textContent = "ditto_ws record_trajectory 시작 중…";
+    try {
+      await api.startDittoCoordinates();
+      setBanner("ditto_ws 좌표 생성을 시작했습니다.", "ok");
+    } catch (error) {
+      setBanner(`좌표 생성 시작 실패: ${errorText(error)}`, "danger");
+    }
+    await refreshCoordinateResults();
+  }
+
+  async function stopCoordinateGeneration() {
+    dom.coordsStop.disabled = true;
+    try {
+      await api.stopDittoCoordinates();
+      setBanner("ditto_ws 좌표 생성을 정지했습니다.", "ok");
+    } catch (error) {
+      setBanner(`좌표 생성 정지 실패: ${errorText(error)}`, "danger");
+    }
+    await refreshCoordinateResults();
+  }
+
   function addSelectedSkillBlock() {
     const primitive = primitiveByOperation(dom.blockOperationSelect.value);
     if (!primitive) return;
@@ -2587,18 +3340,31 @@
   async function createBlockCandidate() {
     const payload = blockEditorPayload();
     if (!payload || !state.editor.blocks.length) return;
-    if (!window.confirm("부모/시연 없이 Mock-only 비활성 Candidate를 생성하고 전체 Mock 회귀 검증을 실행할까요?")) return;
+    const parent = state.editor.loadedParent;
+    const confirmation = parent
+      ? `${parent.id}@${parent.version} 원본은 그대로 두고, 현재 Blockly 내용으로 새 child Candidate를 생성할까요?`
+      : "부모/시연 없이 Mock-only 비활성 Candidate를 생성하고 전체 Mock 회귀 검증을 실행할까요?";
+    if (!window.confirm(confirmation)) return;
     state.editor.loading = true;
     renderSkillBlocks();
-    setBanner("순차 블록 Candidate 컴파일 및 Mock 회귀 검증 중…");
+    setBanner(parent
+      ? `${parent.id}@${parent.version} checksum 확인 및 Blockly child Candidate 생성 중…`
+      : "순차 블록 Candidate 컴파일 및 Mock 회귀 검증 중…");
     try {
-      const result = await api.createSkillBlockCandidate(payload);
+      const result = parent
+        ? await api.createSkillBlockRevisionCandidate(parent.id, parent.version, {
+          ...payload,
+          expected_parent_checksum_sha256: parent.checksum,
+        })
+        : await api.createSkillBlockCandidate(payload);
       dom.blockEditorResult.hidden = false;
       dom.blockEditorResult.textContent = JSON.stringify(result, null, 2);
       await loadRegistry(
-        result.mock_validation_passed
-          ? `${payload.skill_id} Candidate Mock 검증 통과`
-          : `${payload.skill_id} Candidate 저장됨 · Mock 검증 경고를 확인하세요.`,
+        parent && result.parent_unchanged
+          ? `${parent.id} 부모 checksum 보존 · ${result.candidate.version} Blockly Candidate 생성 완료`
+          : result.mock_validation_passed
+            ? `${payload.skill_id} Candidate Mock 검증 통과`
+            : `${payload.skill_id} Candidate 저장됨 · Mock 검증 경고를 확인하세요.`,
       );
       state.selectedKey = `${result.candidate.skill_id}@${result.candidate.version}`;
       showPage("detail");
@@ -2901,6 +3667,7 @@
     state.recordingReview.selectedId = draft.sourceRecordingId;
     state.recordingReview.loaded = false;
     state.recordingReview.draft = null;
+    state.editor.createMode = "recording";
     showPage("create");
   }
 
@@ -2926,6 +3693,7 @@
     state.recordingReview.loaded = false;
     state.recordingReview.frameIndex = useSurfaceHint ? surfaceHint.frameIndex : 0;
     state.recordingReview.draft = null;
+    state.editor.createMode = "recording";
     stopRecordingPlayback();
     showPage("create");
     setBanner(
@@ -3282,6 +4050,8 @@
   dom.stopCamera.addEventListener("click", stopCameraPreview);
   dom.startRecording.addEventListener("click", startCameraRecording);
   dom.stopRecording.addEventListener("click", stopCameraRecording);
+  dom.voiceStart.addEventListener("click", startVoiceRecording);
+  dom.voiceFinish.addEventListener("click", finishVoiceRecording);
   dom.startHandeyeCalibration.addEventListener("click", startHandeyeCalibration);
   dom.abortHandeyeCalibration.addEventListener("click", abortHandeyeCalibration);
   dom.importLegacyHandeye.addEventListener("click", importLegacyHandeyeNpy);
@@ -3290,6 +4060,10 @@
   dom.jogStop.addEventListener("click", stopJog);
   dom.jogLoadCurrent.addEventListener("click", loadCurrentJogTargets);
   dom.jogMoveJ.addEventListener("click", executeJogMoveJ);
+  dom.jogModeMoveJ.addEventListener("click", () => setJogMotionMode("movej"));
+  dom.jogModeMoveL.addEventListener("click", () => setJogMotionMode("movel"));
+  dom.jogLoadCurrentTcp.addEventListener("click", loadCurrentJogTcpTarget);
+  dom.jogMoveL.addEventListener("click", executeJogMoveL);
   dom.arucoExperimentEnable.addEventListener("click", enableArucoExperiment);
   dom.arucoExperimentRefresh.addEventListener(
     "click",
@@ -3328,7 +4102,23 @@
   dom.cancelGeometryTeaching.addEventListener("click", cancelGeometryTeaching);
   dom.recordingSkillForm.addEventListener("submit", createRecordingSkillDraft);
   dom.createRecordingTab.addEventListener("click", () => setCreateMode("recording"));
+  dom.createCoordsTab.addEventListener("click", () => setCreateMode("coords"));
+  dom.createSkillgenTab.addEventListener("click", () => setCreateMode("skillgen"));
   dom.createBlockTab.addEventListener("click", () => setCreateMode("block"));
+  dom.coordsStart.addEventListener("click", startCoordinateGeneration);
+  dom.coordsStop.addEventListener("click", stopCoordinateGeneration);
+  dom.coordsRefresh.addEventListener("click", refreshCoordinateResults);
+  dom.skillgenGenerate.addEventListener("click", () => {
+    setCreateMode("block");
+    setBanner("Blockly에서 승인 primitive를 구성해 Mock-only Candidate를 생성하세요.", "ok");
+  });
+  dom.skillgenRefresh.addEventListener("click", refreshPipelineSkills);
+  dom.skillgenListSelect.addEventListener("change", () => {
+    loadPipelineSkillDetail(dom.skillgenListSelect.value);
+  });
+  dom.loadSkillToBlockly.addEventListener("click", loadExistingSkillToBlockly);
+  dom.newBlockSkill.addEventListener("click", resetBlockEditorForNewSkill);
+  dom.existingSkillSelect.addEventListener("change", renderSkillBlocks);
   dom.addSkillBlock.addEventListener("click", addSelectedSkillBlock);
   dom.previewSkillBlocks.addEventListener("click", previewSkillBlocks);
   dom.createBlockCandidate.addEventListener("click", createBlockCandidate);
@@ -3410,13 +4200,13 @@
       const normal = await resizeCursorImage(
         "assets/metamon_cursor.png",
         1,
-        1
+        5
       );
 
       const hand = await resizeCursorImage(
         "assets/metamon_point.png",
         1,
-        1
+        5
       );
 
       document.body.style.setProperty(
@@ -3485,6 +4275,9 @@
     }
     if (state.page === "aruco-experiment" || state.arucoExperiment.status?.enabled) {
       refreshArucoExperimentStatus({ quiet: true });
+    }
+    if (state.page === "create" && state.editor.createMode === "coords") {
+      refreshCoordinateResults();
     }
   }, 1000);
 })();

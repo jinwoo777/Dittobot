@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -38,6 +39,7 @@ from robot_skill_system.capture.realsense_capture import (
     RealSenseCaptureConfig,
 )
 from robot_skill_system.capture.rgbd_recording import RGBDCameraController
+from robot_skill_system.coordinates.ditto import DittoCoordinateController
 from robot_skill_system.demonstrations.models import (
     DemonstrationTrajectory,
     PoseSample,
@@ -253,6 +255,7 @@ class MVPApplication:
         calibration_controller: HandEyeCalibrationController | None = None,
         jog_controller: JogController | None = None,
         aruco_experiment_controller: ArucoExperimentController | None = None,
+        ditto_coordinate_controller: DittoCoordinateController | None = None,
     ) -> None:
         self.settings = settings
         self.store = LocalArtifactStore(settings.artifact_root)
@@ -285,6 +288,34 @@ class MVPApplication:
             maximum_recording_duration_s=(
                 settings.realsense_maximum_recording_duration_s
             ),
+        )
+        ditto_coordinate_gates = {
+            "ROBOT_EXECUTION_MODE=hardware": (
+                settings.robot_execution_mode is SettingsExecutionMode.HARDWARE
+            ),
+            "ENABLE_HARDWARE_EXECUTION=true": settings.enable_hardware_execution,
+            "ROBOT_BACKEND=doosan": settings.robot_backend == "doosan",
+            "ENABLE_REAL_ROBOT=true": settings.enable_real_robot,
+            "DRY_RUN=false": not settings.dry_run,
+            "ENABLE_DITTO_COORDINATE_CAPTURE=true": (
+                settings.enable_ditto_coordinate_capture
+            ),
+            "DITTO_COORDINATE_CELL_SAFETY_VERIFIED=true": (
+                settings.ditto_coordinate_cell_safety_verified
+            ),
+        }
+        self.ditto_coordinate_controller = (
+            ditto_coordinate_controller
+            or DittoCoordinateController(
+                repository_root=settings.repo_root,
+                workspace_root=(
+                    settings.ditto_workspace_root
+                    or settings.repo_root / "ditto_ws"
+                ),
+                artifact_root=settings.artifact_root,
+                hardware_authorized=settings.ditto_coordinate_hardware_enabled,
+                gate_summary=ditto_coordinate_gates,
+            )
         )
         calibration_gates = {
             "ROBOT_EXECUTION_MODE=hardware": (
@@ -327,14 +358,23 @@ class MVPApplication:
             "ENABLE_WEB_JOG=true": settings.enable_web_jog,
             "JOG_CELL_SAFETY_VERIFIED=true": settings.jog_cell_safety_verified,
         }
-        jog_profile = load_motion_profiles(
+        jog_profiles = load_motion_profiles(
             settings.repo_root / "configs/motion_profiles/default.json"
-        )["joint_safe"]
+        )
+        jog_profile = jog_profiles["joint_safe"]
+        jog_linear_profile = jog_profiles["linear_slow"]
         if (
             jog_profile.joint_velocity_rad_s is None
             or jog_profile.joint_acceleration_rad_s2 is None
         ):
             raise ValueError("joint_safe must define joint velocity and acceleration")
+        if (
+            jog_linear_profile.linear_velocity_m_s is None
+            or jog_linear_profile.linear_acceleration_m_s2 is None
+            or jog_linear_profile.angular_velocity_rad_s is None
+            or jog_linear_profile.angular_acceleration_rad_s2 is None
+        ):
+            raise ValueError("linear_slow must define linear and angular limits")
         use_hardware_jog = settings.jog_hardware_enabled
         self.jog_controller = jog_controller or JogController(
             robot_factory=(
@@ -355,6 +395,22 @@ class MVPApplication:
             ),
             joint_acceleration_rad_s2=(
                 jog_profile.joint_acceleration_rad_s2 * jog_profile.safety_scale
+            ),
+            linear_velocity_m_s=(
+                jog_linear_profile.linear_velocity_m_s
+                * jog_linear_profile.safety_scale
+            ),
+            linear_acceleration_m_s2=(
+                jog_linear_profile.linear_acceleration_m_s2
+                * jog_linear_profile.safety_scale
+            ),
+            angular_velocity_rad_s=(
+                jog_linear_profile.angular_velocity_rad_s
+                * jog_linear_profile.safety_scale
+            ),
+            angular_acceleration_rad_s2=(
+                jog_linear_profile.angular_acceleration_rad_s2
+                * jog_linear_profile.safety_scale
             ),
         )
         aruco_gates = {
@@ -436,6 +492,7 @@ class MVPApplication:
         self.aruco_experiment_controller.close()
         self.jog_controller.close()
         self.calibration_controller.close()
+        self.ditto_coordinate_controller.close()
         self.camera_controller.close()
         self.database.close()
 
@@ -602,6 +659,157 @@ class MVPApplication:
         )
         return status
 
+    def get_ditto_coordinate_status(self) -> dict[str, Any]:
+        return self.ditto_coordinate_controller.status()
+
+    def start_ditto_coordinate_capture(self) -> dict[str, Any]:
+        with self._robot_motion_transition_lock:
+            self._ensure_no_other_robot_motion("start ditto coordinate capture")
+            if self.jog_controller.enabled:
+                raise ValueError("disable web jog before starting coordinate capture")
+            camera_status = self.camera_controller.status()
+            if camera_status.get("state") != "stopped":
+                raise ValueError(
+                    "stop the built-in RealSense preview before starting ditto coordinate capture"
+                )
+            return self.ditto_coordinate_controller.start()
+
+    def stop_ditto_coordinate_capture(self) -> dict[str, Any]:
+        return self.ditto_coordinate_controller.stop()
+
+    def get_latest_ditto_coordinates(self) -> dict[str, Any]:
+        return self.ditto_coordinate_controller.latest()
+
+    def get_ditto_coordinate_json(self, stage: str, filename: str) -> dict[str, Any]:
+        return self.ditto_coordinate_controller.read_json_result(stage, filename)
+
+    def get_ditto_coordinate_image(self, stage: str, filename: str) -> bytes:
+        return self.ditto_coordinate_controller.read_image_result(stage, filename)
+
+    def get_ditto_coordinate_frame(self) -> bytes:
+        return self.ditto_coordinate_controller.read_live_frame()
+
+    def get_monitor_voice_capabilities(self) -> dict[str, Any]:
+        """Return microphone/transcription wiring without constructing a live client."""
+
+        ditto_keyword_source = (
+            self.settings.repo_root
+            / "ditto_ws"
+            / "src"
+            / "ditto_system"
+            / "ditto_system"
+            / "get_keyword.py"
+        )
+        live_mode = self.settings.openai_mode.value == "live"
+        api_key_configured = self.settings.openai_api_key is not None
+        return {
+            "available": not live_mode or api_key_configured,
+            "openai_mode": self.settings.openai_mode.value,
+            "model": self.settings.openai_transcribe_model,
+            "api_key_configured": api_key_configured,
+            "will_contact_openai": live_mode,
+            "explicit_charge_acknowledgement_required": live_mode,
+            "openai_maximum_attempts_per_submission": 1 if live_mode else 0,
+            "openai_retries_disabled": True,
+            "browser_microphone_capture": True,
+            "maximum_audio_bytes": 8 * 1024 * 1024,
+            "accepted_media_types": [
+                "audio/webm",
+                "audio/ogg",
+                "audio/wav",
+                "audio/x-wav",
+                "audio/mpeg",
+                "audio/mp4",
+            ],
+            "ditto_get_keyword_source_present": ditto_keyword_source.is_file(),
+            "ditto_get_keyword_executed": False,
+            "tool_extraction": "deterministic_local_catalog",
+            "automatic_skill_execution": False,
+        }
+
+    @staticmethod
+    def _voice_command_entities(transcript: str) -> dict[str, list[str]]:
+        normalized = transcript.casefold()
+        aliases = {
+            "hammer": ("hammer", "망치", "해머"),
+            "screwdriver": ("screwdriver", "드라이버", "스크루드라이버"),
+            "wrench": ("wrench", "스패너", "렌치"),
+            "brush": ("brush", "솔", "브러시", "붓"),
+        }
+        matches: list[tuple[int, str]] = []
+        for canonical, terms in aliases.items():
+            positions = [normalized.find(term) for term in terms]
+            found = [position for position in positions if position >= 0]
+            if found:
+                matches.append((min(found), canonical))
+        matches.sort()
+        destinations = [
+            destination
+            for destination in ("pos1", "pos2", "pos3")
+            if destination in normalized
+        ]
+        return {
+            "tools": [canonical for _position, canonical in matches],
+            "destinations": destinations,
+        }
+
+    def transcribe_monitor_voice(
+        self,
+        audio: bytes,
+        media_type: str,
+        acknowledge_openai_charges: bool,
+    ) -> dict[str, Any]:
+        """Transcribe one explicit browser recording; never auto-execute its meaning."""
+
+        base_media_type = media_type.split(";", 1)[0].strip().lower()
+        suffixes = {
+            "audio/webm": ".webm",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+        }
+        suffix = suffixes.get(base_media_type)
+        if suffix is None:
+            raise ValueError("unsupported voice audio media type")
+        if len(audio) < 32 or len(audio) > 8 * 1024 * 1024:
+            raise ValueError("voice audio must contain between 32 bytes and 8 MiB")
+        live_mode = self.settings.openai_mode.value == "live"
+        if live_mode and not acknowledge_openai_charges:
+            raise ValueError("live voice transcription requires OpenAI charge acknowledgement")
+        if live_mode and self.settings.openai_api_key is None:
+            raise NotConfiguredError(
+                "OPENAI_API_KEY is required for live voice transcription"
+            )
+
+        from robot_skill_system.openai_integration.transcription import (
+            TranscriptionService,
+        )
+
+        # A monitor-button submission is deliberately single-attempt.  The general
+        # OpenAI client may retry transient failures, but repeating an audio upload
+        # can create unexpected billable requests for an operator.
+        voice_settings = self.settings.model_copy(
+            update={"openai_api_max_retries": 0}
+        )
+        with tempfile.TemporaryDirectory(prefix="robot-skill-system-voice-") as directory:
+            audio_path = Path(directory) / f"monitor_command{suffix}"
+            audio_path.write_bytes(audio)
+            result = TranscriptionService(voice_settings).transcribe(audio_path)
+        entities = self._voice_command_entities(result.text)
+        return {
+            "state": "done",
+            "transcript": result.text,
+            "language": result.language,
+            "duration_s": result.duration_s,
+            "model": result.model,
+            "tools": entities["tools"],
+            "destinations": entities["destinations"],
+            "openai_contacted": live_mode,
+            "automatic_skill_execution": False,
+        }
+
     def get_handeye_calibration_status(self) -> dict[str, Any]:
         return self.calibration_controller.status()
 
@@ -650,6 +858,16 @@ class MVPApplication:
                 target_joint_positions_deg=tuple(float(value) for value in target)
             )
 
+    def move_jog_linear(self, request: dict[str, Any]) -> dict[str, Any]:
+        target = request["target_tcp_pose_base_mm_zyz_deg"]
+        if not isinstance(target, (list, tuple)):
+            raise ValueError("movel target must be a six-value pose")
+        with self._robot_motion_transition_lock:
+            self._ensure_no_other_robot_motion("movel")
+            return self.jog_controller.move_to_cartesian_pose(
+                target_tcp_pose_base_mm_zyz_deg=tuple(float(value) for value in target)
+            )
+
     def stop_jog(self, request: dict[str, Any]) -> dict[str, Any]:
         return self.jog_controller.stop(
             reason=str(request.get("reason") or "operator_request")
@@ -695,6 +913,8 @@ class MVPApplication:
         )
 
     def _ensure_aruco_motion_available(self, action: str) -> None:
+        if self.ditto_coordinate_controller.status().get("running") is True:
+            raise ValueError(f"cannot {action} while ditto coordinate capture is active")
         with self._active_execution_lock:
             if self._active_executions:
                 raise ValueError(f"cannot {action} while a skill execution is active")
@@ -710,6 +930,8 @@ class MVPApplication:
             raise ValueError(f"cannot {action} while hand-eye calibration is active")
 
     def _ensure_no_other_robot_motion(self, action: str) -> None:
+        if self.ditto_coordinate_controller.status().get("running") is True:
+            raise ValueError(f"cannot {action} while ditto coordinate capture is active")
         with self._active_execution_lock:
             if self._active_executions:
                 raise ValueError(f"cannot {action} while a skill execution is active")
@@ -761,6 +983,10 @@ class MVPApplication:
 
     def start_handeye_calibration(self, request: dict[str, Any]) -> dict[str, Any]:
         with self._robot_motion_transition_lock:
+            if self.ditto_coordinate_controller.status().get("running") is True:
+                raise ValueError(
+                    "stop ditto coordinate capture before hand-eye calibration"
+                )
             if self.jog_controller.enabled:
                 raise ValueError("stop and disable jog before starting hand-eye calibration")
             if self.aruco_experiment_controller.enabled:
@@ -796,6 +1022,10 @@ class MVPApplication:
         )
 
     def start_camera_preview(self) -> dict[str, Any]:
+        if self.ditto_coordinate_controller.status().get("running") is True:
+            raise ValueError(
+                "stop ditto coordinate capture before starting RealSense preview"
+            )
         return self.camera_controller.start_preview()
 
     def stop_camera_preview(self) -> dict[str, Any]:
@@ -5174,6 +5404,120 @@ class MVPApplication:
             "promotion_policy": promotion.as_dict(),
         }
 
+    def create_skill_editor_revision_candidate(
+        self,
+        skill_id: str,
+        version: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create a full Blockly child revision without mutating its parent graph."""
+
+        promotion = PromotionPolicy().evaluate_block_candidate(
+            operator_confirmed=request.get("acknowledge_mock_only") is True
+        )
+        if not promotion.eligible:
+            raise ValueError(
+                "block revision Candidate promotion blocked: "
+                + "; ".join(promotion.blockers)
+            )
+        if str(request["skill_id"]) != skill_id:
+            raise ValueError("request skill_id must match the parent skill_id")
+
+        parent = self._find_version(skill_id, version)
+        expected_checksum = str(request["expected_parent_checksum_sha256"])
+        if expected_checksum != parent.graph_checksum_sha256:
+            raise ValueError(
+                "parent SkillGraph checksum changed; reload before editing"
+            )
+        parent_graph = SkillGraph.model_validate(parent.graph_json)
+        if SkillCompiler.graph_checksum(parent_graph) != parent.graph_checksum_sha256:
+            raise ValueError("stored parent SkillGraph checksum verification failed")
+
+        immutable_metadata = {
+            "name": parent_graph.name,
+            "description": parent_graph.description,
+            "skill_type": parent_graph.skill_type.value,
+        }
+        for field_name, expected_value in immutable_metadata.items():
+            supplied_value = request[field_name]
+            if hasattr(supplied_value, "value"):
+                supplied_value = supplied_value.value
+            if str(supplied_value) != expected_value:
+                raise ValueError(
+                    f"{field_name} cannot be changed in a Blockly child revision"
+                )
+
+        candidate_version = self._next_editor_candidate_version(
+            skill_id,
+            parent_version=parent_graph.version,
+        )
+        try:
+            editor_graph = self._build_editor_skill_graph(
+                request,
+                version=candidate_version,
+            )
+            candidate_graph = parent_graph.model_copy(
+                update={
+                    "version": candidate_version,
+                    "parent_version": parent_graph.version,
+                    "required_tools": editor_graph.required_tools,
+                    "required_entity_roles": editor_graph.required_entity_roles,
+                    "bindings": editor_graph.bindings,
+                    "nodes": editor_graph.nodes,
+                    "edges": [],
+                    "start_node": editor_graph.start_node,
+                    "terminal_nodes": editor_graph.terminal_nodes,
+                    "motion_profiles": editor_graph.motion_profiles,
+                    "force_profiles": editor_graph.force_profiles,
+                    "uncertainty": {
+                        **parent_graph.uncertainty,
+                        "authoring_method": "sequential_block_editor_revision",
+                        "blockly_revision": {
+                            "parent_graph_checksum_sha256": expected_checksum,
+                            "original_node_count": len(parent_graph.nodes),
+                            "revised_node_count": len(editor_graph.nodes),
+                        },
+                        "promotion_policy": promotion.as_dict(),
+                    },
+                    "validation_status": ValidationStatus.UNVALIDATED,
+                    "lifecycle_status": SkillLifecycleStatus.CANDIDATE,
+                },
+                deep=True,
+            )
+            row = self._persist_graph(
+                candidate_graph,
+                status="candidate",
+                validation_status="pending",
+                variant=self._skill_variant(parent),
+                parent_version_id=parent.id,
+            )
+        except RobotSkillError as error:
+            raise ValueError(str(error)) from error
+
+        validation = self.validate_skill(
+            skill_id,
+            {"version": row.semantic_version, "mode": "mock"},
+        )
+        unchanged_parent = self._find_version(skill_id, parent.semantic_version)
+        return {
+            "created": True,
+            "skill_id": skill_id,
+            "parent_version": parent.semantic_version,
+            "parent_checksum_sha256": parent.graph_checksum_sha256,
+            "parent_unchanged": (
+                unchanged_parent.graph_checksum_sha256
+                == parent.graph_checksum_sha256
+            ),
+            "candidate": self._version_summary(
+                self._find_version(skill_id, row.semantic_version),
+                include_graph=True,
+            ),
+            "validation": validation,
+            "mock_validation_passed": validation["passed"],
+            "hardware_compatible": False,
+            "promotion_policy": promotion.as_dict(),
+        }
+
     def create_skill_parameter_candidate(
         self,
         skill_id: str,
@@ -6454,6 +6798,8 @@ class MVPApplication:
         return report.as_dict()
 
     def execute_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
+        if self.ditto_coordinate_controller.status().get("running") is True:
+            raise ValueError("stop ditto coordinate capture before executing a skill")
         if self.jog_controller.enabled:
             raise ValueError("stop and disable jog before executing a skill")
         requested_mode = str(request.get("mode", "mock"))
