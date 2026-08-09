@@ -1,0 +1,29 @@
+{
+  "format": "v2",
+  "sequence": [
+    {
+      "move_type": "movel",
+      "vel_mm_s": 15.0,
+      "acc_mm_s2": 15.0,
+      "blend_radius_mm": 0.0,
+      "reasoning": "(GPT 응답 없음/누락 - 기본값 사용)",
+      "source": "default_fallback",
+      "end_pose": {
+        "time": 8.983,
+        "x": 471.2685999999999,
+        "y": -24.10500000000003,
+        "z": 340.02333333333326,
+        "yaw": 75.79173333334575,
+        "gripper": "open"
+      },
+      "via_pose": {
+        "time": 6.01,
+        "x": 431.9031,
+        "y": 136.62786666666665,
+        "z": 369.46489999999994,
+        "yaw": 151.48442297225714,
+        "gripper": "open"
+      }
+    }
+  ]
+}

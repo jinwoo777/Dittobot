@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>ditto_system</name>
+  <version>0.1.0</version>
+  <description>
+    Desktop/test2에서 옮겨온 도구 픽업 + 궤적 재생(실시간 스킬화) + 손 핸드오버 파이프라인.
+    Dittobot의 정식 robot_skill_system과는 별도의 독립 실행 패키지 - 통합 대상 아님.
+  </description>
+  <maintainer email="rokey4090@todo.todo">rokey4090</maintainer>
+  <license>TODO: License declaration</license>
+
+  <depend>rclpy</depend>
+  <depend>std_srvs</depend>
+  <depend>ament_index_python</depend>
+
+  <!--
+    아래는 rosdep으로 안 잡히는 순수 pip 패키지들이라 package.xml에 못 넣는다
+    (설치는 README의 pip install 안내를 따를 것):
+    opencv-python, numpy, pyrealsense2, mediapipe, torch, ultralytics,
+    transformers, Pillow, scipy, python-dotenv, langchain, langchain-openai,
+    openai, pyaudio, pymodbus
+  -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

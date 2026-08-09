@@ -1,6 +1,0 @@
-{
-  "fixture_kind": "expert_wipe",
-  "generator": "generate_expert_wipe_trajectory",
-  "seed": 202,
-  "description": "Fast, smooth, high-confidence repeated surface wipe"
-}

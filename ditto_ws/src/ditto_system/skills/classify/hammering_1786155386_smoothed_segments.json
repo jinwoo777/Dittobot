@@ -1,0 +1,68 @@
+{
+  "source": "/home/rokey/Desktop/Dittobot/ditto_ws/src/ditto_system/skills/smooth/hammering_1786155386_smoothed.json",
+  "segments": [
+    {
+      "index": 0,
+      "type": "line",
+      "start_idx": 0,
+      "end_idx": 7,
+      "point_count": 8,
+      "start_pose": {
+        "time": 0.752,
+        "x": 271.3028,
+        "y": -107.1943,
+        "z": 271.43126666666666,
+        "yaw": -173.6643,
+        "gripper": "open"
+      },
+      "end_pose": {
+        "time": 4.135,
+        "x": 245.62710000000004,
+        "y": 134.4186,
+        "z": 475.9283,
+        "yaw": -162.72131438265924,
+        "gripper": "open"
+      },
+      "via_idx": null,
+      "via_pose": null,
+      "path_length_mm": 379.5,
+      "fit_radius_mm": null,
+      "fit_residual_mm": null
+    },
+    {
+      "index": 1,
+      "type": "arc",
+      "start_idx": 8,
+      "end_idx": 14,
+      "point_count": 7,
+      "start_pose": {
+        "time": 4.633,
+        "x": 247.27123333333338,
+        "y": 185.32143333333332,
+        "z": 478.8459,
+        "yaw": -161.2891097304137,
+        "gripper": "open"
+      },
+      "end_pose": {
+        "time": 7.562,
+        "x": 266.68420000000003,
+        "y": 299.2592,
+        "z": 341.3410333333333,
+        "yaw": -162.74015016274257,
+        "gripper": "open"
+      },
+      "via_idx": 11,
+      "via_pose": {
+        "time": 6.094,
+        "x": 252.24980000000005,
+        "y": 251.16553333333331,
+        "z": 427.32099999999997,
+        "yaw": -160.3840333296399,
+        "gripper": "open"
+      },
+      "path_length_mm": 194.9,
+      "fit_radius_mm": 116.8,
+      "fit_residual_mm": 9.65
+    }
+  ]
+}
