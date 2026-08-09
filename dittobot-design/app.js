@@ -3244,14 +3244,14 @@
     try {
       const normal = await resizeCursorImage(
         "assets/metamon_cursor.png",
-        3,
-        3
+        1,
+        1
       );
 
       const hand = await resizeCursorImage(
         "assets/metamon_point.png",
-        3,
-        3
+        1,
+        1
       );
 
       document.body.style.setProperty(
