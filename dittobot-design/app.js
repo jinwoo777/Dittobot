@@ -1623,7 +1623,7 @@
       ? capabilities.failed_gates
       : [];
     dom.jogGates.textContent = hardware
-      ? `실제 로봇 gate: 모두 통과\nMOVEJ: ${capabilities.motion_profile_id || "joint_safe"}\nMOVEL: ${capabilities.movel_motion_profile_id || "사용 불가"}\nMOVEL 1회 제한: ${capabilities.maximum_movel_translation_mm || 50} mm / ${capabilities.maximum_movel_rotation_deg || 5}°`
+      ? `실제 로봇 gate: 모두 통과\nMOVEJ: ${capabilities.motion_profile_id || "joint_safe"}\nMOVEL: ${capabilities.movel_motion_profile_id || "사용 불가"}\nMOVEL 1회 제한: ${capabilities.maximum_movel_translation_mm || 100} mm / ${capabilities.maximum_movel_rotation_deg || 5}°`
       : `실제 로봇은 비활성화됨${failedGates.length ? `\n닫힌 gate:\n- ${failedGates.join("\n- ")}` : ""}\n현재 조작은 MOCK 전용`;
 
     dom.jogEnable.disabled = busy || enabled || state.apiStatus !== "connected";
@@ -1910,8 +1910,8 @@
       return;
     }
     const capabilities = state.jog.status?.capabilities || {};
-    const maximumTranslation = Number(capabilities.maximum_movel_translation_mm || 50);
-    const maximumRotation = Number(capabilities.maximum_movel_rotation_deg || 5);
+    const maximumTranslation = Number(capabilities.maximum_movel_translation_mm || 100);
+    const maximumRotation = Number(capabilities.maximum_movel_rotation_deg || 30);
     const translation = Math.hypot(
       targets[0] - current[0],
       targets[1] - current[1],
