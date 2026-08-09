@@ -50,6 +50,6 @@ def test_depth_diagnostic_keeps_hardware_target_unresolved() -> None:
         diagnostic.mock_descent_with_corrected_hypothesis_m
         == pytest.approx(
             diagnostic.baseline_descent_m
-            + diagnostic.corrected_sagitta_if_stroke_were_radius_m
+            - diagnostic.corrected_sagitta_if_stroke_were_radius_m
         )
     )

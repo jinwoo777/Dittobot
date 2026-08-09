@@ -6,9 +6,11 @@ import importlib
 import math
 import os
 import sys
+import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from threading import Lock
 from types import ModuleType
 from typing import Any, Protocol, cast, runtime_checkable
 
@@ -40,6 +42,18 @@ def _set_module_attribute(module: ModuleType, name: str, value: Any) -> None:
     """Set a runtime-only vendor module attribute without static stub assumptions."""
 
     setattr(module, name, value)
+
+
+def _empty_pose_response(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, np.ndarray):
+        return value.size == 0
+    return bool(
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes))
+        and len(value) == 0
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +142,9 @@ class DoosanHandEyeCalibrationRobot:
     """Lazily bind the exact DSR functions required by the approved calibration flow."""
 
     adapter_name = "doosan_m0609_handeye"
+    _ACTIVE_TCP_POSE_ATTEMPTS = 3
+    _ACTIVE_TCP_POSE_TIMEOUT_S = 1.0
+    _ACTIVE_TCP_POSE_RETRY_DELAY_S = 0.05
 
     def __init__(
         self,
@@ -147,6 +164,9 @@ class DoosanHandEyeCalibrationRobot:
         self._get_current_posj: Callable[..., Any] | None = None
         self._get_current_tool_flange_posx: Callable[..., Any] | None = None
         self._get_current_posx: Callable[..., Any] | None = None
+        self._current_posx_client: Any | None = None
+        self._current_posx_type: Any | None = None
+        self._current_posx_lock = Lock()
         self._get_tcp: Callable[..., Any] | None = None
         self._get_robot_state: Callable[..., Any] | None = None
         self._movej: Callable[..., Any] | None = None
@@ -275,6 +295,10 @@ class DoosanHandEyeCalibrationRobot:
             self._move_stop_client = node.create_client(
                 self._move_stop_type, "motion/move_stop"
             )
+            self._current_posx_type = service_types["aux_control/get_current_posx"]
+            self._current_posx_client = node.create_client(
+                self._current_posx_type, "aux_control/get_current_posx"
+            )
         except Exception:
             self.disconnect()
             raise
@@ -295,10 +319,13 @@ class DoosanHandEyeCalibrationRobot:
         node, rclpy = self._node, self._rclpy
         self._node = None
         if node is not None:
-            if self._move_stop_client is not None:
-                node.destroy_client(self._move_stop_client)
+            for client in (self._move_stop_client, self._current_posx_client):
+                if client is not None:
+                    node.destroy_client(client)
             self._move_stop_client = None
             self._move_stop_type = None
+            self._current_posx_client = None
+            self._current_posx_type = None
             node.destroy_node()
         if self._owns_rclpy and rclpy is not None and bool(rclpy.ok()):
             rclpy.shutdown()
@@ -317,19 +344,91 @@ class DoosanHandEyeCalibrationRobot:
         return _cartesian_pose_matrix(function(), label="tool flange pose")
 
     def get_base_to_tcp_matrix(self) -> Matrix44:
+        return _cartesian_pose_matrix(
+            self._read_active_tcp_pose(), label="active TCP pose"
+        )
+
+    def _read_active_tcp_pose(self) -> JointVector:
+        with self._current_posx_lock:
+            if (
+                self._rclpy is not None
+                and self._node is not None
+                and self._current_posx_client is not None
+                and self._current_posx_type is not None
+            ):
+                return self._read_active_tcp_pose_service()
+            return self._read_active_tcp_pose_driver()
+
+    def _read_active_tcp_pose_service(self) -> JointVector:
+        rclpy = self._rclpy
+        node = self._node
+        client = self._current_posx_client
+        service_type = self._current_posx_type
+        if rclpy is None or node is None or client is None or service_type is None:
+            raise NotConfiguredError("Doosan active-TCP pose service is not configured")
+        last_error = "empty response"
+        for attempt in range(1, self._ACTIVE_TCP_POSE_ATTEMPTS + 1):
+            request = service_type.Request()
+            request.ref = 0
+            future = client.call_async(request)
+            rclpy.spin_until_future_complete(
+                node,
+                future,
+                timeout_sec=self._ACTIVE_TCP_POSE_TIMEOUT_S,
+            )
+            if not future.done():
+                with suppress(Exception):
+                    future.cancel()
+                last_error = (
+                    f"no response within {self._ACTIVE_TCP_POSE_TIMEOUT_S:g}s"
+                )
+            else:
+                try:
+                    response = future.result()
+                except Exception as exc:
+                    last_error = f"service error: {exc}"
+                else:
+                    task_positions = getattr(response, "task_pos_info", ())
+                    success = getattr(response, "success", False)
+                    if success is True and task_positions:
+                        values = getattr(task_positions[0], "data", ())
+                        if len(values) >= 6:
+                            return _pose_values(
+                                list(values[:6]), label="Doosan active TCP pose"
+                            )
+                    last_error = "controller returned success=false or an empty pose"
+            if attempt < self._ACTIVE_TCP_POSE_ATTEMPTS:
+                time.sleep(self._ACTIVE_TCP_POSE_RETRY_DELAY_S)
+        raise NotConfiguredError(
+            "Doosan active-TCP pose service failed after "
+            f"{self._ACTIVE_TCP_POSE_ATTEMPTS} bounded attempts ({last_error})"
+        )
+
+    def _read_active_tcp_pose_driver(self) -> JointVector:
         function = self._required(self._get_current_posx, "get_current_posx")
-        try:
-            value = function()
-        except IndexError as exc:
-            # DSR_ROBOT2 indexes the service response internally.  Some
-            # controller/ROS timing failures surface as this bare IndexError;
-            # turn it into an actionable API response instead of a 500.
-            raise NotConfiguredError(
-                "Doosan get_current_posx returned an empty active-TCP response; "
-                "wait for the controller pose service and retry"
-            ) from exc
-        pose = value[0] if isinstance(value, tuple) and len(value) == 2 else value
-        return _cartesian_pose_matrix(pose, label="active TCP pose")
+        last_error = "empty response"
+        for attempt in range(1, self._ACTIVE_TCP_POSE_ATTEMPTS + 1):
+            try:
+                value = function()
+                pose = (
+                    value[0]
+                    if isinstance(value, tuple) and len(value) == 2
+                    else value
+                )
+                if _empty_pose_response(pose):
+                    last_error = "empty active-TCP response"
+                    if attempt < self._ACTIVE_TCP_POSE_ATTEMPTS:
+                        time.sleep(self._ACTIVE_TCP_POSE_RETRY_DELAY_S)
+                    continue
+                return _pose_values(pose, label="Doosan active TCP pose")
+            except IndexError:
+                last_error = "empty active-TCP response"
+            if attempt < self._ACTIVE_TCP_POSE_ATTEMPTS:
+                time.sleep(self._ACTIVE_TCP_POSE_RETRY_DELAY_S)
+        raise NotConfiguredError(
+            "Doosan get_current_posx failed after "
+            f"{self._ACTIVE_TCP_POSE_ATTEMPTS} bounded attempts ({last_error})"
+        )
 
     def get_active_tcp_name(self) -> str:
         function = self._required(self._get_tcp, "get_tcp")

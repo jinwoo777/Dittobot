@@ -90,6 +90,12 @@ class Settings(BaseModel):
     )
     aruco_fixed_reference_npz: Path
     aruco_runtime_workspace_npz: Path
+    live_object_detector_weights_path: Path
+    live_grasp_profile_path: Path
+    live_object_detection_confidence: float = Field(default=0.60, gt=0.0, le=1.0)
+    live_pick_pregrasp_distance_m: float = Field(default=0.050, ge=0.010, le=0.150)
+    live_pick_grasp_depth_offset_m: float = Field(default=-0.005, ge=-0.010, le=0.010)
+    live_pick_workspace_xy_tolerance_m: float = Field(default=0.001, ge=0.0, le=0.003)
     doosan_robot_id: str = Field(default="dsr01", pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
     doosan_robot_model: Literal["m0609"] = "m0609"
     rg2_modbus_host: str = Field(default="192.168.1.1", min_length=1, max_length=255)
@@ -124,6 +130,8 @@ class Settings(BaseModel):
         "artifact_root",
         "aruco_fixed_reference_npz",
         "aruco_runtime_workspace_npz",
+        "live_object_detector_weights_path",
+        "live_grasp_profile_path",
     )
     @classmethod
     def _absolute_path(cls, value: Path) -> Path:
@@ -174,6 +182,8 @@ class Settings(BaseModel):
         for path in (
             self.aruco_fixed_reference_npz,
             self.aruco_runtime_workspace_npz,
+            self.live_object_detector_weights_path,
+            self.live_grasp_profile_path,
         ):
             if not (
                 path == self.repo_root
@@ -181,7 +191,9 @@ class Settings(BaseModel):
                 or path == self.artifact_root
                 or path.is_relative_to(self.artifact_root)
             ):
-                raise ValueError("ArUco workspace paths must stay under repo or artifact root")
+                raise ValueError(
+                    "ArUco/live-perception paths must stay under repo or artifact root"
+                )
         if self.aruco_fixed_reference_npz == self.aruco_runtime_workspace_npz:
             raise ValueError("ArUco fixed reference and runtime workspace paths must differ")
         return self
@@ -225,6 +237,16 @@ class Settings(BaseModel):
         ).expanduser()
         if not aruco_runtime_path.is_absolute():
             aruco_runtime_path = resolved_root / aruco_runtime_path
+        detector_path = Path(
+            env.get("LIVE_OBJECT_DETECTOR_WEIGHTS", "data/models/yolov8n_tools_0122.pt")
+        ).expanduser()
+        if not detector_path.is_absolute():
+            detector_path = resolved_root / detector_path
+        grip_profile_path = Path(
+            env.get("LIVE_GRASP_PROFILE", "configs/grasp_profiles/hammer_live_grasp.json")
+        ).expanduser()
+        if not grip_profile_path.is_absolute():
+            grip_profile_path = resolved_root / grip_profile_path
         raw_key = env.get("OPENAI_API_KEY", "").strip()
         image_detail = env.get("OPENAI_IMAGE_DETAIL", "auto").lower()
         if image_detail not in {"auto", "low", "high"}:
@@ -294,6 +316,20 @@ class Settings(BaseModel):
             ),
             aruco_fixed_reference_npz=aruco_reference_path.resolve(),
             aruco_runtime_workspace_npz=aruco_runtime_path.resolve(),
+            live_object_detector_weights_path=detector_path.resolve(),
+            live_grasp_profile_path=grip_profile_path.resolve(),
+            live_object_detection_confidence=float(
+                env.get("LIVE_OBJECT_DETECTION_CONFIDENCE", "0.60")
+            ),
+            live_pick_pregrasp_distance_m=float(
+                env.get("LIVE_PICK_PREGRASP_DISTANCE_M", "0.050")
+            ),
+            live_pick_grasp_depth_offset_m=float(
+                env.get("LIVE_PICK_GRASP_DEPTH_OFFSET_M", "-0.005")
+            ),
+            live_pick_workspace_xy_tolerance_m=float(
+                env.get("LIVE_PICK_WORKSPACE_XY_TOLERANCE_M", "0.001")
+            ),
             doosan_robot_id=env.get("DOOSAN_ROBOT_ID", "dsr01"),
             doosan_robot_model=cast(
                 Literal["m0609"], env.get("DOOSAN_ROBOT_MODEL", "m0609").lower()
@@ -372,6 +408,14 @@ class Settings(BaseModel):
             "aruco_experiment_expected_tcp": self.aruco_experiment_expected_tcp,
             "aruco_fixed_reference_npz": str(self.aruco_fixed_reference_npz),
             "aruco_runtime_workspace_npz": str(self.aruco_runtime_workspace_npz),
+            "live_object_detector_weights_path": str(self.live_object_detector_weights_path),
+            "live_grasp_profile_path": str(self.live_grasp_profile_path),
+            "live_object_detection_confidence": self.live_object_detection_confidence,
+            "live_pick_pregrasp_distance_m": self.live_pick_pregrasp_distance_m,
+            "live_pick_grasp_depth_offset_m": self.live_pick_grasp_depth_offset_m,
+            "live_pick_workspace_xy_tolerance_m": (
+                self.live_pick_workspace_xy_tolerance_m
+            ),
             "doosan_robot_id": self.doosan_robot_id,
             "doosan_robot_model": self.doosan_robot_model,
             "handeye_legacy_npy_configured": self.handeye_legacy_npy_path is not None,

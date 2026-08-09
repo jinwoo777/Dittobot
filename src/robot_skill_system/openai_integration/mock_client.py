@@ -119,8 +119,20 @@ class MockOpenAIClient:
         """Return a deterministic non-executable draft for offline UI/tests."""
 
         lowered = request.operator_instruction.lower()
+        hammer_task = any(
+            token in lowered for token in ("hammer", "해머", "망치")
+        )
         preferred_operations = (
-            ["motion.move_l", "contact.search_surface", "contact.follow_path"]
+            [
+                "gripper.open",
+                "motion.rotate_joint_6_relative",
+                "motion.move_l",
+                "gripper.move_width",
+                "motion.move_l",
+                "gripper.open",
+            ]
+            if hammer_task
+            else ["motion.move_l", "contact.search_surface", "contact.follow_path"]
             if "닦" in request.operator_instruction or "wipe" in lowered
             else ["motion.move_l"]
         )
@@ -131,7 +143,11 @@ class MockOpenAIClient:
         ]
         if not operations:
             operations = [request.primitive_catalog[0]]
-        preferred_roles = ["tool", "target_surface"]
+        preferred_roles = (
+            ["tool", "target_object", "target_surface"]
+            if hammer_task
+            else ["tool", "target_surface"]
+        )
         roles = [role for role in preferred_roles if role in request.entity_role_catalog]
         if not roles:
             roles = [request.entity_role_catalog[0]]
@@ -200,7 +216,13 @@ class MockOpenAIClient:
                 ),
                 tool=ToolShapeObservation(
                     detected="tool" in roles,
-                    shape="wiper" if "tool" in roles else "not_detected",
+                    shape=(
+                        "gripper"
+                        if hammer_task and "tool" in roles
+                        else "wiper"
+                        if "tool" in roles
+                        else "not_detected"
+                    ),
                     representative_frame_index=representative_index,
                     region_normalized=(
                         NormalizedImageRegion(
@@ -210,19 +232,31 @@ class MockOpenAIClient:
                         else None
                     ),
                     description=(
-                        "Mock elongated wiping tool."
+                        "Mock two-finger gripper proxy."
+                        if hammer_task and "tool" in roles
+                        else "Mock elongated wiping tool."
                         if "tool" in roles
                         else "No separate tool is visible."
                     ),
                     confidence=0.75,
                 ),
                 target_object=TargetObjectObservation(
-                    detected=False,
-                    class_name=None,
+                    detected=hammer_task,
+                    class_name="hammer" if hammer_task else None,
                     representative_frame_index=representative_index,
-                    region_normalized=None,
-                    description="No separate target object is required for the mock surface task.",
-                    confidence=0.7,
+                    region_normalized=(
+                        NormalizedImageRegion(
+                            x_min=0.35, y_min=0.45, x_max=0.75, y_max=0.80
+                        )
+                        if hammer_task
+                        else None
+                    ),
+                    description=(
+                        "Mock hammer target on the work surface."
+                        if hammer_task
+                        else "No separate target object is required for the mock surface task."
+                    ),
+                    confidence=0.8 if hammer_task else 0.7,
                 ),
                 work_surface=WorkSurfaceObservation(
                     detected=True,

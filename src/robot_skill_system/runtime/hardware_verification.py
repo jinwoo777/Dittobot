@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import math
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from typing import Any
 
@@ -10,6 +11,8 @@ from robot_skill_system.runtime.binder import EntityBinder
 from robot_skill_system.runtime.models import BoundTargetPose, ObstacleObservation, ValidationCheck
 from robot_skill_system.runtime.preflight import MockGeometryValidator
 from robot_skill_system.runtime.scene_monitor import CameraSceneMonitor
+
+HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS = 1_800_000
 
 
 def _walk_bound_poses(value: Any) -> list[BoundTargetPose]:
@@ -33,10 +36,17 @@ class DoosanFixedPlaneGeometryValidator(MockGeometryValidator):
 
     is_mock = False
 
-    def __init__(self, robot: Any, *, minimum_clearance_m: float = 0.0) -> None:
+    def __init__(
+        self,
+        robot: Any,
+        *,
+        minimum_clearance_m: float = 0.0,
+        validate_tcp_target: Callable[[BoundTargetPose], None] | None = None,
+    ) -> None:
         super().__init__(minimum_clearance_m=minimum_clearance_m)
         self.robot = robot
         self._runtime_binder = EntityBinder()
+        self._validate_tcp_target = validate_tcp_target
 
     def validate(
         self, *, skill: Any, scene: Any, bindings: Mapping[str, Any]
@@ -49,11 +59,24 @@ class DoosanFixedPlaneGeometryValidator(MockGeometryValidator):
             else "taught anchor-relative path stays inside the acknowledged fixed workspace"
         )
         targets: list[BoundTargetPose] = []
+        relative_j6_checks = 0
         try:
+            joint_positions = tuple(float(value) for value in self.robot.get_joint_positions())
+            if len(joint_positions) != 6 or any(
+                not math.isfinite(value) for value in joint_positions
+            ):
+                raise ValueError("Doosan did not return six finite joint positions")
             for node in getattr(skill, "nodes", ()):
                 arguments = self._runtime_binder.bind_arguments(
                     node.arguments, scene=scene, bindings=bindings
                 )
+                if node.operation == "motion.rotate_joint_6_relative":
+                    delta_rad = float(arguments["delta_rad"])
+                    joint_6_target_rad = joint_positions[5] + delta_rad
+                    if not -2.0 * math.pi <= joint_6_target_rad <= 2.0 * math.pi:
+                        raise ValueError("relative J6 target exceeds M0609 J6 limits")
+                    joint_positions = (*joint_positions[:5], joint_6_target_rad)
+                    relative_j6_checks += 1
                 node_targets = _walk_bound_poses(arguments)
                 if len(node_targets) > 3:
                     node_targets = [
@@ -63,9 +86,14 @@ class DoosanFixedPlaneGeometryValidator(MockGeometryValidator):
                     ]
                 targets.extend(node_targets)
             for target in targets:
+                if self._validate_tcp_target is not None:
+                    self._validate_tcp_target(target)
                 self.robot.solve_inverse_kinematics(target)
             ik_passed = bool(targets)
-            ik_detail = f"live Doosan IK accepted {len(targets)} bound Cartesian targets"
+            ik_detail = (
+                f"live Doosan IK accepted {len(targets)} bound Cartesian targets and "
+                f"{relative_j6_checks} relative J6 targets"
+            )
         except Exception as exc:
             ik_passed = False
             ik_detail = f"live Doosan IK rejected a bound target: {exc}"
@@ -113,4 +141,5 @@ __all__ = [
     "DoosanFixedPlaneGeometryValidator",
     "DoosanStateMonitor",
     "FixedReferenceSceneMonitor",
+    "HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS",
 ]

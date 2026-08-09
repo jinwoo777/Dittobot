@@ -23,8 +23,17 @@ api = [
   "python-multipart>=0.0.9,<1",
   "uvicorn>=0.30,<1",
 ]
-vision = ["mediapipe>=0.10,<1", "opencv-python-headless>=4.8,<5", "scipy>=1.10,<2"]
-perception = ["opencv-python-headless>=4.8,<5", "scipy>=1.10,<2"]
+vision = [
+  "mediapipe>=0.10,<1",
+  "opencv-python-headless>=4.8,<5",
+  "scipy>=1.10,<2",
+  "ultralytics>=8.3,<9",
+]
+perception = [
+  "opencv-python-headless>=4.8,<5",
+  "scipy>=1.10,<2",
+  "ultralytics>=8.3,<9",
+]
 realsense = [
   "opencv-python-headless>=4.8,<5",
   "pyrealsense2>=2.58,<2.59",

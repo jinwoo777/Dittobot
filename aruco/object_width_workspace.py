@@ -13,13 +13,20 @@ The fixed plane has ``z=0`` on the measured table, ``+Z`` toward the reference
 camera/away from the table, and decreasing Z toward the table.
 
 The Z bounds constrain the *TCP origin*, with the gripper orientation and TCP
-definition assumed unchanged from the validated reference geometry:
+definition assumed unchanged from the validated reference geometry.  For the
+default full-opening model, ``w`` is the full object width, so each symmetric
+side of the gripper spans ``w/2``:
 
-    theta          = asin(w/R)                  (default)
-    opening_offset = R * (1 - cos(theta))
-    allowed_down   = 0.184 + opening_offset - safety_margin
-    z_max          = frozen reference-camera origin plane-Z
-    z_min          = reference TCP plane-Z - allowed_down
+    theta                  = asin((w/2)/R)
+    opening_offset         = R * (1 - cos(theta))
+    geometric_allowed_down = 0.184 - opening_offset
+    safe_allowed_down      = geometric_allowed_down - safety_margin
+    z_max                  = frozen reference-camera origin plane-Z
+    z_min                  = reference TCP plane-Z - safe_allowed_down
+
+Thus ``0.184 - opening_offset`` is the requested geometric descent formula.
+The pre-existing safety margin remains a separate conservative reduction of
+that descent and is the predicted residual tip clearance at ``z_min``.
 
 The optional legacy model uses ``theta = asin(2*w/R)``.  Invalid or unsafe
 targets are rejected; this module never clamps or projects a point into range.
@@ -101,10 +108,20 @@ class RuntimeWorkspace:
         return math.degrees(self.theta_rad)
 
     @property
+    def object_half_width_mm(self) -> float:
+        """One symmetric gripper-side span for the full object opening."""
+        return self.object_width_mm / 2.0
+
+    @property
+    def geometric_allowed_down_from_reference_m(self) -> float:
+        """Requested 184 mm minus opening-offset descent before safety margin."""
+        return self.closed_tip_clearance_m - self.opening_offset_m
+
+    @property
     def predicted_tip_clearance_at_z_min_m(self) -> float:
         return (
             self.closed_tip_clearance_m
-            + self.opening_offset_m
+            - self.opening_offset_m
             - self.allowed_down_from_reference_m
         )
 
@@ -730,7 +747,13 @@ def _validated_reference_snapshot(
 
 
 def width_to_theta_rad(width_mm: float, radius_m: float, model: str) -> float:
-    """Convert object width to theta on the principal physical branch [0, pi/2]."""
+    """Convert object width to theta on the principal physical branch [0, pi/2].
+
+    ``full-opening`` treats ``width_mm`` as the complete symmetric object
+    opening and therefore uses its half-width: ``sin(theta)=(width/2)/R``.
+    The legacy model intentionally retains its historical ``2*width/R`` ratio
+    only for old artifacts and remains explicitly selected by name.
+    """
     width_mm = _finite_scalar(width_mm, "object width in mm")
     radius_m = _finite_scalar(radius_m, "gripper radius in m")
     if width_mm < 0.0:
@@ -741,11 +764,15 @@ def width_to_theta_rad(width_mm: float, radius_m: float, model: str) -> float:
         raise ValueError(f"Unknown width model: {model}")
 
     radius_mm = radius_m * 1000.0
-    ratio = width_mm / radius_mm
-    if model == "legacy-half-factor":
-        ratio *= 2.0
+    ratio = (
+        (width_mm / 2.0) / radius_mm
+        if model == "full-opening"
+        else (2.0 * width_mm) / radius_mm
+    )
     if ratio > 1.0:
-        maximum_width_mm = radius_mm if model == "full-opening" else radius_mm / 2.0
+        maximum_width_mm = (
+            2.0 * radius_mm if model == "full-opening" else radius_mm / 2.0
+        )
         raise ValueError(
             f"Width {width_mm:.6g} mm exceeds the {model} model maximum "
             f"{maximum_width_mm:.6g} mm"
@@ -772,9 +799,17 @@ def build_runtime_workspace(
     if not 0.0 <= safety_margin_m < closed_tip_clearance_m:
         raise ValueError("Safety margin must satisfy 0 <= margin < closed tip clearance")
 
-    allowed_down_m = closed_tip_clearance_m + opening_offset_m - safety_margin_m
+    geometric_allowed_down_m = closed_tip_clearance_m - opening_offset_m
+    if (
+        not math.isfinite(geometric_allowed_down_m)
+        or geometric_allowed_down_m <= 0.0
+    ):
+        raise ValueError("Computed geometric downward allowance must be finite and positive")
+    allowed_down_m = geometric_allowed_down_m - safety_margin_m
     if not math.isfinite(allowed_down_m) or allowed_down_m <= 0.0:
-        raise ValueError("Computed downward allowance must be finite and positive")
+        raise ValueError(
+            "Computed safety-margined downward allowance must be finite and positive"
+        )
 
     tcp_reference_plane_xyz_m = _finite_array(
         reference["tcp_reference_plane_xyz_m"],
@@ -1001,8 +1036,14 @@ def check_tcp_point_plane(
     reference: dict[str, object],
     runtime: RuntimeWorkspace,
     tcp_point_plane_m: np.ndarray,
+    *,
+    xy_tolerance_m: float = BOUNDARY_TOLERANCE_M,
 ) -> tuple[bool, dict[str, object]]:
     """Check one TCP origin already expressed in the fixed plane frame."""
+    if not math.isfinite(xy_tolerance_m) or xy_tolerance_m < 0.0:
+        return False, _invalid_point_details(
+            "fixed_aruco_plane", "TCP target XY tolerance must be finite and >= 0"
+        )
     try:
         reference = _validated_reference_snapshot(reference)
         runtime = _validated_runtime_workspace(reference, runtime)
@@ -1026,14 +1067,14 @@ def check_tcp_point_plane(
         return False, details
 
     signed_xy_distance_m = _minimum_signed_boundary_distance_m(point[:2], polygon)
-    inside_xy = signed_xy_distance_m >= -BOUNDARY_TOLERANCE_M
+    inside_xy = signed_xy_distance_m >= -xy_tolerance_m
     distance_to_lower_z_m = float(point[2] - runtime.z_min_plane_m)
     distance_to_upper_z_m = float(runtime.z_max_plane_m - point[2])
     above_lower_z = distance_to_lower_z_m >= -BOUNDARY_TOLERANCE_M
     below_camera_z = distance_to_upper_z_m >= -BOUNDARY_TOLERANCE_M
     predicted_tip_clearance_m = (
         runtime.closed_tip_clearance_m
-        + runtime.opening_offset_m
+        - runtime.opening_offset_m
         + float(point[2] - runtime.z_reference_tcp_plane_m)
     )
 
@@ -1059,6 +1100,7 @@ def check_tcp_point_plane(
         "z_max_plane_m": runtime.z_max_plane_m,
         "z_reference_tcp_plane_m": runtime.z_reference_tcp_plane_m,
         "minimum_signed_xy_boundary_distance_m": signed_xy_distance_m,
+        "xy_tolerance_m": xy_tolerance_m,
         "distance_to_lower_z_m": distance_to_lower_z_m,
         "distance_to_upper_z_m": distance_to_upper_z_m,
         "predicted_tip_clearance_m": predicted_tip_clearance_m,
@@ -1310,13 +1352,29 @@ def save_runtime_npz(
                 polygon_minimum_width_m
             ),
             "object_width_mm": np.asarray(runtime.object_width_mm),
+            "object_half_width_mm": np.asarray(runtime.object_half_width_mm),
             "width_model": np.asarray(runtime.width_model),
+            "width_to_theta_formula": np.asarray(
+                "sin(theta)=(object_width_mm/2)/gripper_radius_mm"
+                if runtime.width_model == "full-opening"
+                else "legacy: sin(theta)=2*object_width_mm/gripper_radius_mm"
+            ),
             "theta_rad": np.asarray(runtime.theta_rad),
             "theta_deg": np.asarray(runtime.theta_deg),
             "gripper_radius_m": np.asarray(runtime.gripper_radius_m),
             "opening_offset_m": np.asarray(runtime.opening_offset_m),
             "closed_tip_clearance_m": np.asarray(runtime.closed_tip_clearance_m),
             "safety_margin_m": np.asarray(runtime.safety_margin_m),
+            "geometric_allowed_down_from_reference_m": np.asarray(
+                runtime.geometric_allowed_down_from_reference_m
+            ),
+            "geometric_allowed_down_formula": np.asarray(
+                "closed_tip_clearance_m - opening_offset_m"
+            ),
+            "safety_margin_application": np.asarray(
+                "allowed_down_from_reference_m = "
+                "geometric_allowed_down_from_reference_m - safety_margin_m"
+            ),
             "allowed_down_from_reference_m": np.asarray(
                 runtime.allowed_down_from_reference_m
             ),
@@ -1503,12 +1561,16 @@ def _runtime_summary(
         "reference_joint_deg": np.asarray(reference["reference_joint_deg"]).tolist(),
         "frame": str(reference["frame_name"]),
         "object_width_mm": runtime.object_width_mm,
+        "object_half_width_mm": runtime.object_half_width_mm,
         "width_model": runtime.width_model,
         "theta_deg": runtime.theta_deg,
         "gripper_radius_mm": runtime.gripper_radius_m * 1000.0,
         "opening_offset_mm": runtime.opening_offset_m * 1000.0,
         "closed_tip_clearance_mm": runtime.closed_tip_clearance_m * 1000.0,
         "safety_margin_mm": runtime.safety_margin_m * 1000.0,
+        "geometric_allowed_down_from_reference_mm": (
+            runtime.geometric_allowed_down_from_reference_m * 1000.0
+        ),
         "allowed_down_from_reference_mm": (
             runtime.allowed_down_from_reference_m * 1000.0
         ),

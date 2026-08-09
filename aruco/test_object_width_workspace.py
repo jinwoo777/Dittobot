@@ -152,18 +152,20 @@ def _create_frozen_reference(root: Path) -> tuple[Path, Path, Path]:
 class WidthGeometryTests(unittest.TestCase):
     def test_width_models_and_numeric_formula(self) -> None:
         theta = workspace.width_to_theta_rad(80.0, 0.110, "full-opening")
-        expected_theta = math.asin(80.0 / 110.0)
+        expected_theta = math.asin((80.0 / 2.0) / 110.0)
         self.assertAlmostEqual(theta, expected_theta, places=14)
 
         legacy_theta = workspace.width_to_theta_rad(
             40.0, 0.110, "legacy-half-factor"
         )
-        self.assertAlmostEqual(legacy_theta, expected_theta, places=14)
+        self.assertAlmostEqual(
+            legacy_theta, math.asin((2.0 * 40.0) / 110.0), places=14
+        )
         self.assertEqual(
             workspace.width_to_theta_rad(0.0, 0.110, "full-opening"), 0.0
         )
         self.assertAlmostEqual(
-            workspace.width_to_theta_rad(110.0, 0.110, "full-opening"),
+            workspace.width_to_theta_rad(220.0, 0.110, "full-opening"),
             math.pi / 2.0,
         )
         self.assertAlmostEqual(
@@ -176,10 +178,10 @@ class WidthGeometryTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 workspace.width_to_theta_rad(value, 0.110, "full-opening")
         with self.assertRaises(ValueError):
-            workspace.width_to_theta_rad(110.001, 0.110, "full-opening")
+            workspace.width_to_theta_rad(220.001, 0.110, "full-opening")
         with self.assertRaises(ValueError):
             workspace.width_to_theta_rad(
-                math.nextafter(110.0, math.inf), 0.110, "full-opening"
+                math.nextafter(220.0, math.inf), 0.110, "full-opening"
             )
         with self.assertRaises(ValueError):
             workspace.width_to_theta_rad(55.001, 0.110, "legacy-half-factor")
@@ -191,10 +193,17 @@ class WidthGeometryTests(unittest.TestCase):
     def test_runtime_z_bounds_preserve_five_mm_tip_clearance(self) -> None:
         reference = _memory_reference()
         runtime = workspace.build_runtime_workspace(reference, 80.0)
-        expected_theta = math.asin(80.0 / 110.0)
+        expected_theta = math.asin((80.0 / 2.0) / 110.0)
         expected_offset_m = 0.110 * (1.0 - math.cos(expected_theta))
-        expected_allowed_m = 0.184 + expected_offset_m - 0.005
+        expected_geometric_allowed_m = 0.184 - expected_offset_m
+        expected_allowed_m = expected_geometric_allowed_m - 0.005
+        self.assertAlmostEqual(runtime.object_half_width_mm, 40.0, places=14)
         self.assertAlmostEqual(runtime.opening_offset_m, expected_offset_m, places=14)
+        self.assertAlmostEqual(
+            runtime.geometric_allowed_down_from_reference_m,
+            expected_geometric_allowed_m,
+            places=14,
+        )
         self.assertAlmostEqual(
             runtime.allowed_down_from_reference_m, expected_allowed_m, places=14
         )
@@ -206,6 +215,17 @@ class WidthGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(
             runtime.predicted_tip_clearance_at_z_min_m, 0.005, places=14
         )
+
+    def test_wider_object_reduces_descent_and_raises_tcp_lower_bound(self) -> None:
+        reference = _memory_reference()
+        narrow = workspace.build_runtime_workspace(reference, 20.0)
+        wide = workspace.build_runtime_workspace(reference, 110.0)
+
+        self.assertLess(
+            wide.allowed_down_from_reference_m,
+            narrow.allowed_down_from_reference_m,
+        )
+        self.assertGreater(wide.z_min_plane_m, narrow.z_min_plane_m)
 
 
 class PolygonAndTargetTests(unittest.TestCase):
@@ -250,6 +270,12 @@ class PolygonAndTargetTests(unittest.TestCase):
             )
             self.assertTrue(safe, details)
             self.assertFalse(details["target_was_clamped"])
+            if z_m == self.runtime.z_min_plane_m:
+                self.assertAlmostEqual(
+                    float(details["predicted_tip_clearance_m"]),
+                    self.runtime.safety_margin_m,
+                    places=14,
+                )
         above_tcp_safe, above_tcp_details = workspace.check_tcp_point_plane(
             self.reference, self.runtime, np.asarray([0.0, 0.0, 0.300])
         )
@@ -374,8 +400,17 @@ class FrozenArtifactTests(unittest.TestCase):
             workspace.save_runtime_npz(runtime_path, reference, runtime_80)
             with np.load(runtime_path, allow_pickle=False) as runtime_npz:
                 self.assertEqual(float(runtime_npz["object_width_mm"]), 80.0)
+                self.assertEqual(float(runtime_npz["object_half_width_mm"]), 40.0)
                 self.assertTrue(bool(runtime_npz["usable_for_target_validation"]))
                 self.assertFalse(bool(runtime_npz["unsafe_targets_are_clamped"]))
+                self.assertEqual(
+                    str(runtime_npz["width_to_theta_formula"]),
+                    "sin(theta)=(object_width_mm/2)/gripper_radius_mm",
+                )
+                self.assertAlmostEqual(
+                    float(runtime_npz["geometric_allowed_down_from_reference_m"]),
+                    runtime_80.geometric_allowed_down_from_reference_m,
+                )
                 np.testing.assert_allclose(
                     runtime_npz["workspace_safe_boundary_plane_xy"],
                     reference["workspace_xy_m"],

@@ -1,0 +1,16 @@
+{
+  "schema_version": "local-live-grasp/1.0",
+  "class_name": "hammer",
+  "normalized_grasp_point": {
+    "longitudinal": -0.7177469962321966,
+    "lateral": -0.02119294830315273
+  },
+  "jaw_relative_angle_deg": 66.46773154210925,
+  "target_gripper_width_m": 0.021576227217825573,
+  "source": {
+    "artifact": "data/test/grip_point/result.json",
+    "aggregation": "coordinate-wise median and doubled-angle circular mean",
+    "independent_training_cases": 2,
+    "note": "Local grasp parameters; mock-validated only until a physical pick verification is recorded."
+  }
+}

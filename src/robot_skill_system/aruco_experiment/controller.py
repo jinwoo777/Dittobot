@@ -322,10 +322,9 @@ class DoosanArucoExperimentRobot(DoosanHandEyeCalibrationRobot):
         super().disconnect()
 
     def get_tcp_pose_base_mm_zyz_deg(self) -> CartesianPose:
-        function = self._required(self._get_current_posx, "get_current_posx")
-        value = function()
-        candidate = value[0] if isinstance(value, tuple) and len(value) == 2 else value
-        return _pose_values(candidate, label="Doosan active TCP pose")
+        return _pose_values(
+            self._read_active_tcp_pose(), label="Doosan active TCP pose"
+        )
 
     def _call_service(self, client: Any, request: Any, *, label: str, timeout_s: float) -> Any:
         if self._rclpy is None or self._node is None or client is None:
@@ -481,6 +480,12 @@ class ArucoExperimentController:
         self._last_action: str | None = None
         self._last_action_at_ns: int | None = None
         self._last_error: str | None = None
+        # Browser status polling must never start a second global rclpy spin
+        # while preflight or a motion service is awaiting its response.  These
+        # values are refreshed by the serialized enable/reference/+Z actions.
+        self._last_joint_positions_deg: list[float] | None = None
+        self._last_tcp_base_xyz_m: list[float] | None = None
+        self._last_active_tcp_name: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -530,20 +535,6 @@ class ArucoExperimentController:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            joints_deg: list[float] | None = None
-            tcp_base_xyz_m: list[float] | None = None
-            active_tcp_name: str | None = None
-            if self._enabled and self._robot is not None:
-                try:
-                    joints = self._robot.get_joint_positions_rad()
-                    joints_deg = [round(math.degrees(value), 4) for value in joints]
-                    tcp = _rigid_matrix(
-                        self._robot.get_base_to_tcp_matrix(), label="T_base_tcp feedback"
-                    )
-                    tcp_base_xyz_m = _point_from_transform(tcp).tolist()
-                    active_tcp_name = self._robot.get_active_tcp_name()
-                except Exception as exc:
-                    self._last_error = str(exc)
             runtime = self._runtime
             return {
                 "enabled": self._enabled,
@@ -551,9 +542,10 @@ class ArucoExperimentController:
                 "enabled_at_ns": self._enabled_at_ns,
                 "reference_captured": self._reference_captured,
                 "z_test_completed": self._z_test_completed,
-                "active_tcp_name": active_tcp_name,
-                "joint_positions_deg": joints_deg,
-                "tcp_base_xyz_m": tcp_base_xyz_m,
+                "active_tcp_name": self._last_active_tcp_name,
+                "joint_positions_deg": self._last_joint_positions_deg,
+                "tcp_base_xyz_m": self._last_tcp_base_xyz_m,
+                "feedback_source": "last_serialized_aruco_action",
                 "adapter_name": self._robot.adapter_name if self._robot else None,
                 "last_action": self._last_action,
                 "last_action_at_ns": self._last_action_at_ns,
@@ -574,8 +566,28 @@ class ArucoExperimentController:
                 "capabilities": self._capabilities(),
             }
 
+    def _refresh_feedback_locked(self, robot: ArucoExperimentRobot) -> None:
+        """Read hardware feedback only from a serialized controller action.
+
+        Calling the Doosan wrapper from a FastAPI status poll races its
+        process-global rclpy executor with runtime IK.  Motion actions already
+        hold this controller lock, so cache their post-action evidence instead.
+        """
+
+        joints = robot.get_joint_positions_rad()
+        tcp = _rigid_matrix(robot.get_base_to_tcp_matrix(), label="T_base_tcp feedback")
+        self._last_joint_positions_deg = [round(math.degrees(value), 4) for value in joints]
+        self._last_tcp_base_xyz_m = _point_from_transform(tcp).tolist()
+        self._last_active_tcp_name = robot.get_active_tcp_name()
+
     def acquire_runtime_session(self) -> tuple[ArucoExperimentRobot, Matrix44]:
-        """Lease the connected robot and captured base/plane transform for one skill run."""
+        """Lease the connected robot and captured base/plane transform for one skill run.
+
+        The returned transform is deliberately the transform captured at the
+        validated ``[0, 0, 90, 0, 90, -90]`` reference pose.  Callers must not
+        substitute a URDF-only base/camera candidate: that candidate has not
+        established the active TCP-to-plane origin.
+        """
 
         with self._lock:
             robot = self._require_enabled_robot()
@@ -584,6 +596,28 @@ class ArucoExperimentController:
             if self.mode != "hardware" or not self.hardware_authorized:
                 raise ValueError("현재 ArUco 세션은 실제 하드웨어 세션이 아닙니다")
             return robot, self._base_to_plane.copy()
+
+    def acquire_runtime_workspace(
+        self,
+    ) -> tuple[dict[str, object], RuntimeWorkspace]:
+        """Return the reference and width-specific envelope for a leased run.
+
+        This is intentionally available only after the same enabled,
+        reference-captured ArUco session required by :meth:`acquire_runtime_session`.
+        The normal skill runtime uses it to reject every TCP target below the
+        width-adjusted plane-Z limit rather than treating the envelope as an
+        ArUco-test-only diagnostic.
+        """
+
+        with self._lock:
+            self._require_enabled_robot()
+            if not self._reference_captured or self._base_to_plane is None:
+                raise ValueError("ArUco 기준 자세(1번)를 먼저 실행해 좌표계를 고정하세요")
+            if self.mode != "hardware" or not self.hardware_authorized:
+                raise ValueError("현재 ArUco 세션은 실제 하드웨어 세션이 아닙니다")
+            if self._runtime is None:
+                raise RuntimeError("물체 폭 기반 runtime workspace가 없습니다")
+            return load_reference(self.reference_npz), self._runtime
 
     def enable(
         self,
@@ -650,6 +684,11 @@ class ArucoExperimentController:
             self._last_action = "enabled"
             self._last_action_at_ns = time.time_ns()
             self._last_error = None
+            self._last_joint_positions_deg = [
+                round(math.degrees(value), 4) for value in joints
+            ]
+            self._last_tcp_base_xyz_m = _point_from_transform(tcp).tolist()
+            self._last_active_tcp_name = active_tcp_name
             return self.status()
 
     def record_failure(self, action: str, exc: Exception) -> None:
@@ -704,6 +743,7 @@ class ArucoExperimentController:
             self._last_action = "moved_to_reference"
             self._last_action_at_ns = time.time_ns()
             self._last_error = None
+            self._refresh_feedback_locked(robot)
             return self.status()
 
     def move_plane_z_test(self) -> dict[str, Any]:
@@ -774,6 +814,7 @@ class ArucoExperimentController:
             self._last_action = "plane_z_plus_20mm_completed"
             self._last_action_at_ns = time.time_ns()
             self._last_error = None
+            self._refresh_feedback_locked(robot)
             return self.status()
 
     def stop(self, *, reason: str = "operator_request") -> dict[str, Any]:
@@ -786,6 +827,9 @@ class ArucoExperimentController:
             self._reference_captured = False
             self._base_to_plane = None
             self._base_to_tcp_reference = None
+            self._last_joint_positions_deg = None
+            self._last_tcp_base_xyz_m = None
+            self._last_active_tcp_name = None
             if robot is not None:
                 try:
                     robot.stop(reason=reason)

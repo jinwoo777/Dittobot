@@ -79,18 +79,20 @@ python3 aruco/object_width_workspace.py \
 
 80 mm, 기본 모델의 수치는 다음과 같습니다.
 
-- `theta = 46.658 deg`
-- `opening_offset = 34.502 mm`
-- `allowed_down = 184 + 34.502 - 5 = 213.502 mm`
-- `z_min = z_tcp_reference - 213.502 mm`
+- `sin(theta) = (80 / 2) / 110`, `theta = 21.324 deg`
+- `opening_offset = 7.530 mm`
+- `geometric_allowed_down = 184 - 7.530 = 176.470 mm`
+- `allowed_down = 176.470 - 5 = 171.470 mm`
+- `z_min = z_tcp_reference - 171.470 mm`
 - `z_max = z_frozen_reference_camera`
 
 legacy 모델은 `w = R*sin(theta)/2`이므로 허용 최대 폭은 `55 mm`입니다. 기본 모델 최대 폭은
-`110 mm`이며 범위를 넘는 폭은 clamp하지 않고 거부합니다.
+`220 mm`이지만, RG2가 실제로 명령할 수 있는 총 stroke는 110 mm이므로 API 입력은 110 mm에서
+fail-closed합니다.
 
-폭이 커질수록 허용 하강량도 커지므로 폭 측정에 오차가 있다면 과대값이 아니라 검증된 보수적
-하한을 입력해야 합니다. 실제 gripper opening이 이 값보다 작거나 모델과 다르면 runtime을
-사용하면 안 됩니다.
+폭이 커질수록 허용 하강량은 작아지고 `z_min`은 위로 올라갑니다. live detector의 폭과 ArUco
+세션에 입력한 폭이 다르면 더 큰 값을 사용해 더 깊은 하강을 허용하지 않습니다. 실제 gripper
+geometry가 이 모델과 다르면 runtime을 사용하면 안 됩니다.
 
 ### 다른 컴퓨터에서 실행
 

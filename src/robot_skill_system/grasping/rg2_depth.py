@@ -145,8 +145,10 @@ def build_rg2_depth_diagnostic(
         raise ValueError("example_grip_width_m exceeds the RG2 total stroke")
     baseline = reference - clearance
     # These two values intentionally treat the specified total stroke as a radius
-    # solely to make the user's hypothesis numerically inspectable.  They are not
-    # vendor geometry and cannot be selected for hardware execution.
+    # solely to make the user's hypothesis numerically inspectable.  The stated
+    # geometry reduces, rather than increases, the allowed descent by the
+    # symmetric opening sagitta.  They are not vendor geometry and cannot be
+    # selected for hardware execution.
     sagitta = circular_sagitta_m(
         width, calibrated_arc_radius_m=RG2_TOTAL_STROKE_M
     )
@@ -157,7 +159,7 @@ def build_rg2_depth_diagnostic(
         example_grip_width_m=width,
         rg2_total_stroke_m=RG2_TOTAL_STROKE_M,
         corrected_sagitta_if_stroke_were_radius_m=sagitta,
-        mock_descent_with_corrected_hypothesis_m=baseline + sagitta,
+        mock_descent_with_corrected_hypothesis_m=baseline - sagitta,
         executable_hardware_descent_m=None,
         hardware_compatible=False,
         warnings=(

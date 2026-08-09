@@ -15,6 +15,7 @@ from .interfaces import (
     SurfaceEstimator,
     WorkspaceBuilder,
 )
+from .live_scene import LearnedGripPoint, LiveSceneBuilder, load_learned_grip_point
 from .mock_perception import (
     MockMarkerPoseEstimator,
     MockObjectDetector,
@@ -31,6 +32,7 @@ from .tool_pose import (
     ArucoMarkerToolPoseEstimator,
     MarkerToolDefinition,
 )
+from .ultralytics_detector import UltralyticsObjectDetector
 
 __all__ = [
     "ArucoMarkerPoseEstimator",
@@ -38,6 +40,8 @@ __all__ = [
     "DepthCentroidObjectPoseEstimator",
     "HandPoseEstimate",
     "HandPoseEstimator",
+    "LearnedGripPoint",
+    "LiveSceneBuilder",
     "MarkerDetection",
     "MarkerPoseEstimator",
     "MarkerToolPoseEstimator",
@@ -57,5 +61,7 @@ __all__ = [
     "PerceptionPipeline",
     "PerceptionResult",
     "SurfaceEstimator",
+    "UltralyticsObjectDetector",
     "WorkspaceBuilder",
+    "load_learned_grip_point",
 ]

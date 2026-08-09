@@ -75,6 +75,24 @@ class MoveJArguments(PrimitiveArguments):
         return value
 
 
+class RotateJoint6RelativeArguments(PrimitiveArguments):
+    """Runtime-relative wrist rotation with profile-owned motion limits."""
+
+    delta_rad: float = Field(ge=-math.pi / 2.0, le=math.pi / 2.0)
+    motion_profile_id: str = Field(
+        validation_alias=AliasChoices("motion_profile_id", "profile_id")
+    )
+
+    _validate_profile = field_validator("motion_profile_id")(validate_profile_id)
+
+    @field_validator("delta_rad")
+    @classmethod
+    def validate_delta(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("relative J6 rotation must be finite")
+        return value
+
+
 class MoveLArguments(MotionTargetArguments):
     """Anchor-relative straight TCP motion goal."""
 

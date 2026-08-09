@@ -88,6 +88,14 @@ def get_recording_draft(
     return service.get_recording_skill_draft(draft_id)
 
 
+@router.delete("/drafts/{draft_id}")
+def archive_recording_draft(
+    draft_id: str,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.archive_recording_skill_draft(draft_id)
+
+
 @router.post("/drafts/{draft_id}/surface-calibration")
 def calibrate_recording_draft_surface(
     draft_id: str,

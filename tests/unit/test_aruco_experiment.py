@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -104,8 +105,109 @@ def test_aruco_robot_reports_empty_vendor_tcp_pose_response() -> None:
 
     robot._get_current_posx = empty_vendor_response
 
-    with pytest.raises(NotConfiguredError, match="empty active-TCP response"):
+    robot._ACTIVE_TCP_POSE_RETRY_DELAY_S = 0.0
+
+    with pytest.raises(NotConfiguredError, match="failed after 3 bounded attempts"):
         robot.get_base_to_tcp_matrix()
+
+
+def test_aruco_robot_retries_empty_vendor_tcp_pose_response() -> None:
+    robot = DoosanArucoExperimentRobot(
+        robot_id="dsr01",
+        robot_model="m0609",
+        execution_mode="hardware",
+        hardware_enabled=True,
+    )
+    responses: list[object] = [IndexError(), IndexError(), ([1, 2, 3, 4, 5, 6], 0)]
+
+    def transient_vendor_response() -> object:
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    robot._get_current_posx = transient_vendor_response
+    robot._ACTIVE_TCP_POSE_RETRY_DELAY_S = 0.0
+
+    assert robot.get_tcp_pose_base_mm_zyz_deg() == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+    assert responses == []
+
+
+@pytest.mark.parametrize("empty_response", [None, [], (), np.asarray([])])
+def test_aruco_robot_retries_empty_list_tcp_pose_response(
+    empty_response: object,
+) -> None:
+    robot = DoosanArucoExperimentRobot(
+        robot_id="dsr01",
+        robot_model="m0609",
+        execution_mode="hardware",
+        hardware_enabled=True,
+    )
+    responses = [empty_response, ([1, 2, 3, 4, 5, 6], 0)]
+
+    def transient_empty_response() -> object:
+        return responses.pop(0)
+
+    robot._get_current_posx = transient_empty_response
+    robot._ACTIVE_TCP_POSE_RETRY_DELAY_S = 0.0
+
+    assert robot.get_tcp_pose_base_mm_zyz_deg() == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+    assert responses == []
+
+
+def test_aruco_robot_uses_bounded_direct_tcp_pose_service() -> None:
+    robot = DoosanArucoExperimentRobot(
+        robot_id="dsr01",
+        robot_model="m0609",
+        execution_mode="hardware",
+        hardware_enabled=True,
+    )
+
+    class Request:
+        ref = -1
+
+    class Future:
+        def __init__(self, response: object) -> None:
+            self.response = response
+
+        def done(self) -> bool:
+            return True
+
+        def result(self) -> object:
+            return self.response
+
+    responses = [
+        SimpleNamespace(success=False, task_pos_info=[]),
+        SimpleNamespace(success=False, task_pos_info=[]),
+        SimpleNamespace(
+            success=True,
+            task_pos_info=[SimpleNamespace(data=[10, 20, 30, 40, 50, 60, 0])],
+        ),
+    ]
+    requests: list[Request] = []
+
+    class Client:
+        def call_async(self, request: Request) -> Future:
+            requests.append(request)
+            return Future(responses.pop(0))
+
+    robot._rclpy = SimpleNamespace(
+        spin_until_future_complete=lambda *args, **kwargs: None
+    )
+    robot._node = object()
+    robot._current_posx_client = Client()
+    robot._current_posx_type = SimpleNamespace(Request=Request)
+    robot._ACTIVE_TCP_POSE_RETRY_DELAY_S = 0.0
+
+    assert robot.get_tcp_pose_base_mm_zyz_deg() == (
+        10.0,
+        20.0,
+        30.0,
+        40.0,
+        50.0,
+        60.0,
+    )
+    assert [request.ref for request in requests] == [0, 0, 0]
 
 
 def test_mock_two_step_experiment_uses_camera_z_upper_bound(tmp_path: Path) -> None:
@@ -180,6 +282,21 @@ def test_recorded_failure_survives_status_poll_until_success_or_stop(
     assert controller.stop()["last_error"] is None
 
 
+def test_status_uses_cached_feedback_without_another_robot_call(tmp_path: Path) -> None:
+    robot = MockArucoExperimentRobot()
+    controller = _controller(tmp_path, robot=robot)
+    _enable(controller)
+    expected = controller.status()["tcp_base_xyz_m"]
+
+    def unexpected_status_poll() -> tuple[float, float, float, float, float, float]:
+        raise AssertionError("status must not call the robot")
+
+    robot.get_joint_positions_rad = unexpected_status_poll  # type: ignore[method-assign]
+    robot.get_base_to_tcp_matrix = unexpected_status_poll  # type: ignore[method-assign]
+    assert controller.status()["tcp_base_xyz_m"] == expected
+    assert controller.status()["feedback_source"] == "last_serialized_aruco_action"
+
+
 def test_enable_rejects_tcp_outside_one_metre_base_radius(tmp_path: Path) -> None:
     robot = MockArucoExperimentRobot()
     robot.base_to_tcp[:3, 3] = [1.01, 0.0, 0.0]
@@ -192,5 +309,7 @@ def test_width_runtime_matches_requested_model(tmp_path: Path) -> None:
     controller = _controller(tmp_path)
     _enable(controller, width_mm=80.0)
     runtime = controller.status()["runtime_workspace"]
-    assert runtime["theta_deg"] == pytest.approx(math.degrees(math.asin(80.0 / 110.0)))
+    assert runtime["theta_deg"] == pytest.approx(
+        math.degrees(math.asin((80.0 / 2.0) / 110.0))
+    )
     assert runtime["z_min_plane_m"] < runtime["z_max_plane_m"]

@@ -15,8 +15,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
+import numpy as np
 from sqlalchemy import select
 
+from aruco.object_width_workspace import build_runtime_workspace, check_tcp_point_plane
 from robot_skill_system.adapters.doosan_m0609 import DoosanM0609Adapter
 from robot_skill_system.adapters.mock_robot import MockGripperAdapter, MockRobotAdapter
 from robot_skill_system.adapters.onrobot_rg2 import OnRobotRG2Adapter
@@ -94,6 +96,15 @@ from robot_skill_system.demonstrations.trajectory import (
     summarize_trajectory,
 )
 from robot_skill_system.exceptions import NotConfiguredError, RobotSkillError
+from robot_skill_system.grasping.live_pick import build_live_pick_graph
+from robot_skill_system.grasping.live_profile_catalog import (
+    load_registered_live_grip_profile,
+    register_configured_live_grip_profile,
+)
+from robot_skill_system.grasping.recorded_hammer import (
+    build_recorded_hammer_graph,
+    is_recorded_hammer_draft,
+)
 from robot_skill_system.jog.controller import DoosanJogRobot, JogController, MockJogRobot
 from robot_skill_system.openai_integration.demonstration_analyzer import DemonstrationAnalyzer
 from robot_skill_system.openai_integration.embeddings import (
@@ -132,9 +143,14 @@ from robot_skill_system.perception.hand_pose import (
     FingerObservation,
     MediaPipeHandPoseEstimator,
 )
+from robot_skill_system.perception.live_scene import (
+    LiveSceneBuilder,
+    load_learned_grip_point,
+)
 from robot_skill_system.perception.semantic_anchor import (
     reconstruct_semantic_roi_anchor,
 )
+from robot_skill_system.perception.ultralytics_detector import UltralyticsObjectDetector
 from robot_skill_system.primitives.models import SafetyPolicy
 from robot_skill_system.primitives.profiles import (
     load_force_profiles,
@@ -149,6 +165,7 @@ from robot_skill_system.runtime.event_log import InMemoryEventSink
 from robot_skill_system.runtime.executor import RuntimeExecutor
 from robot_skill_system.runtime.force_supervisor import GlobalForceSupervisor
 from robot_skill_system.runtime.hardware_verification import (
+    HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS,
     DoosanFixedPlaneGeometryValidator,
     DoosanStateMonitor,
     FixedReferenceSceneMonitor,
@@ -163,6 +180,8 @@ from robot_skill_system.runtime.task_flow_materializer import (
 from robot_skill_system.runtime.workspace_monitor import GlobalWorkspaceSupervisor
 from robot_skill_system.scene.models import (
     AccessPolicy,
+    CameraMetadata,
+    ConfidenceSummary,
     Pose,
     Quaternion,
     SceneSnapshot,
@@ -253,6 +272,7 @@ class MVPApplication:
         calibration_controller: HandEyeCalibrationController | None = None,
         jog_controller: JogController | None = None,
         aruco_experiment_controller: ArucoExperimentController | None = None,
+        live_scene_builder: LiveSceneBuilder | None = None,
     ) -> None:
         self.settings = settings
         self.store = LocalArtifactStore(settings.artifact_root)
@@ -264,9 +284,6 @@ class MVPApplication:
         self._active_executions: dict[str, ActiveExecution] = {}
         self._active_execution_lock = threading.RLock()
         self._robot_motion_transition_lock = threading.RLock()
-        self._fixed_hardware_session_lock = threading.RLock()
-        self._fixed_hardware_robot: DoosanArucoExperimentRobot | None = None
-        self._fixed_base_plane_cache: tuple[Any, str] | None = None
         self._recording_flange_starts: dict[str, dict[str, Any]] = {}
         real_sense_config = RealSenseCaptureConfig(
             width_px=settings.realsense_width_px,
@@ -425,14 +442,46 @@ class MVPApplication:
                 ),
             )
         )
+        # The detector weight and learned grasp profile are local artifacts.
+        # Model loading is lazy inside the detector, so mock-only imports and
+        # tests do not require Ultralytics/Torch.
+        self._live_grip_profile_version_id: str | None = None
+        if live_scene_builder is not None:
+            self.live_scene_builder = live_scene_builder
+        else:
+            configured_grip = load_learned_grip_point(settings.live_grasp_profile_path)
+            registered_grip = register_configured_live_grip_profile(
+                self.repository,
+                self.store,
+                configured_grip,
+            )
+            if registered_grip is not None:
+                configured_grip = load_registered_live_grip_profile(
+                    self.store,
+                    registered_grip.record,
+                    source_path=settings.live_grasp_profile_path,
+                )
+                self._live_grip_profile_version_id = registered_grip.record.id
+            self.live_scene_builder = LiveSceneBuilder(
+                UltralyticsObjectDetector(
+                    settings.live_object_detector_weights_path,
+                    minimum_confidence=settings.live_object_detection_confidence,
+                ),
+                configured_grip,
+                minimum_confidence=settings.live_object_detection_confidence,
+                grip_profile_version_id=(
+                    registered_grip.record.id if registered_grip is not None else None
+                ),
+                grip_profile_checksum_sha256=(
+                    registered_grip.record.artifact_checksum_sha256
+                    if registered_grip is not None
+                    else None
+                ),
+            )
 
     def close(self) -> None:
         """Release database resources."""
 
-        with self._fixed_hardware_session_lock:
-            fixed_robot, self._fixed_hardware_robot = self._fixed_hardware_robot, None
-        if fixed_robot is not None:
-            fixed_robot.disconnect()
         self.aruco_experiment_controller.close()
         self.jog_controller.close()
         self.calibration_controller.close()
@@ -536,13 +585,32 @@ class MVPApplication:
         if mode not in {"mock", "single", "burst", "hardware"}:
             raise ValueError("scene capture supports mock/single/burst/hardware")
         frame_count = 1 if mode == "single" else self.settings.scene_burst_frame_count
-        scene = capture_mock_scene(frame_count=frame_count)
-        if mode == "hardware":
-            aruco_robot, base_to_plane = self._acquire_fixed_hardware_session()
-            tcp_transform = rigid_transform_from_matrix(
-                aruco_robot.get_base_to_tcp_matrix(), label="hardware T_base_tcp"
+        if mode != "hardware":
+            scene = capture_mock_scene(frame_count=frame_count)
+        else:
+            (
+                aruco_robot,
+                base_to_plane,
+                reference,
+                _runtime_workspace,
+            ) = self._acquire_aruco_runtime_context()
+            base_to_tcp = np.asarray(
+                aruco_robot.get_base_to_tcp_matrix(), dtype=np.float64
             )
-            active_tool = scene.tools[0].model_copy(
+            tcp_transform = rigid_transform_from_matrix(
+                base_to_tcp, label="hardware T_base_tcp"
+            )
+            frame = self.camera_controller.get_latest_frame(timeout_s=2.0)
+            base_to_camera = base_to_tcp @ np.asarray(
+                reference["T_tcp_camera"], dtype=np.float64
+            )
+            object_anchor = self.live_scene_builder.build_object(
+                frame,
+                base_to_camera=base_to_camera,
+                base_to_plane=base_to_plane,
+            )
+            template = capture_mock_scene(frame_count=1)
+            active_tool = template.tools[0].model_copy(
                 update={
                     "instance_id": "active_rg2",
                     "tool_class": "onrobot_rg2",
@@ -560,21 +628,31 @@ class MVPApplication:
                 },
                 deep=True,
             )
-            scene = scene.model_copy(
-                update={
-                    "scene_id": f"hardware_{uuid.uuid4().hex}",
-                    "timestamp_ns": time.time_ns(),
-                    "reference_frame": "base",
-                    "valid_for_ms": 1_800_000,
-                    "calibration_id": "aruco_fixed_plane_operator_session",
-                    "objects": [],
-                    "tools": [active_tool],
-                    "surfaces": [],
-                    "workspace_regions": [],
-                    "static_obstacles": [],
-                    "dynamic_obstacles": [],
-                },
-                deep=True,
+            scene = SceneSnapshot(
+                schema_version="1.0",
+                scene_id=f"hardware_{uuid.uuid4().hex}",
+                timestamp_ns=time.time_ns(),
+                reference_frame="base",
+                valid_for_ms=HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS,
+                objects=[object_anchor],
+                tools=[active_tool],
+                calibration_id="aruco_live_reference_session",
+                camera_metadata=CameraMetadata(
+                    camera_id="realsense_live_aligned_rgbd",
+                    color_frame_id=frame.reference_frame,
+                    depth_frame_id=frame.reference_frame,
+                    width_px=frame.color_intrinsics.width_px,
+                    height_px=frame.color_intrinsics.height_px,
+                    depth_scale_m=frame.depth_scale_m,
+                    capture_mode="live_grasp_snapshot",
+                    frame_count=1,
+                ),
+                confidence_summary=ConfidenceSummary(
+                    overall=object_anchor.confidence,
+                    perception=object_anchor.confidence,
+                    geometry=object_anchor.confidence,
+                    calibration=1.0,
+                ),
             )
             self._scenes[scene.scene_id] = scene
             self.store.put_json(
@@ -610,15 +688,18 @@ class MVPApplication:
 
     def get_aruco_experiment_status(self) -> dict[str, Any]:
         status = self.aruco_experiment_controller.status()
-        try:
-            transform, source = self._load_fixed_base_plane()
-            status["fixed_workspace_ready"] = True
-            status["fixed_workspace_source"] = source
-            status["fixed_T_base_plane"] = transform.tolist()
-            status["skill_execution_requires_aruco_enable"] = False
-        except Exception as exc:
-            status["fixed_workspace_ready"] = False
-            status["fixed_workspace_error"] = str(exc)
+        ready = bool(status.get("enabled")) and bool(status.get("reference_captured"))
+        status["fixed_workspace_ready"] = ready
+        status["fixed_workspace_source"] = (
+            "live_doosan_reference_tcp @ frozen_T_tcp_plane"
+            if ready
+            else None
+        )
+        status["skill_execution_requires_aruco_enable"] = True
+        if not ready:
+            status["fixed_workspace_error"] = (
+                "실제 skill 실행에는 ArUco enable 및 기준 자세 캡처가 필요합니다"
+            )
         return status
 
     def enable_jog(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -1607,6 +1688,43 @@ class MVPApplication:
             fallback_created_at_ns=path.stat().st_mtime_ns,
         )
 
+    def archive_recording_skill_draft(self, draft_id: str) -> dict[str, Any]:
+        """Remove one draft from the active UI while retaining recoverable evidence."""
+
+        path = self._recording_skill_draft_path(draft_id)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("draft_id") != draft_id:
+            raise ValueError("recording draft artifact identity mismatch")
+        registration = self._latest_draft_evidence(
+            payload, "candidate_registration_*.json"
+        )
+        if isinstance(registration, dict) and self._find_version_optional(
+            str(registration.get("skill_id") or "")
+        ) is not None:
+            raise ValueError("delete the registered skill before deleting its source draft")
+        archive_root = self.store.path_for(
+            f"archive/recording_skill_drafts/{draft_id}"
+        )
+        if archive_root.exists():
+            raise ValueError("recording draft archive destination already exists")
+        archive_root.mkdir(parents=True)
+        archived_draft = archive_root / "draft.json"
+        path.replace(archived_draft)
+        evidence_path = self.store.path_for(self._draft_evidence_root(payload))
+        archived_evidence_files = 0
+        if evidence_path.is_dir():
+            archived_evidence_files = sum(
+                1 for item in evidence_path.rglob("*") if item.is_file()
+            )
+            evidence_path.replace(archive_root / "evidence")
+        return {
+            "archived": True,
+            "draft_id": draft_id,
+            "archive_uri": archive_root.relative_to(self.store.root).as_posix(),
+            "archived_draft_files": 1,
+            "archived_evidence_files": archived_evidence_files,
+        }
+
     def calibrate_recording_draft_surface(
         self, draft_id: str, request: dict[str, Any]
     ) -> dict[str, Any]:
@@ -2180,18 +2298,63 @@ class MVPApplication:
             raise ValueError(
                 "candidate promotion blocked: " + "; ".join(promotion.blockers)
             )
-        graph = self._recording_candidate_graph(
-            draft_payload,
-            calibration=calibration,
-            trajectory=trajectory,
-            handeye_transform=handeye_transform,
-        )
+        recorded_hammer = is_recorded_hammer_draft(draft_payload)
+        promotion_payload = promotion.as_dict()
+        promotion_warnings = list(promotion.warnings)
+        if recorded_hammer:
+            promotion_warnings = [
+                warning
+                for warning in promotion_warnings
+                if not warning.startswith("gripper behavior unresolved")
+            ]
+            for check in promotion_payload["checks"]:
+                if check["id"] == "gripper_behavior":
+                    check.update(
+                        {
+                            "passed": True,
+                            "detail": (
+                                "체크섬 검증된 로컬 Grip/End 단계 경계를 사용합니다."
+                            ),
+                        }
+                    )
+            promotion_payload["warnings"] = promotion_warnings
+        if recorded_hammer:
+            active_grip = self.repository.active_grip_profile_version(
+                object_class_id="hammer"
+            )
+            if active_grip is None or active_grip.metadata_json.get(
+                "runtime_live_grip_profile"
+            ) is not True:
+                raise ValueError("take_hammer requires the active live hammer GripProfile")
+            grip_profile = load_registered_live_grip_profile(
+                self.store,
+                active_grip,
+                source_path=self.settings.live_grasp_profile_path,
+            )
+            graph = build_recorded_hammer_graph(
+                store=self.store,
+                draft_payload=draft_payload,
+                calibration=calibration,
+                version=self._next_recording_candidate_version("take_hammer"),
+                grip_profile=grip_profile,
+                grip_profile_version_id=active_grip.id,
+                grip_profile_checksum_sha256=(
+                    active_grip.artifact_checksum_sha256
+                ),
+            )
+        else:
+            graph = self._recording_candidate_graph(
+                draft_payload,
+                calibration=calibration,
+                trajectory=trajectory,
+                handeye_transform=handeye_transform,
+            )
         graph = graph.model_copy(
             update={
                 "uncertainty": {
                     **graph.uncertainty,
-                    "promotion_policy": promotion.as_dict(),
-                    "promotion_warnings": list(promotion.warnings),
+                    "promotion_policy": promotion_payload,
+                    "promotion_warnings": promotion_warnings,
                 }
             },
             deep=True,
@@ -2215,8 +2378,8 @@ class MVPApplication:
             "version": row.semantic_version,
             "status": "validated" if validation["passed"] else "rejected",
             "mock_validation_passed": bool(validation["passed"]),
-            "promotion_policy": promotion.as_dict(),
-            "warnings": list(promotion.warnings),
+            "promotion_policy": promotion_payload,
+            "warnings": promotion_warnings,
             "handeye_transform_candidate": (
                 {
                     key: latest_handeye_transform[key]
@@ -5441,6 +5604,7 @@ class MVPApplication:
     ) -> bool:
         supported_kinds = {
             "motion.move_j": {"move_j"},
+            "motion.rotate_joint_6_relative": {"move_j"},
             "motion.move_l": {"move_l"},
             "motion.move_c": {"move_c"},
             "motion.move_spline": {"move_spline"},
@@ -5613,6 +5777,8 @@ class MVPApplication:
             resolved = resolve(item)
             if field_name == "target_joint_positions_rad":
                 return [0.0] * 6
+            if field_name == "delta_rad":
+                return 0.0
             if field_name == "motion_profile_id":
                 options = profile_options["motion_profile_ids"]
                 return options[0] if options else ""
@@ -5876,11 +6042,7 @@ class MVPApplication:
         active_actions = self.repository.list_catalog_entries(
             kind="action", status="active"
         )
-        if active_objects or active_actions:
-            if not active_objects or not active_actions:
-                raise ValueError(
-                    "task-flow runtime requires both active object and action catalogs"
-                )
+        if active_objects and active_actions:
             if scene is None:
                 raise ValueError("task-flow runtime resolution requires a current scene_id")
             return self._resolve_task_flow_intent(
@@ -6246,8 +6408,9 @@ class MVPApplication:
         )
         return report.as_dict()
 
+    @staticmethod
     def _scene_with_graph_task_plane(
-        self, scene: SceneSnapshot, graph: SkillGraph
+        scene: SceneSnapshot, graph: SkillGraph
     ) -> SceneSnapshot:
         """Attach the graph's exact calibrated task plane to a fresh Scene."""
 
@@ -6389,8 +6552,27 @@ class MVPApplication:
         row = self._find_version(str(request["skill_id"]), request.get("version"))
         graph = SkillGraph.model_validate(row.graph_json)
         if str(request.get("mode", "mock")) == "hardware":
-            _, base_to_plane = self._acquire_fixed_hardware_session()
+            _, base_to_plane, reference, runtime_workspace = self._acquire_aruco_runtime_context()
             graph = self._graph_with_aruco_base_plane(graph, base_to_plane)
+            source_scene = self._scene(str(request["scene_id"]))
+            if graph.skill_id == "take_hammer":
+                hammer = self._live_hammer_anchor(source_scene)
+                runtime_workspace = self._runtime_workspace_for_live_hammer(
+                    reference, runtime_workspace, hammer
+                )
+                graph = build_live_pick_graph(
+                    graph,
+                    object_anchor=hammer,
+                    reference=reference,
+                    runtime=runtime_workspace,
+                    pregrasp_distance_m=self.settings.live_pick_pregrasp_distance_m,
+                    grasp_depth_offset_m=(
+                        self.settings.live_pick_grasp_depth_offset_m
+                    ),
+                    workspace_xy_tolerance_m=(
+                        self.settings.live_pick_workspace_xy_tolerance_m
+                    ),
+                )
         scene = self._scene_with_graph_task_plane(
             self._scene(str(request["scene_id"])), graph
         )
@@ -6416,15 +6598,22 @@ class MVPApplication:
 
     def preflight_runtime(self, request: dict[str, Any]) -> dict[str, Any]:
         mode = ExecutionMode(str(request.get("mode", "mock")))
-        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(request)
+        row, graph, scene, bindings, robot, motion, force, target_validator = (
+            self._runtime_parts(request)
+        )
         safety_policy = self._safety_policy()
         geometry_validator = (
-            DoosanFixedPlaneGeometryValidator(robot, minimum_clearance_m=0.0)
+            DoosanFixedPlaneGeometryValidator(
+                robot, minimum_clearance_m=0.0, validate_tcp_target=target_validator
+            )
             if mode is ExecutionMode.HARDWARE
             else None
         )
         preflight_policy = (
-            PreflightPolicy(maximum_scene_age_ms=1_800_000, minimum_clearance_m=0.0)
+            PreflightPolicy(
+                maximum_scene_age_ms=HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS,
+                minimum_clearance_m=0.0,
+            )
             if mode is ExecutionMode.HARDWARE
             else None
         )
@@ -6472,17 +6661,22 @@ class MVPApplication:
                 )
         if requested_mode == "hardware" and not self.settings.hardware_enabled:
             raise ValueError("hardware execution gates are not all enabled")
-        row, graph, scene, bindings, robot, motion, force = self._runtime_parts(
+        row, graph, scene, bindings, robot, motion, force, target_validator = self._runtime_parts(
             request, allow_mock_candidate=mock_override is not None
         )
         safety_policy = self._safety_policy()
         geometry_validator = (
-            DoosanFixedPlaneGeometryValidator(robot, minimum_clearance_m=0.0)
+            DoosanFixedPlaneGeometryValidator(
+                robot, minimum_clearance_m=0.0, validate_tcp_target=target_validator
+            )
             if requested_mode == "hardware"
             else None
         )
         preflight_policy = (
-            PreflightPolicy(maximum_scene_age_ms=1_800_000, minimum_clearance_m=0.0)
+            PreflightPolicy(
+                maximum_scene_age_ms=HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS,
+                minimum_clearance_m=0.0,
+            )
             if requested_mode == "hardware"
             else None
         )
@@ -6510,7 +6704,9 @@ class MVPApplication:
             hardware_workspace_monitor_verified=requested_mode == "hardware",
             hardware_scene_monitor_verified=requested_mode == "hardware",
         )
-        run = self._load_verified_run(row, SkillGraph.model_validate(row.graph_json))
+        run, execution_artifact = self._load_execution_run(row, graph)
+        preflight_payload = report.as_dict()
+        preflight_payload["execution_artifact"] = execution_artifact
         gripper = (
             OnRobotRG2Adapter(
                 host=self.settings.rg2_modbus_host,
@@ -6576,7 +6772,9 @@ class MVPApplication:
             DoosanStateMonitor(robot) if requested_mode == "hardware" else None
         )
         scene_monitor = (
-            FixedReferenceSceneMonitor(maximum_scene_age_ms=1_800_000)
+            FixedReferenceSceneMonitor(
+                maximum_scene_age_ms=HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS
+            )
             if requested_mode == "hardware"
             else None
         )
@@ -6602,7 +6800,7 @@ class MVPApplication:
             skill_version_id=row.id,
             scene_id=scene.scene_id,
             command_text=request.get("text"),
-            preflight=report.as_dict(),
+            preflight=preflight_payload,
             bindings={name: value.entity_id for name, value in bindings.items()},
         )
         with self._active_execution_lock:
@@ -6655,7 +6853,7 @@ class MVPApplication:
             "run_id": execution.id,
             "status": "succeeded",
             "mode": requested_mode,
-            "preflight": report.as_dict(),
+            "preflight": preflight_payload,
             "bindings": {name: value.entity_id for name, value in bindings.items()},
             "robot_commands": [command.operation for command in robot.commands],
             "events": [event.event_type for event in event_sink.events],
@@ -6728,6 +6926,7 @@ class MVPApplication:
         Any,
         dict[str, Any],
         dict[str, Any],
+        Any | None,
     ]:
         mode = str(request.get("mode", "mock"))
         row = self._find_version(str(request["skill_id"]), request.get("version"))
@@ -6740,7 +6939,7 @@ class MVPApplication:
             if not allow_mock_candidate:
                 if not hardware_validated_candidate:
                     raise ValueError(
-                        "runtime accepts active skills or passed validated Candidates"
+                        "runtime accepts active, validated skills or passed validated Candidates"
                     )
             elif row.status not in {"candidate", "validated"}:
                 raise ValueError(
@@ -6756,10 +6955,16 @@ class MVPApplication:
         SkillCompiler().compile(graph)
         fixed_workspace_orientation_xyzw: tuple[float, float, float, float] | None = None
         initial_hardware_pose: BoundTargetPose | None = None
+        target_validator: Any | None = None
         if mode == "hardware":
-            aruco_robot, base_to_plane = self._acquire_fixed_hardware_session()
+            (
+                aruco_robot,
+                base_to_plane,
+                reference,
+                runtime_workspace,
+            ) = self._acquire_aruco_runtime_context()
             initial_tcp_matrix = aruco_robot.get_base_to_tcp_matrix()
-            fixed_workspace_orientation_xyzw = rotation_matrix_to_quaternion_xyzw(
+            initial_orientation_xyzw = rotation_matrix_to_quaternion_xyzw(
                 initial_tcp_matrix[:3, :3]
             )
             initial_hardware_pose = BoundTargetPose(
@@ -6768,14 +6973,52 @@ class MVPApplication:
                     tuple[float, float, float],
                     tuple(float(value) for value in initial_tcp_matrix[:3, 3]),
                 ),
-                orientation_xyzw=fixed_workspace_orientation_xyzw,
-                anchor_entity_id="fixed_workspace_run_start_tcp",
+                orientation_xyzw=initial_orientation_xyzw,
+                anchor_entity_id="aruco_reference_run_start_tcp",
                 timestamp_ns=time.time_ns(),
             )
             graph = self._graph_with_aruco_base_plane(graph, base_to_plane)
             scene_source = self._scene(str(request["scene_id"]))
+            EntityBinder().ensure_scene_fresh(
+                scene_source,
+                maximum_age_ms=self.settings.scene_freshness_ms,
+            )
+            if graph.skill_id == "take_hammer":
+                hammer = self._live_hammer_anchor(scene_source)
+                runtime_workspace = self._runtime_workspace_for_live_hammer(
+                    reference, runtime_workspace, hammer
+                )
+                graph = build_live_pick_graph(
+                    graph,
+                    object_anchor=hammer,
+                    reference=reference,
+                    runtime=runtime_workspace,
+                    pregrasp_distance_m=self.settings.live_pick_pregrasp_distance_m,
+                    grasp_depth_offset_m=(
+                        self.settings.live_pick_grasp_depth_offset_m
+                    ),
+                    workspace_xy_tolerance_m=(
+                        self.settings.live_pick_workspace_xy_tolerance_m
+                    ),
+                )
+                # The live graph contains an approved plane-normal yaw from the
+                # current grasp observation, so the hardware adapter must not
+                # overwrite it with the run-start orientation.
+                fixed_workspace_orientation_xyzw = None
+            else:
+                fixed_workspace_orientation_xyzw = initial_orientation_xyzw
+            target_validator = self._width_workspace_target_validator(
+                base_to_plane=base_to_plane,
+                reference=reference,
+                runtime_workspace=runtime_workspace,
+                workspace_xy_tolerance_m=(
+                    self.settings.live_pick_workspace_xy_tolerance_m
+                ),
+            )
             self._scenes[scene_source.scene_id] = scene_source.model_copy(
-                update={"timestamp_ns": time.time_ns(), "valid_for_ms": 1_800_000},
+                update={
+                    "valid_for_ms": HARDWARE_FIXED_REFERENCE_SCENE_VALIDITY_MS,
+                },
                 deep=True,
             )
         scene = self._scene_with_graph_task_plane(
@@ -6805,7 +7048,16 @@ class MVPApplication:
             else MockRobotAdapter()
         )
         robot.connect()
-        return row, graph, scene, bindings, robot, self._motion_profiles(), self._force_profiles()
+        return (
+            row,
+            graph,
+            scene,
+            bindings,
+            robot,
+            self._motion_profiles(),
+            self._force_profiles(),
+            target_validator,
+        )
 
     @staticmethod
     def _graph_with_aruco_base_plane(graph: SkillGraph, base_to_plane: Any) -> SkillGraph:
@@ -6820,55 +7072,116 @@ class MVPApplication:
         }
         return graph.model_copy(update={"uncertainty": uncertainty}, deep=True)
 
-    def _load_fixed_base_plane(self) -> tuple[Any, str]:
-        """Load the operator-frozen base/workspace transform without re-running ArUco."""
+    def _acquire_aruco_runtime_context(self) -> tuple[Any, Any, dict[str, object], Any]:
+        """Use the same live ArUco session that passed the reference/+Z test.
 
-        with self._fixed_hardware_session_lock:
-            cached = self._fixed_base_plane_cache
-            if cached is not None:
-                return cached[0].copy(), cached[1]
-        source = (
-            self.settings.repo_root
-            / "aruco/results/d435i_plane_scans/scan_20260807_123803/"
-            "base_workspace_urdf_candidate.json"
-        ).resolve()
-        payload = json.loads(source.read_text(encoding="utf-8"))
-        transforms = payload.get("transforms")
-        if not isinstance(transforms, dict):
-            raise ValueError("fixed base workspace artifact has no transforms")
-        matrix = transforms.get(
-            "T_base_plane_from_urdf_camera_and_reference_T_camera_plane"
-        )
-        transform = rigid_transform_from_matrix(matrix, label="fixed T_base_plane")
-        # Round-trip through the typed transform to reject malformed matrices, then
-        # retain the exact matrix values selected by the operator.
-        del transform
-        import numpy as np
-
-        result = np.asarray(matrix, dtype=np.float64), str(source)
-        with self._fixed_hardware_session_lock:
-            self._fixed_base_plane_cache = result
-        return result[0].copy(), result[1]
-
-    def _acquire_fixed_hardware_session(self) -> tuple[DoosanArucoExperimentRobot, Any]:
-        """Reuse one server-owned Doosan session and the frozen workspace transform."""
+        Normal hardware pick used to bypass this session and load an
+        URDF-only candidate transform.  That candidate did not map the
+        reference TCP back to its live measured pose, which shifted the
+        workspace below the markers.  A pick now requires the reference-captured
+        session and its width-specific envelope.
+        """
 
         if not self.settings.hardware_enabled:
             raise ValueError("서버가 hardware 모드로 시작되지 않았습니다")
-        base_to_plane, _ = self._load_fixed_base_plane()
-        with self._fixed_hardware_session_lock:
-            robot = self._fixed_hardware_robot
-            if robot is None:
-                robot = DoosanArucoExperimentRobot(
-                    robot_id=self.settings.doosan_robot_id,
-                    robot_model=self.settings.doosan_robot_model,
-                    execution_mode="hardware",
-                    hardware_enabled=True,
-                    expected_tcp_name=self.settings.aruco_experiment_expected_tcp,
+        robot, base_to_plane = self.aruco_experiment_controller.acquire_runtime_session()
+        reference, runtime_workspace = (
+            self.aruco_experiment_controller.acquire_runtime_workspace()
+        )
+        return robot, base_to_plane, reference, runtime_workspace
+
+    def _live_hammer_anchor(self, scene: SceneSnapshot) -> Any:
+        hammers = [item for item in scene.objects if item.class_name == "hammer"]
+        if len(hammers) != 1:
+            raise ValueError(
+                "hardware pick requires exactly one current live hammer grasp anchor"
+            )
+        anchor = hammers[0]
+        if anchor.pose_source != "live_yolo_rgbd_grasp_anchor":
+            raise ValueError("hardware pick refuses a non-live hammer anchor")
+        active_grip = self.repository.active_grip_profile_version(
+            object_class_id="hammer"
+        )
+        if active_grip is None or active_grip.metadata_json.get(
+            "runtime_live_grip_profile"
+        ) is not True:
+            raise ValueError("hammer has no active live RGB-D GripProfile")
+        if anchor.attributes.get("grip_profile_version_id") != active_grip.id:
+            raise ValueError(
+                "scene GripProfile differs from the active hammer GripProfile; recapture RGB-D"
+            )
+        if (
+            anchor.attributes.get("grip_profile_checksum_sha256")
+            != active_grip.artifact_checksum_sha256
+        ):
+            raise ValueError("scene GripProfile checksum verification failed")
+        selected_profile = load_registered_live_grip_profile(
+            self.store,
+            active_grip,
+            source_path=self.settings.live_grasp_profile_path,
+        )
+        observed_width = anchor.attributes.get("target_gripper_width_m")
+        if not isinstance(observed_width, (int, float)) or isinstance(
+            observed_width, bool
+        ):
+            raise ValueError("scene has no numeric grip width")
+        if not math.isclose(
+            float(observed_width),
+            selected_profile.target_gripper_width_m,
+            abs_tol=1e-9,
+            rel_tol=0.0,
+        ):
+            raise ValueError("scene grip width differs from the active GripProfile")
+        return anchor
+
+    @staticmethod
+    def _runtime_workspace_for_live_hammer(
+        reference: dict[str, object], runtime_workspace: Any, hammer: Any
+    ) -> Any:
+        """Keep the GripProfile width only as a conservative safety envelope."""
+
+        raw = hammer.attributes.get("object_width_mm")
+        try:
+            grip_width_mm = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("live hammer anchor has no GripProfile width") from exc
+        if not math.isfinite(grip_width_mm) or not 0.0 < grip_width_mm <= 110.0:
+            raise ValueError("live hammer GripProfile width is outside (0, 110] mm")
+        return build_runtime_workspace(
+            reference,
+            grip_width_mm,
+            str(runtime_workspace.width_model),
+        )
+
+    @staticmethod
+    def _width_workspace_target_validator(
+        *,
+        base_to_plane: Any,
+        reference: dict[str, object],
+        runtime_workspace: Any,
+        workspace_xy_tolerance_m: float = 0.0,
+    ) -> Any:
+        matrix = np.asarray(base_to_plane, dtype=np.float64)
+        if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+            raise ValueError("live T_base_plane must be a finite 4x4 transform")
+        plane_to_base = np.linalg.inv(matrix)
+
+        def validate(target: BoundTargetPose) -> None:
+            point_base = np.asarray(target.position_m, dtype=np.float64)
+            point_plane = (plane_to_base @ np.r_[point_base, 1.0])[:3]
+            safe, details = check_tcp_point_plane(
+                reference,
+                runtime_workspace,
+                point_plane,
+                xy_tolerance_m=workspace_xy_tolerance_m,
+            )
+            if not safe:
+                reasons = "; ".join(str(item) for item in details["rejection_reasons"])
+                raise ValueError(
+                    "bound TCP target violates object-width workspace: " + reasons
                 )
-                robot.connect()
-                self._fixed_hardware_robot = robot
-            return robot, base_to_plane.copy()
+
+        return validate
 
     def _mock_regression_validate(
         self, row: SkillVersionRecord, graph: SkillGraph
@@ -6963,7 +7276,7 @@ class MVPApplication:
     def _scene_with_mock_binding_fixtures(
         scene: SceneSnapshot, graph: SkillGraph
     ) -> SceneSnapshot:
-        """Supply declared object classes only inside the explicit built-in Mock scene.
+        """Supply declared object/tool bindings inside the explicit built-in Mock scene.
 
         This makes class-specific block skills reproducible without weakening real-scene
         binding.  The cloned object retains the Mock perception pose, including its complete
@@ -6971,15 +7284,10 @@ class MVPApplication:
         """
 
         camera = scene.camera_metadata
-        if (
-            scene.calibration_id != "mock_calibration_v1"
-            or camera is None
-            or camera.camera_id != "mock_d435i"
-        ):
+        if camera is None or camera.camera_id != "mock_d435i":
             return scene
         objects = list(scene.objects)
-        if not objects:
-            return scene
+        tools = list(scene.tools)
         existing_ids = {
             entity.instance_id
             for collection in (scene.objects, scene.tools, scene.surfaces)
@@ -7000,13 +7308,15 @@ class MVPApplication:
             while identifier in existing_ids:
                 identifier = f"mock_{identifier_class}_{suffix:02d}"
                 suffix += 1
-            seed = objects[0]
-            fixture = seed.model_copy(
+            if not objects:
+                raise ValueError("Mock scene has no object fixture to clone")
+            object_seed = objects[0]
+            fixture = object_seed.model_copy(
                 update={
                     "instance_id": identifier,
                     "class_name": class_name,
                     "attributes": {
-                        **seed.attributes,
+                        **object_seed.attributes,
                         "mock_binding_fixture": True,
                         "declared_skill_id": graph.skill_id,
                     },
@@ -7016,9 +7326,54 @@ class MVPApplication:
             )
             objects.append(fixture)
             existing_ids.add(identifier)
-        if objects == scene.objects:
+        for binding in graph.bindings.values():
+            if binding.entity_kind is not EntityKind.TOOL:
+                continue
+            if any(
+                (binding.instance_id is None or item.instance_id == binding.instance_id)
+                and (binding.class_name is None or item.tool_class == binding.class_name)
+                and item.verification_confidence >= binding.minimum_confidence
+                and (
+                    binding.must_be_attached is None
+                    or item.attached is binding.must_be_attached
+                )
+                and (
+                    binding.compatible_skill is None
+                    or binding.compatible_skill in item.compatible_skills
+                )
+                for item in tools
+            ):
+                continue
+            if not tools:
+                raise ValueError("Mock scene has no tool fixture to clone")
+            identifier = binding.instance_id or f"mock_{binding.class_name or 'tool'}_01"
+            if identifier in existing_ids:
+                raise ValueError(f"Mock tool fixture ID already exists: {identifier}")
+            tool_seed = tools[0]
+            compatible_skills = list(tool_seed.compatible_skills)
+            if (
+                binding.compatible_skill is not None
+                and binding.compatible_skill not in compatible_skills
+            ):
+                compatible_skills.append(binding.compatible_skill)
+            tool_fixture = tool_seed.model_copy(
+                update={
+                    "instance_id": identifier,
+                    "tool_class": binding.class_name or tool_seed.tool_class,
+                    "attached": (
+                        binding.must_be_attached
+                        if binding.must_be_attached is not None
+                        else tool_seed.attached
+                    ),
+                    "compatible_skills": compatible_skills,
+                },
+                deep=True,
+            )
+            tools.append(tool_fixture)
+            existing_ids.add(identifier)
+        if objects == scene.objects and tools == scene.tools:
             return scene
-        return scene.model_copy(update={"objects": objects}, deep=True)
+        return scene.model_copy(update={"objects": objects, "tools": tools}, deep=True)
 
     def _load_verified_run(
         self, row: SkillVersionRecord, graph: SkillGraph
@@ -7055,6 +7410,94 @@ class MVPApplication:
             artifact_root=self.settings.artifact_root,
             expected_checksum_sha256=row.generated_code_checksum_sha256,
         )
+
+    def _load_execution_run(
+        self, row: SkillVersionRecord, graph: SkillGraph
+    ) -> tuple[CompiledRun, dict[str, str]]:
+        """Load the artifact for the exact graph passed through preflight.
+
+        Hardware runtime materialization may replace a taught replay path with a
+        current object-relative graph.  That graph must never execute the
+        registry artifact for the original replay graph.
+        """
+
+        graph_checksum = SkillCompiler.graph_checksum(graph)
+        if graph_checksum == row.graph_checksum_sha256:
+            return self._load_verified_run(row, graph), {
+                "kind": "registry",
+                "skill_graph_checksum_sha256": graph_checksum,
+                "compiled_skill_uri": str(row.generated_code_uri or ""),
+                "compiled_skill_checksum_sha256": str(
+                    row.generated_code_checksum_sha256 or ""
+                ),
+            }
+        return self._materialize_runtime_graph(graph)
+
+    def _materialize_runtime_graph(
+        self, graph: SkillGraph
+    ) -> tuple[CompiledRun, dict[str, str]]:
+        """Compile and verify one immutable artifact for an ephemeral runtime graph."""
+
+        compiled = SkillCompiler().compile(graph)
+        graph_checksum = compiled.graph_checksum_sha256
+        base_uri = f"runtime_skills/{graph.skill_id}/{graph.version}/{graph_checksum}"
+        graph_artifact = self.store.put_json(
+            f"{base_uri}/skill_graph.json", graph.model_dump(mode="json")
+        )
+        if graph_artifact.checksum_sha256 != graph_checksum:
+            raise ValueError("runtime graph artifact checksum does not match compiled graph")
+        code_artifact = self.store.put_text(
+            f"{base_uri}/compiled_skill.py",
+            compiled.source,
+            media_type="text/x-python; charset=utf-8",
+        )
+        validation = ValidationReport(
+            skill_id=graph.skill_id,
+            version=graph.version,
+            passed=compiled.validation_report.valid,
+            checks={
+                "schema": True,
+                "graph": True,
+                "ast": compiled.validation_report.valid,
+                "py_compile": compiled.validation_report.py_compile_passed,
+            },
+            graph_checksum_sha256=graph_checksum,
+            generated_code_checksum_sha256=code_artifact.checksum_sha256,
+            mock_validation=False,
+            hardware_validated=False,
+            timestamp_ns=time.time_ns(),
+        )
+        report_artifact = self.store.put_json(
+            f"{base_uri}/validation_report.json", validation.model_dump(mode="json")
+        )
+        manifest = SkillManifest(
+            skill_id=graph.skill_id,
+            version=graph.version,
+            skill_graph_uri=graph_artifact.uri,
+            skill_graph_checksum_sha256=graph_artifact.checksum_sha256,
+            compiled_skill_uri=code_artifact.uri,
+            compiled_skill_checksum_sha256=code_artifact.checksum_sha256,
+            validation_report_uri=report_artifact.uri,
+            validation_report_checksum_sha256=report_artifact.checksum_sha256,
+            source_demonstration_uris=list(graph.source_demonstrations),
+        )
+        manifest_uri = f"{base_uri}/manifest.json"
+        self.store.put_json(manifest_uri, manifest.model_dump(mode="json"))
+        verified_manifest = SkillManifest.model_validate_json(self.store.read_bytes(manifest_uri))
+        if not SkillCompiler.verify_manifest(verified_manifest, self.settings.artifact_root):
+            raise ValueError("runtime graph manifest artifact checksum verification failed")
+        return load_compiled_run(
+            Path(code_artifact.uri),
+            artifact_root=self.settings.artifact_root,
+            expected_checksum_sha256=code_artifact.checksum_sha256,
+        ), {
+            "kind": "runtime_materialized",
+            "skill_graph_uri": graph_artifact.uri,
+            "skill_graph_checksum_sha256": graph_artifact.checksum_sha256,
+            "compiled_skill_uri": code_artifact.uri,
+            "compiled_skill_checksum_sha256": code_artifact.checksum_sha256,
+            "manifest_uri": manifest_uri,
+        }
 
     def _motion_profiles(self) -> dict[str, Any]:
         return load_motion_profiles(

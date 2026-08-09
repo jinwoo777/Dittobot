@@ -26,6 +26,7 @@ from robot_skill_system.runtime.workspace_monitor import GlobalWorkspaceSupervis
 _SUPPORTED_OPERATIONS = frozenset(
     {
         "motion.move_j",
+        "motion.rotate_joint_6_relative",
         "motion.move_l",
         "motion.move_c",
         "motion.move_spline",
@@ -320,6 +321,25 @@ class RuntimeExecutor:
                     profile, "joint_acceleration_rad_s2"
                 ),
                 blend_radius_m=self._profile_number(profile, "blend_radius_m", default=0.0),
+            )
+        elif operation == "motion.rotate_joint_6_relative":
+            profile = self._motion_profile(arguments)
+            current = tuple(float(value) for value in self.robot.get_joint_positions())
+            if len(current) != 6 or any(not math.isfinite(value) for value in current):
+                raise RuntimeSafetyError("robot did not return six finite joint positions")
+            delta_rad = float(_get(arguments, "delta_rad"))
+            target = (*current[:5], current[5] + delta_rad)
+            if abs(target[5]) > 2.0 * math.pi:
+                raise RuntimeSafetyError("relative J6 target exceeds the ±360 degree envelope")
+            self.robot.move_j(
+                target,
+                velocity_rad_s=self._motion_limit(profile, "joint_velocity_rad_s"),
+                acceleration_rad_s2=self._motion_limit(
+                    profile, "joint_acceleration_rad_s2"
+                ),
+                blend_radius_m=self._profile_number(
+                    profile, "blend_radius_m", default=0.0
+                ),
             )
         elif operation == "motion.move_l":
             self._move_l(_get(arguments, "target_pose", "target"), arguments)

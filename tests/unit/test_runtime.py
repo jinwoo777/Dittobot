@@ -451,6 +451,58 @@ def test_mock_runtime_executes_profile_scaled_motion_offline(
     assert move.arguments["target_pose"].position_m == pytest.approx((0.6, 0.0, 0.8))
 
 
+def test_relative_j6_uses_current_feedback_and_preserves_other_joints(
+    profiles: tuple[dict[str, Any], dict[str, Any]],
+) -> None:
+    motion_profiles, force_profiles = profiles
+    graph = SkillGraph(
+        skill_id="rotate_grip_wrist",
+        version="1.0.0",
+        name="rotate grip wrist",
+        description="Rotate J6 from live feedback.",
+        skill_type="motion",
+        nodes=[
+            {
+                "node_id": "rotate",
+                "operation": "motion.rotate_joint_6_relative",
+                "arguments": {
+                    "delta_rad": 0.4,
+                    "motion_profile_id": "joint_safe",
+                },
+            }
+        ],
+        start_node="rotate",
+        terminal_nodes=["rotate"],
+        motion_profiles=["joint_safe"],
+        validation_status="passed",
+        lifecycle_status="active",
+    )
+    robot = MockRobotAdapter(clock_ns=lambda: NOW_NS)
+    robot.connect()
+    robot.move_j(
+        (0.1, -0.2, 0.3, -0.4, 0.5, -0.6),
+        velocity_rad_s=0.1,
+        acceleration_rad_s2=0.1,
+    )
+    robot.disconnect()
+    runtime = RuntimeOrchestrator(
+        robot=robot,
+        motion_profiles=motion_profiles,
+        force_profiles=force_profiles,
+        execution_mode="mock",
+        primitive_registry=PrimitiveRegistry.default(),
+        clock_ns=lambda: NOW_NS,
+    )
+
+    result = asyncio.run(runtime.run(command_text="rotate", skill=graph, scene=_scene()))
+
+    assert result.success
+    rotate = [command for command in robot.commands if command.operation == "move_j"][-1]
+    assert rotate.arguments["target"] == pytest.approx(
+        (0.1, -0.2, 0.3, -0.4, 0.5, -0.2)
+    )
+
+
 def test_graph_runtime_executes_only_the_selected_success_branch(
     profiles: tuple[dict[str, Any], dict[str, Any]],
 ) -> None:

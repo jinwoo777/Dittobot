@@ -30,7 +30,7 @@ def create_app(service: Any | None = None) -> Any:
     )
     from robot_skill_system.capture.rgbd_recording import CameraStateError
     from robot_skill_system.exceptions import HardwareExecutionDenied, NotConfiguredError
-    from robot_skill_system.runtime.errors import PreflightError
+    from robot_skill_system.runtime.errors import PreflightError, RuntimeErrorBase
 
     if service is None:
         from robot_skill_system.application import create_application
@@ -101,6 +101,10 @@ def create_app(service: Any | None = None) -> Any:
         # error.  The UI can surface this detail directly instead of showing a
         # misleading generic "Internal Server Error" banner.
         return JSONResponse(status_code=422, content={"detail": str(exc), "code": exc.code})
+
+    @app.exception_handler(RuntimeErrorBase)
+    async def runtime_failed(_request: Request, exc: RuntimeErrorBase) -> JSONResponse:
+        return JSONResponse(status_code=409, content={"detail": str(exc), "code": exc.code})
 
     # Retain FastAPI's type in the generated OpenAPI graph without importing it in core modules.
     _ = HTTPException

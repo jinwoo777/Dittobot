@@ -32,6 +32,7 @@ def test_catalog_contains_required_metadata_and_aliases() -> None:
 
     for operation in (
         "motion.move_j",
+        "motion.rotate_joint_6_relative",
         "motion.move_l",
         "motion.move_c",
         "motion.move_spline",
@@ -76,6 +77,24 @@ def test_relative_motion_arguments_are_typed_and_normalized() -> None:
     )
 
     assert validated.model_dump(mode="json")["motion_profile_id"] == "linear_normal"
+
+
+def test_relative_j6_rotation_is_bounded_and_profile_owned() -> None:
+    registry = PrimitiveRegistry.default()
+    validated = registry.validate_arguments(
+        "motion.rotate_joint_6_relative",
+        {"delta_rad": 0.5, "motion_profile_id": "joint_safe"},
+    )
+
+    assert validated.model_dump(mode="json") == {
+        "delta_rad": 0.5,
+        "motion_profile_id": "joint_safe",
+    }
+    with pytest.raises(PrimitiveValidationError):
+        registry.validate_arguments(
+            "motion.rotate_joint_6_relative",
+            {"delta_rad": 2.0, "motion_profile_id": "joint_safe"},
+        )
 
 
 def test_approved_profile_files_validate() -> None:
