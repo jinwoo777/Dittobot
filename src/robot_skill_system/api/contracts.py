@@ -110,6 +110,21 @@ class JogMoveJRequest(APIModel):
         return value
 
 
+class JogMoveLRequest(APIModel):
+    target_tcp_pose_base_mm_zyz_deg: list[float] = Field(min_length=6, max_length=6)
+
+    @field_validator("target_tcp_pose_base_mm_zyz_deg")
+    @classmethod
+    def validate_target_tcp_pose(cls, value: list[float]) -> list[float]:
+        if any(not math.isfinite(position) for position in value):
+            raise ValueError("movel target must contain six finite values")
+        if any(abs(position) > 2000.0 for position in value[:3]):
+            raise ValueError("movel position exceeds the +/-2000 mm schema envelope")
+        if any(abs(position) > 360.0 for position in value[3:]):
+            raise ValueError("movel orientation exceeds the +/-360 degree envelope")
+        return value
+
+
 class JogStopRequest(APIModel):
     reason: str = Field(default="operator_request", min_length=1, max_length=128)
 

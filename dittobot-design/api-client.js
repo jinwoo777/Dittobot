@@ -259,6 +259,14 @@
       });
     }
 
+    moveJogLinear(targetTcpPoseBaseMmZyzDeg) {
+      return this.request("/jog/movel", {
+        method: "POST",
+        body: { target_tcp_pose_base_mm_zyz_deg: targetTcpPoseBaseMmZyzDeg },
+        timeoutMs: 120000,
+      });
+    }
+
     stopJog(reason = "operator_request") {
       return this.request("/jog/stop", {
         method: "POST",

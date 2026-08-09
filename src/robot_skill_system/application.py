@@ -327,14 +327,23 @@ class MVPApplication:
             "ENABLE_WEB_JOG=true": settings.enable_web_jog,
             "JOG_CELL_SAFETY_VERIFIED=true": settings.jog_cell_safety_verified,
         }
-        jog_profile = load_motion_profiles(
+        jog_profiles = load_motion_profiles(
             settings.repo_root / "configs/motion_profiles/default.json"
-        )["joint_safe"]
+        )
+        jog_profile = jog_profiles["joint_safe"]
+        jog_linear_profile = jog_profiles["linear_slow"]
         if (
             jog_profile.joint_velocity_rad_s is None
             or jog_profile.joint_acceleration_rad_s2 is None
         ):
             raise ValueError("joint_safe must define joint velocity and acceleration")
+        if (
+            jog_linear_profile.linear_velocity_m_s is None
+            or jog_linear_profile.linear_acceleration_m_s2 is None
+            or jog_linear_profile.angular_velocity_rad_s is None
+            or jog_linear_profile.angular_acceleration_rad_s2 is None
+        ):
+            raise ValueError("linear_slow must define linear and angular limits")
         use_hardware_jog = settings.jog_hardware_enabled
         self.jog_controller = jog_controller or JogController(
             robot_factory=(
@@ -355,6 +364,22 @@ class MVPApplication:
             ),
             joint_acceleration_rad_s2=(
                 jog_profile.joint_acceleration_rad_s2 * jog_profile.safety_scale
+            ),
+            linear_velocity_m_s=(
+                jog_linear_profile.linear_velocity_m_s
+                * jog_linear_profile.safety_scale
+            ),
+            linear_acceleration_m_s2=(
+                jog_linear_profile.linear_acceleration_m_s2
+                * jog_linear_profile.safety_scale
+            ),
+            angular_velocity_rad_s=(
+                jog_linear_profile.angular_velocity_rad_s
+                * jog_linear_profile.safety_scale
+            ),
+            angular_acceleration_rad_s2=(
+                jog_linear_profile.angular_acceleration_rad_s2
+                * jog_linear_profile.safety_scale
             ),
         )
         aruco_gates = {
@@ -648,6 +673,16 @@ class MVPApplication:
             self._ensure_no_other_robot_motion("movej")
             return self.jog_controller.move_to_joint_positions(
                 target_joint_positions_deg=tuple(float(value) for value in target)
+            )
+
+    def move_jog_linear(self, request: dict[str, Any]) -> dict[str, Any]:
+        target = request["target_tcp_pose_base_mm_zyz_deg"]
+        if not isinstance(target, (list, tuple)):
+            raise ValueError("movel target must be a six-value pose")
+        with self._robot_motion_transition_lock:
+            self._ensure_no_other_robot_motion("movel")
+            return self.jog_controller.move_to_cartesian_pose(
+                target_tcp_pose_base_mm_zyz_deg=tuple(float(value) for value in target)
             )
 
     def stop_jog(self, request: dict[str, Any]) -> dict[str, Any]:

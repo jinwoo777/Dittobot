@@ -148,6 +148,8 @@
     .jog-operator input, .jog-step input, .jog-target-angle { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
     .jog-operator select { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--bg); }
     .jog-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+    .jog-mode-switch { display: inline-flex; gap: 8px; margin-bottom: 18px; padding: 5px; border: 1px solid var(--border); border-radius: 11px; background: var(--bg); }
+    .jog-mode-switch .button { min-width: 110px; }
     .jog-step { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
     .jog-step input { width: 100px; }
     .jog-joints { display: grid; gap: 9px; }
@@ -1146,7 +1148,7 @@
       </section>
 
       <section id="page-jog" class="page" hidden>
-        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그 · MOVEJ</h1><p class="subtitle">M0609의 J1–J6 목표각을 degree로 직접 입력한 뒤, MOVEJ 한 번으로 6축을 함께 이동합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
+        <header><p class="eyebrow">05 · DIRECT CONTROL</p><h1>조그 · MOVEJ / MOVEL</h1><p class="subtitle">관절 목표각 또는 DR_BASE 기준 TCP pose를 직접 입력하고 MOVEJ와 MOVEL을 전환해 사용합니다. 이동 전 안전 확인을 완료하고, 사용 후 반드시 정지하여 조그 세션을 비활성화하세요.</p></header>
         <div class="jog-layout">
           <section class="panel">
             <p class="eyebrow">SAFETY ENABLE</p>
@@ -1157,7 +1159,7 @@
             <div class="jog-safety-list">
               <label><input id="jog-workspace-cleared" type="checkbox" autocomplete="off"> 로봇 작업공간에 사람과 장애물이 없음을 확인했습니다.</label>
               <label><input id="jog-estop-ready" type="checkbox" autocomplete="off"> 비상 정지 버튼을 즉시 사용할 수 있습니다.</label>
-              <label><input id="jog-direct-motion-ack" type="checkbox" autocomplete="off"> 아래 버튼을 누르면 로봇 관절이 직접 움직일 수 있음을 이해했습니다.</label>
+              <label><input id="jog-direct-motion-ack" type="checkbox" autocomplete="off"> MOVEJ 또는 MOVEL 버튼을 누르면 로봇이 직접 움직일 수 있음을 이해했습니다.</label>
             </div>
             <div class="actions">
               <button id="jog-enable" type="button" class="button primary">조그 활성화</button>
@@ -1168,18 +1170,38 @@
             <pre id="jog-gates" class="jog-gates"></pre>
           </section>
           <section class="panel">
-            <div class="jog-toolbar">
-              <div><p class="eyebrow">JOINT TARGET · J1–J6</p><p class="subtitle">현재각을 참고해 목표각을 직접 입력하세요. ± 설정은 목표값만 바꾸며 로봇을 움직이지 않습니다.</p></div>
-              <label class="jog-step" for="jog-step-deg">± 설정 간격 (0.1–5°)
-                <input id="jog-step-deg" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
-              </label>
+            <div class="jog-mode-switch" role="group" aria-label="조그 이동 방식">
+              <button id="jog-mode-movej" type="button" class="button primary" aria-pressed="true">MOVEJ</button>
+              <button id="jog-mode-movel" type="button" class="button" aria-pressed="false">MOVEL</button>
             </div>
-            <div id="jog-joint-list" class="jog-joints"></div>
-            <div class="jog-target-actions">
-              <button id="jog-load-current" type="button" class="button">현재각 불러오기</button>
-              <button id="jog-movej" type="button" class="button primary" disabled>MOVEJ · 6축 이동</button>
+            <div id="jog-joint-panel">
+              <div class="jog-toolbar">
+                <div><p class="eyebrow">JOINT TARGET · J1–J6</p><p class="subtitle">현재각을 참고해 목표각을 직접 입력하세요. ± 설정은 목표값만 바꾸며 로봇을 움직이지 않습니다.</p></div>
+                <label class="jog-step" for="jog-step-deg">± 설정 간격 (0.1–5°)
+                  <input id="jog-step-deg" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
+                </label>
+              </div>
+              <div id="jog-joint-list" class="jog-joints"></div>
+              <div class="jog-target-actions">
+                <button id="jog-load-current" type="button" class="button">현재각 불러오기</button>
+                <button id="jog-movej" type="button" class="button primary" disabled>MOVEJ · 6축 이동</button>
+              </div>
+              <p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p>
             </div>
-            <p class="subtitle">각도 단위: degree · 속도/가속도: 승인된 joint_safe 프로파일</p>
+            <div id="jog-linear-panel" hidden>
+              <div class="jog-toolbar">
+                <div><p class="eyebrow">TCP TARGET · DR_BASE</p><p class="subtitle">X/Y/Z는 mm, Rx/Ry/Rz는 degree입니다. ± 설정은 목표값만 변경합니다.</p></div>
+                <label class="jog-step" for="jog-linear-step">± 설정 간격 (0.1–5)
+                  <input id="jog-linear-step" type="number" min="0.1" max="5" step="0.1" value="1" inputmode="decimal">
+                </label>
+              </div>
+              <div id="jog-linear-list" class="jog-joints"></div>
+              <div class="jog-target-actions">
+                <button id="jog-load-current-tcp" type="button" class="button">현재 TCP 불러오기</button>
+                <button id="jog-movel" type="button" class="button primary" disabled>MOVEL · 직선 이동</button>
+              </div>
+              <p class="subtitle">위치: mm · 자세: degree · 기준: DR_BASE · 프로파일: linear_slow · 1회 최대 50 mm / 축별 5°</p>
+            </div>
           </section>
         </div>
       </section>
@@ -1229,7 +1251,7 @@
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js?v=direct-skill-run-1"></script>
-  <script src="./app.js?v=direct-skill-run-1"></script>
+  <script src="./api-client.js?v=jog-movel-1"></script>
+  <script src="./app.js?v=jog-movel-1"></script>
 </body>
 </html>

@@ -37,8 +37,11 @@
       status: null,
       loading: false,
       lastError: null,
+      motionMode: "movej",
       targetPositionsDeg: null,
       targetDirty: false,
+      targetTcpPose: null,
+      targetTcpDirty: false,
     },
     arucoExperiment: {
       status: null,
@@ -158,6 +161,14 @@
     jogJointList: element("jog-joint-list"),
     jogLoadCurrent: element("jog-load-current"),
     jogMoveJ: element("jog-movej"),
+    jogModeMoveJ: element("jog-mode-movej"),
+    jogModeMoveL: element("jog-mode-movel"),
+    jogJointPanel: element("jog-joint-panel"),
+    jogLinearPanel: element("jog-linear-panel"),
+    jogLinearStep: element("jog-linear-step"),
+    jogLinearList: element("jog-linear-list"),
+    jogLoadCurrentTcp: element("jog-load-current-tcp"),
+    jogMoveL: element("jog-movel"),
     arucoExperimentModeNotice: element("aruco-experiment-mode-notice"),
     arucoExperimentOperatorId: element("aruco-experiment-operator-id"),
     arucoObjectWidthMm: element("aruco-object-width-mm"),
@@ -1572,14 +1583,30 @@
     const positions = Array.isArray(payload?.joint_positions_deg)
       ? payload.joint_positions_deg
       : [0, 0, 0, 0, 0, 0];
+    const tcpPose = Array.isArray(payload?.tcp_pose_base_mm_zyz_deg)
+      ? payload.tcp_pose_base_mm_zyz_deg
+      : [0, 0, 0, 0, 0, 0];
     if (!Array.isArray(state.jog.targetPositionsDeg)
       || state.jog.targetPositionsDeg.length !== 6) {
       state.jog.targetPositionsDeg = positions.map((value) => Number(value));
       state.jog.targetDirty = false;
     }
+    if (!Array.isArray(state.jog.targetTcpPose)
+      || state.jog.targetTcpPose.length !== 6) {
+      state.jog.targetTcpPose = tcpPose.map((value) => Number(value));
+      state.jog.targetTcpDirty = false;
+    }
+
+    const moveLMode = state.jog.motionMode === "movel";
+    dom.jogModeMoveJ.classList.toggle("primary", !moveLMode);
+    dom.jogModeMoveL.classList.toggle("primary", moveLMode);
+    dom.jogModeMoveJ.setAttribute("aria-pressed", String(!moveLMode));
+    dom.jogModeMoveL.setAttribute("aria-pressed", String(moveLMode));
+    dom.jogJointPanel.hidden = moveLMode;
+    dom.jogLinearPanel.hidden = !moveLMode;
 
     dom.jogModeNotice.textContent = hardware
-      ? "실제 M0609 하드웨어 조그 모드입니다. MOVEJ를 누르면 입력한 6축 목표로 즉시 이동합니다."
+      ? `실제 M0609 하드웨어 조그 모드입니다. ${moveLMode ? "MOVEL" : "MOVEJ"}을 누르면 입력한 목표로 즉시 이동합니다.`
       : "MOCK 조그 모드입니다. 화면의 관절값만 변경되며 실제 로봇은 움직이지 않습니다.";
     renderConnection();
     dom.jogModeNotice.style.color = hardware ? "var(--danger)" : "";
@@ -1596,7 +1623,7 @@
       ? capabilities.failed_gates
       : [];
     dom.jogGates.textContent = hardware
-      ? `실제 로봇 gate: 모두 통과\nMOVEJ 속도/가속도: 승인된 ${capabilities.motion_profile_id || "joint_safe"} 프로파일`
+      ? `실제 로봇 gate: 모두 통과\nMOVEJ: ${capabilities.motion_profile_id || "joint_safe"}\nMOVEL: ${capabilities.movel_motion_profile_id || "사용 불가"}\nMOVEL 1회 제한: ${capabilities.maximum_movel_translation_mm || 50} mm / ${capabilities.maximum_movel_rotation_deg || 5}°`
       : `실제 로봇은 비활성화됨${failedGates.length ? `\n닫힌 gate:\n- ${failedGates.join("\n- ")}` : ""}\n현재 조작은 MOCK 전용`;
 
     dom.jogEnable.disabled = busy || enabled || state.apiStatus !== "connected";
@@ -1607,9 +1634,12 @@
     dom.jogEstopReady.disabled = enabled || busy;
     dom.jogDirectMotionAck.disabled = enabled || busy;
     dom.jogStepDeg.disabled = busy;
+    dom.jogLinearStep.disabled = busy;
     dom.jogLoadCurrent.disabled = busy || !payload;
     dom.jogMoveJ.disabled = busy || !enabled;
-    if (document.activeElement?.classList.contains("jog-target-angle")) return;
+    dom.jogLoadCurrentTcp.disabled = busy || !payload;
+    dom.jogMoveL.disabled = busy || !enabled || capabilities.movel_available !== true;
+    if (document.activeElement?.classList.contains("jog-target-input")) return;
     dom.jogJointList.replaceChildren();
     for (let jointIndex = 1; jointIndex <= 6; jointIndex += 1) {
       const row = create("div", { className: "jog-joint" });
@@ -1620,7 +1650,9 @@
         className: "jog-angle",
         text: `현재 ${Number(positions[jointIndex - 1] || 0).toFixed(3)}°`,
       });
-      const target = create("input", { className: "jog-target-angle" });
+      const target = create("input", {
+        className: "jog-target-angle jog-target-input",
+      });
       target.type = "number";
       target.step = "0.1";
       target.inputMode = "decimal";
@@ -1646,6 +1678,58 @@
       row.append(name, currentAngle, target, minus, plus);
       dom.jogJointList.append(row);
     }
+
+    const cartesianLabels = ["X", "Y", "Z", "Rx", "Ry", "Rz"];
+    dom.jogLinearList.replaceChildren();
+    cartesianLabels.forEach((label, index) => {
+      const unit = index < 3 ? "mm" : "deg";
+      const row = create("div", { className: "jog-joint" });
+      const name = create("strong", { text: label });
+      const currentValue = create("span", {
+        className: "jog-angle",
+        text: `현재 ${Number(tcpPose[index] || 0).toFixed(3)} ${unit}`,
+      });
+      const target = create("input", {
+        className: "jog-target-angle jog-target-input",
+      });
+      target.type = "number";
+      target.step = "0.1";
+      target.inputMode = "decimal";
+      target.min = index < 3 ? "-1000" : "-360";
+      target.max = index < 3 ? "1000" : "360";
+      target.value = String(state.jog.targetTcpPose[index]);
+      target.disabled = !enabled || busy;
+      target.setAttribute("aria-label", `${label} 목표 (${unit}, DR_BASE 기준)`);
+      target.addEventListener("input", () => {
+        state.jog.targetTcpPose[index] = target.value;
+        state.jog.targetTcpDirty = true;
+      });
+      const minus = create("button", { className: "button", text: "− 설정" });
+      const plus = create("button", { className: "button", text: "+ 설정" });
+      minus.type = "button";
+      plus.type = "button";
+      minus.disabled = !enabled || busy;
+      plus.disabled = !enabled || busy;
+      minus.addEventListener("click", () => moveJogCartesianAxis(index, -1));
+      plus.addEventListener("click", () => moveJogCartesianAxis(index, 1));
+      row.append(name, currentValue, target, minus, plus);
+      dom.jogLinearList.append(row);
+    });
+  }
+
+  function syncJogTargetsFromStatus({ force = false } = {}) {
+    const positions = state.jog.status?.joint_positions_deg;
+    const tcpPose = state.jog.status?.tcp_pose_base_mm_zyz_deg;
+    if ((force || !state.jog.targetDirty)
+      && Array.isArray(positions) && positions.length === 6) {
+      state.jog.targetPositionsDeg = positions.map(Number);
+      state.jog.targetDirty = false;
+    }
+    if ((force || !state.jog.targetTcpDirty)
+      && Array.isArray(tcpPose) && tcpPose.length === 6) {
+      state.jog.targetTcpPose = tcpPose.map(Number);
+      state.jog.targetTcpDirty = false;
+    }
   }
 
   async function refreshJogStatus({ quiet = false } = {}) {
@@ -1653,10 +1737,7 @@
     try {
       const wasEnabled = state.jog.status?.enabled === true;
       state.jog.status = await api.jogStatus();
-      if (!state.jog.targetDirty
-        && Array.isArray(state.jog.status?.joint_positions_deg)) {
-        state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      }
+      syncJogTargetsFromStatus();
       if (wasEnabled && state.jog.status?.enabled !== true) {
         dom.jogWorkspaceCleared.checked = false;
         dom.jogEstopReady.checked = false;
@@ -1691,8 +1772,7 @@
         estop_ready: true,
         acknowledge_direct_motion: true,
       });
-      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      state.jog.targetDirty = false;
+      syncJogTargetsFromStatus({ force: true });
       const hardware = state.jog.status?.capabilities?.mode === "hardware";
       setBanner(
         hardware ? "실제 로봇 조그가 활성화되었습니다. 로봇 주변에 접근하지 마세요." : "MOCK 조그가 활성화되었습니다.",
@@ -1769,12 +1849,104 @@
     renderJog();
     try {
       state.jog.status = await api.moveJogJoints(targets);
-      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      state.jog.targetDirty = false;
+      syncJogTargetsFromStatus({ force: true });
       setBanner(`MOVEJ 완료 · [${targets.join(", ")}]°`, "ok");
     } catch (error) {
       state.jog.lastError = errorText(error);
       setBanner(`MOVEJ 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.jog.loading = false;
+      renderJog();
+    }
+  }
+
+  function setJogMotionMode(mode) {
+    if (!new Set(["movej", "movel"]).has(mode)) return;
+    state.jog.motionMode = mode;
+    renderJog();
+  }
+
+  function moveJogCartesianAxis(axisIndex, direction) {
+    const step = Number(dom.jogLinearStep.value);
+    if (!Number.isFinite(step) || step < 0.1 || step > 5) {
+      setBanner("MOVEL 설정 간격은 0.1 이상 5 이하여야 합니다.", "danger");
+      return;
+    }
+    const currentTarget = Number(state.jog.targetTcpPose[axisIndex]);
+    const nextTarget = Number((currentTarget + direction * step).toFixed(3));
+    const maximum = axisIndex < 3 ? 1000 : 360;
+    if (!Number.isFinite(nextTarget) || Math.abs(nextTarget) > maximum) {
+      setBanner("MOVEL 목표값이 입력 허용 범위를 벗어납니다.", "danger");
+      return;
+    }
+    state.jog.targetTcpPose[axisIndex] = nextTarget;
+    state.jog.targetTcpDirty = true;
+    renderJog();
+  }
+
+  function loadCurrentJogTcpTarget() {
+    const tcpPose = state.jog.status?.tcp_pose_base_mm_zyz_deg;
+    if (!Array.isArray(tcpPose) || tcpPose.length !== 6) return;
+    state.jog.targetTcpPose = tcpPose.map(Number);
+    state.jog.targetTcpDirty = false;
+    renderJog();
+    setBanner("현재 TCP pose를 MOVEL 목표로 불러왔습니다.");
+  }
+
+  async function executeJogMoveL() {
+    const rawTargets = state.jog.targetTcpPose;
+    const hasBlankTarget = rawTargets?.some(
+      (value) => typeof value === "string" && value.trim() === "",
+    );
+    const targets = rawTargets?.map(Number);
+    if (hasBlankTarget || !Array.isArray(targets) || targets.length !== 6
+      || targets.some((value) => !Number.isFinite(value))) {
+      setBanner("X, Y, Z, Rx, Ry, Rz 목표를 모두 숫자로 입력하세요.", "danger");
+      return;
+    }
+    const current = state.jog.status?.tcp_pose_base_mm_zyz_deg?.map(Number);
+    if (!Array.isArray(current) || current.length !== 6) {
+      setBanner("현재 TCP pose를 읽은 뒤 다시 시도하세요.", "danger");
+      return;
+    }
+    const capabilities = state.jog.status?.capabilities || {};
+    const maximumTranslation = Number(capabilities.maximum_movel_translation_mm || 50);
+    const maximumRotation = Number(capabilities.maximum_movel_rotation_deg || 5);
+    const translation = Math.hypot(
+      targets[0] - current[0],
+      targets[1] - current[1],
+      targets[2] - current[2],
+    );
+    const rotationDeltas = targets.slice(3).map((value, index) => (
+      Math.abs(((value - current[index + 3] + 180) % 360 + 360) % 360 - 180)
+    ));
+    if (translation > maximumTranslation) {
+      setBanner(`MOVEL 1회 이동은 ${maximumTranslation} mm 이하여야 합니다.`, "danger");
+      return;
+    }
+    if (Math.max(...rotationDeltas) > maximumRotation) {
+      setBanner(`MOVEL 1회 자세 변경은 축별 ${maximumRotation}° 이하여야 합니다.`, "danger");
+      return;
+    }
+    const maximumRadius = Number(capabilities.maximum_tcp_base_radius_mm || 1000);
+    if (Math.hypot(targets[0], targets[1], targets[2]) > maximumRadius) {
+      setBanner(`TCP 목표는 base 반경 ${maximumRadius} mm 안이어야 합니다.`, "danger");
+      return;
+    }
+    const hardware = capabilities.mode === "hardware";
+    if (hardware && !window.confirm(
+      `DR_BASE 기준 [${targets.join(", ")}]으로 MOVEL을 실행할까요?`,
+    )) return;
+    state.jog.loading = true;
+    state.jog.lastError = null;
+    renderJog();
+    try {
+      state.jog.status = await api.moveJogLinear(targets);
+      syncJogTargetsFromStatus({ force: true });
+      setBanner(`MOVEL 완료 · [${targets.join(", ")}]`, "ok");
+    } catch (error) {
+      state.jog.lastError = errorText(error);
+      setBanner(`MOVEL 실패: ${errorText(error)}`, "danger");
     } finally {
       state.jog.loading = false;
       renderJog();
@@ -1800,8 +1972,7 @@
     try {
       state.jog.status = await api.stopJog("ui_operator_request");
       state.jog.lastError = null;
-      state.jog.targetPositionsDeg = state.jog.status.joint_positions_deg.map(Number);
-      state.jog.targetDirty = false;
+      syncJogTargetsFromStatus({ force: true });
       dom.jogWorkspaceCleared.checked = false;
       dom.jogEstopReady.checked = false;
       dom.jogDirectMotionAck.checked = false;
@@ -3290,6 +3461,10 @@
   dom.jogStop.addEventListener("click", stopJog);
   dom.jogLoadCurrent.addEventListener("click", loadCurrentJogTargets);
   dom.jogMoveJ.addEventListener("click", executeJogMoveJ);
+  dom.jogModeMoveJ.addEventListener("click", () => setJogMotionMode("movej"));
+  dom.jogModeMoveL.addEventListener("click", () => setJogMotionMode("movel"));
+  dom.jogLoadCurrentTcp.addEventListener("click", loadCurrentJogTcpTarget);
+  dom.jogMoveL.addEventListener("click", executeJogMoveL);
   dom.arucoExperimentEnable.addEventListener("click", enableArucoExperiment);
   dom.arucoExperimentRefresh.addEventListener(
     "click",
@@ -3410,13 +3585,13 @@
       const normal = await resizeCursorImage(
         "assets/metamon_cursor.png",
         1,
-        1
+        5
       );
 
       const hand = await resizeCursorImage(
         "assets/metamon_point.png",
         1,
-        1
+        5
       );
 
       document.body.style.setProperty(
