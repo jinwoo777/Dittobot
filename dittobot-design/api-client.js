@@ -128,6 +128,17 @@
       });
     }
 
+    createSkillBlockRevisionCandidate(skillId, version, payload) {
+      return this.request(
+        `/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}/block-candidates`,
+        {
+          method: "POST",
+          body: { ...payload, acknowledge_mock_only: true },
+          timeoutMs: 120000,
+        },
+      );
+    }
+
     createSkillParameterCandidate(skillId, version, payload) {
       return this.request(
         `/skills/${encodeURIComponent(skillId)}/versions/${encodeURIComponent(version)}/parameter-candidates`,

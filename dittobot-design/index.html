@@ -1029,6 +1029,20 @@
         <section id="block-create-mode" class="create-mode block-layout" hidden>
           <form id="block-skill-form" class="panel form-grid">
             <p class="eyebrow">SEQUENTIAL BLOCK SKILL</p>
+            <div class="panel">
+              <p class="eyebrow">EXISTING SKILL</p>
+              <label>기존 스킬 불러오기
+                <select id="existing-skill-select" aria-label="기존 스킬 선택">
+                  <option value="">기존 스킬을 선택하세요</option>
+                </select>
+              </label>
+              <div class="actions">
+                <button id="load-skill-to-blockly" type="button" class="button">Blockly로 불러오기</button>
+                <button id="new-block-skill" type="button" class="button">새 스킬로 초기화</button>
+              </div>
+              <p id="loaded-skill-status" class="notice" role="status" aria-live="polite">스킬 버전을 선택하면 primitive와 인수를 Blockly 작업공간으로 불러옵니다.</p>
+              <p class="notice">원본 스킬은 변경되지 않으며, 수정 결과는 checksum으로 보호된 새 child Candidate로 생성됩니다.</p>
+            </div>
             <label>스킬 ID
               <input id="block-skill-id" type="text" value="block_skill" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}" maxlength="64" required autocomplete="off">
             </label>
@@ -1251,7 +1265,7 @@
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js?v=jog-movel-1"></script>
-  <script src="./app.js?v=jog-movel-1"></script>
+  <script src="./api-client.js?v=blockly-existing-skill-1"></script>
+  <script src="./app.js?v=blockly-existing-skill-1"></script>
 </body>
 </html>

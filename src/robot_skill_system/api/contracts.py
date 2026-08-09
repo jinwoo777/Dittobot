@@ -356,6 +356,21 @@ class SkillEditorCandidateRequest(SkillEditorPreviewRequest):
         return self
 
 
+class SkillEditorRevisionCandidateRequest(SkillEditorPreviewRequest):
+    """Checksum-guarded full Blockly revision of an immutable parent graph."""
+
+    expected_parent_checksum_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acknowledge_mock_only: bool
+
+    @model_validator(mode="after")
+    def validate_revision_candidate(self) -> SkillEditorRevisionCandidateRequest:
+        if not self.acknowledge_mock_only:
+            raise ValueError(
+                "block revision Candidate creation requires Mock-only acknowledgement"
+            )
+        return self
+
+
 class SkillParameterEditRequest(APIModel):
     """Complete replacement arguments for one existing immutable graph node."""
 

@@ -5209,6 +5209,120 @@ class MVPApplication:
             "promotion_policy": promotion.as_dict(),
         }
 
+    def create_skill_editor_revision_candidate(
+        self,
+        skill_id: str,
+        version: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Create a full Blockly child revision without mutating its parent graph."""
+
+        promotion = PromotionPolicy().evaluate_block_candidate(
+            operator_confirmed=request.get("acknowledge_mock_only") is True
+        )
+        if not promotion.eligible:
+            raise ValueError(
+                "block revision Candidate promotion blocked: "
+                + "; ".join(promotion.blockers)
+            )
+        if str(request["skill_id"]) != skill_id:
+            raise ValueError("request skill_id must match the parent skill_id")
+
+        parent = self._find_version(skill_id, version)
+        expected_checksum = str(request["expected_parent_checksum_sha256"])
+        if expected_checksum != parent.graph_checksum_sha256:
+            raise ValueError(
+                "parent SkillGraph checksum changed; reload before editing"
+            )
+        parent_graph = SkillGraph.model_validate(parent.graph_json)
+        if SkillCompiler.graph_checksum(parent_graph) != parent.graph_checksum_sha256:
+            raise ValueError("stored parent SkillGraph checksum verification failed")
+
+        immutable_metadata = {
+            "name": parent_graph.name,
+            "description": parent_graph.description,
+            "skill_type": parent_graph.skill_type.value,
+        }
+        for field_name, expected_value in immutable_metadata.items():
+            supplied_value = request[field_name]
+            if hasattr(supplied_value, "value"):
+                supplied_value = supplied_value.value
+            if str(supplied_value) != expected_value:
+                raise ValueError(
+                    f"{field_name} cannot be changed in a Blockly child revision"
+                )
+
+        candidate_version = self._next_editor_candidate_version(
+            skill_id,
+            parent_version=parent_graph.version,
+        )
+        try:
+            editor_graph = self._build_editor_skill_graph(
+                request,
+                version=candidate_version,
+            )
+            candidate_graph = parent_graph.model_copy(
+                update={
+                    "version": candidate_version,
+                    "parent_version": parent_graph.version,
+                    "required_tools": editor_graph.required_tools,
+                    "required_entity_roles": editor_graph.required_entity_roles,
+                    "bindings": editor_graph.bindings,
+                    "nodes": editor_graph.nodes,
+                    "edges": [],
+                    "start_node": editor_graph.start_node,
+                    "terminal_nodes": editor_graph.terminal_nodes,
+                    "motion_profiles": editor_graph.motion_profiles,
+                    "force_profiles": editor_graph.force_profiles,
+                    "uncertainty": {
+                        **parent_graph.uncertainty,
+                        "authoring_method": "sequential_block_editor_revision",
+                        "blockly_revision": {
+                            "parent_graph_checksum_sha256": expected_checksum,
+                            "original_node_count": len(parent_graph.nodes),
+                            "revised_node_count": len(editor_graph.nodes),
+                        },
+                        "promotion_policy": promotion.as_dict(),
+                    },
+                    "validation_status": ValidationStatus.UNVALIDATED,
+                    "lifecycle_status": SkillLifecycleStatus.CANDIDATE,
+                },
+                deep=True,
+            )
+            row = self._persist_graph(
+                candidate_graph,
+                status="candidate",
+                validation_status="pending",
+                variant=self._skill_variant(parent),
+                parent_version_id=parent.id,
+            )
+        except RobotSkillError as error:
+            raise ValueError(str(error)) from error
+
+        validation = self.validate_skill(
+            skill_id,
+            {"version": row.semantic_version, "mode": "mock"},
+        )
+        unchanged_parent = self._find_version(skill_id, parent.semantic_version)
+        return {
+            "created": True,
+            "skill_id": skill_id,
+            "parent_version": parent.semantic_version,
+            "parent_checksum_sha256": parent.graph_checksum_sha256,
+            "parent_unchanged": (
+                unchanged_parent.graph_checksum_sha256
+                == parent.graph_checksum_sha256
+            ),
+            "candidate": self._version_summary(
+                self._find_version(skill_id, row.semantic_version),
+                include_graph=True,
+            ),
+            "validation": validation,
+            "mock_validation_passed": validation["passed"],
+            "hardware_compatible": False,
+            "promotion_policy": promotion.as_dict(),
+        }
+
     def create_skill_parameter_candidate(
         self,
         skill_id: str,

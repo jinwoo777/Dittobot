@@ -80,6 +80,7 @@
       selectedBlocklyBlockId: null,
       blocklyError: null,
       blocklyCatalogSignature: "",
+      loadedParent: null,
       parameterNodeId: null,
       parameterArguments: null,
     },
@@ -220,6 +221,10 @@
     recordingCreateMode: element("recording-create-mode"),
     blockCreateMode: element("block-create-mode"),
     blockSkillForm: element("block-skill-form"),
+    existingSkillSelect: element("existing-skill-select"),
+    loadSkillToBlockly: element("load-skill-to-blockly"),
+    newBlockSkill: element("new-block-skill"),
+    loadedSkillStatus: element("loaded-skill-status"),
     blockSkillId: element("block-skill-id"),
     blockSkillName: element("block-skill-name"),
     blockSkillDescription: element("block-skill-description"),
@@ -1364,7 +1369,202 @@
     });
   }
 
+  function renderExistingSkillOptions() {
+    const selectedKey = dom.existingSkillSelect.value
+      || state.editor.loadedParent?.key
+      || "";
+    dom.existingSkillSelect.replaceChildren();
+    const placeholder = create("option", { text: "기존 스킬 버전을 선택하세요" });
+    placeholder.value = "";
+    dom.existingSkillSelect.append(placeholder);
+    state.skills.forEach((skill) => {
+      const option = create("option", {
+        text: `${skill.id} · v${skill.version} · ${skill.graph.name || skill.uiState}`,
+      });
+      option.value = skill.key;
+      option.selected = skill.key === selectedKey;
+      dom.existingSkillSelect.append(option);
+    });
+    if (!state.skills.some((skill) => skill.key === selectedKey)) {
+      dom.existingSkillSelect.value = "";
+    }
+    const parent = state.editor.loadedParent;
+    dom.loadSkillToBlockly.disabled = state.apiStatus !== "connected"
+      || state.editor.loading
+      || !dom.existingSkillSelect.value;
+    dom.newBlockSkill.disabled = state.editor.loading;
+    dom.blockSkillId.disabled = Boolean(parent);
+    dom.blockSkillName.disabled = Boolean(parent);
+    dom.blockSkillDescription.disabled = Boolean(parent);
+    dom.blockSkillType.disabled = Boolean(parent);
+    dom.createBlockCandidate.textContent = parent
+      ? "수정 Candidate 생성"
+      : "Candidate 생성";
+    dom.loadedSkillStatus.textContent = parent
+      ? `${parent.id}@${parent.version} 불러옴 · checksum ${parent.checksum.slice(0, 12)}… · 원본 메타데이터는 잠겨 있습니다.`
+      : "스킬 버전을 선택하면 primitive와 인수를 Blockly 작업공간으로 불러옵니다.";
+  }
+
+  function sequentialNodesForBlockly(graph) {
+    const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+    if (!nodes.length || !graph.start_node) {
+      throw new Error("SkillGraph에 시작 노드가 없습니다.");
+    }
+    const byId = new Map(nodes.map((node) => [node.node_id, node]));
+    if (!byId.has(graph.start_node)) {
+      throw new Error("SkillGraph의 시작 노드를 찾을 수 없습니다.");
+    }
+    const transitions = new Map();
+    const addTransition = (source, target) => {
+      if (!target) return;
+      const targets = transitions.get(source) || new Set();
+      targets.add(target);
+      transitions.set(source, targets);
+    };
+    nodes.forEach((node) => {
+      if (node.on_failure) {
+        throw new Error(`${node.node_id}에 실패 분기가 있어 순차 Blockly로 표현할 수 없습니다.`);
+      }
+      if (node.timeout_s != null || node.timeout != null
+        || node.checkpoint != null || node.required_scene_freshness_ms != null) {
+        throw new Error(`${node.node_id}에 Blockly가 표시하지 못하는 실행 메타데이터가 있습니다.`);
+      }
+      if (!primitiveByOperation(node.operation)) {
+        throw new Error(`${node.operation}은 현재 승인 primitive catalog에 없습니다.`);
+      }
+      addTransition(node.node_id, node.on_success);
+    });
+    (graph.edges || []).forEach((edge) => {
+      if ((edge.condition || "success") !== "success") {
+        throw new Error("failure/always edge가 있어 순차 Blockly로 표현할 수 없습니다.");
+      }
+      addTransition(edge.source_node || edge.from_node, edge.target_node || edge.to_node);
+    });
+
+    const ordered = [];
+    const visited = new Set();
+    let nodeId = graph.start_node;
+    while (nodeId) {
+      if (visited.has(nodeId)) throw new Error("순환 경로는 Blockly로 불러올 수 없습니다.");
+      const node = byId.get(nodeId);
+      if (!node) throw new Error(`경로가 알 수 없는 노드 ${nodeId}를 참조합니다.`);
+      visited.add(nodeId);
+      ordered.push(node);
+      const targets = [...(transitions.get(nodeId) || [])];
+      if (targets.length > 1) {
+        throw new Error(`${nodeId}에서 경로가 분기되어 순차 Blockly로 표현할 수 없습니다.`);
+      }
+      nodeId = targets[0] || null;
+    }
+    if (visited.size !== nodes.length) {
+      throw new Error("시작 노드에서 연결되지 않은 노드가 있어 순차 Blockly로 표현할 수 없습니다.");
+    }
+    const terminals = new Set(graph.terminal_nodes || []);
+    if (terminals.size !== 1 || !terminals.has(ordered.at(-1).node_id)) {
+      throw new Error("종료 노드 구성이 단일 순차 체인과 일치하지 않습니다.");
+    }
+    return ordered;
+  }
+
+  function replaceBlocklyWorkspace(nodes) {
+    initializeBlockly();
+    const workspace = state.editor.workspace;
+    if (!workspace || !window.Blockly) {
+      throw new Error("Blockly 작업공간을 초기화하지 못했습니다.");
+    }
+    let first = null;
+    let previous = null;
+    window.Blockly.Events.disable();
+    try {
+      workspace.clear();
+      nodes.forEach((node) => {
+        const blocklyBlock = workspace.newBlock(blocklyTypeForOperation(node.operation));
+        writeBlocklyBlockData(blocklyBlock, {
+          operation: node.operation,
+          arguments: cloneValue(node.arguments || {}),
+        });
+        blocklyBlock.initSvg();
+        blocklyBlock.render();
+        if (previous?.nextConnection && blocklyBlock.previousConnection) {
+          previous.nextConnection.connect(blocklyBlock.previousConnection);
+        } else {
+          blocklyBlock.moveBy(48, 48);
+        }
+        first ||= blocklyBlock;
+        previous = blocklyBlock;
+      });
+    } finally {
+      window.Blockly.Events.enable();
+    }
+    state.editor.selectedBlocklyBlockId = first?.id || null;
+    if (first) first.select();
+    syncBlocksFromBlockly();
+  }
+
+  async function loadExistingSkillToBlockly() {
+    const selected = state.skills.find(
+      (skill) => skill.key === dom.existingSkillSelect.value,
+    );
+    if (!selected) return;
+    if (state.editor.blocks.length
+      && state.editor.loadedParent?.key !== selected.key
+      && !window.confirm("현재 Blockly 작업공간을 선택한 스킬로 교체할까요?")) return;
+    state.editor.loading = true;
+    renderSkillBlocks();
+    setBanner(`${selected.id}@${selected.version} SkillGraph 불러오는 중…`);
+    try {
+      const result = await api.getSkill(selected.id, selected.version);
+      const graph = result.skill_graph || {};
+      const orderedNodes = sequentialNodesForBlockly(graph);
+      replaceBlocklyWorkspace(orderedNodes);
+      dom.blockSkillId.value = graph.skill_id;
+      dom.blockSkillName.value = graph.name;
+      dom.blockSkillDescription.value = graph.description;
+      dom.blockSkillType.value = graph.skill_type;
+      state.editor.bindings = cloneValue(graph.bindings || {});
+      state.editor.loadedParent = {
+        key: `${result.skill_id}@${result.version}`,
+        id: result.skill_id,
+        version: result.version,
+        checksum: result.graph_checksum_sha256,
+      };
+      dom.blockEditorResult.hidden = true;
+      setBanner(
+        `${result.skill_id}@${result.version}의 primitive ${orderedNodes.length}개를 Blockly로 불러왔습니다.`,
+        "ok",
+      );
+    } catch (error) {
+      setBanner(`Blockly 불러오기 실패: ${errorText(error)}`, "danger");
+    } finally {
+      state.editor.loading = false;
+      renderSkillBlocks();
+    }
+  }
+
+  function resetBlockEditorForNewSkill() {
+    if (state.editor.blocks.length
+      && !window.confirm("현재 Blockly 작업공간을 비우고 새 스킬을 만들까요?")) return;
+    state.editor.loadedParent = null;
+    state.editor.bindings = {};
+    state.editor.selectedBlocklyBlockId = null;
+    dom.blockSkillForm.reset();
+    if (state.editor.workspace && window.Blockly) {
+      window.Blockly.Events.disable();
+      try {
+        state.editor.workspace.clear();
+      } finally {
+        window.Blockly.Events.enable();
+      }
+    }
+    state.editor.blocks = [];
+    state.editor.blocklyError = null;
+    dom.blockEditorResult.hidden = true;
+    renderSkillBlocks();
+    setBanner("새 순차 블록 스킬 작업공간으로 초기화했습니다.", "ok");
+  }
+
   function renderSkillBlocks() {
+    renderExistingSkillOptions();
     renderPrimitiveOptions();
     initializeBlockly();
     if (!window.Blockly) {
@@ -2758,18 +2958,31 @@
   async function createBlockCandidate() {
     const payload = blockEditorPayload();
     if (!payload || !state.editor.blocks.length) return;
-    if (!window.confirm("부모/시연 없이 Mock-only 비활성 Candidate를 생성하고 전체 Mock 회귀 검증을 실행할까요?")) return;
+    const parent = state.editor.loadedParent;
+    const confirmation = parent
+      ? `${parent.id}@${parent.version} 원본은 그대로 두고, 현재 Blockly 내용으로 새 child Candidate를 생성할까요?`
+      : "부모/시연 없이 Mock-only 비활성 Candidate를 생성하고 전체 Mock 회귀 검증을 실행할까요?";
+    if (!window.confirm(confirmation)) return;
     state.editor.loading = true;
     renderSkillBlocks();
-    setBanner("순차 블록 Candidate 컴파일 및 Mock 회귀 검증 중…");
+    setBanner(parent
+      ? `${parent.id}@${parent.version} checksum 확인 및 Blockly child Candidate 생성 중…`
+      : "순차 블록 Candidate 컴파일 및 Mock 회귀 검증 중…");
     try {
-      const result = await api.createSkillBlockCandidate(payload);
+      const result = parent
+        ? await api.createSkillBlockRevisionCandidate(parent.id, parent.version, {
+          ...payload,
+          expected_parent_checksum_sha256: parent.checksum,
+        })
+        : await api.createSkillBlockCandidate(payload);
       dom.blockEditorResult.hidden = false;
       dom.blockEditorResult.textContent = JSON.stringify(result, null, 2);
       await loadRegistry(
-        result.mock_validation_passed
-          ? `${payload.skill_id} Candidate Mock 검증 통과`
-          : `${payload.skill_id} Candidate 저장됨 · Mock 검증 경고를 확인하세요.`,
+        parent && result.parent_unchanged
+          ? `${parent.id} 부모 checksum 보존 · ${result.candidate.version} Blockly Candidate 생성 완료`
+          : result.mock_validation_passed
+            ? `${payload.skill_id} Candidate Mock 검증 통과`
+            : `${payload.skill_id} Candidate 저장됨 · Mock 검증 경고를 확인하세요.`,
       );
       state.selectedKey = `${result.candidate.skill_id}@${result.candidate.version}`;
       showPage("detail");
@@ -3504,6 +3717,9 @@
   dom.recordingSkillForm.addEventListener("submit", createRecordingSkillDraft);
   dom.createRecordingTab.addEventListener("click", () => setCreateMode("recording"));
   dom.createBlockTab.addEventListener("click", () => setCreateMode("block"));
+  dom.loadSkillToBlockly.addEventListener("click", loadExistingSkillToBlockly);
+  dom.newBlockSkill.addEventListener("click", resetBlockEditorForNewSkill);
+  dom.existingSkillSelect.addEventListener("change", renderSkillBlocks);
   dom.addSkillBlock.addEventListener("click", addSelectedSkillBlock);
   dom.previewSkillBlocks.addEventListener("click", previewSkillBlocks);
   dom.createBlockCandidate.addEventListener("click", createBlockCandidate);

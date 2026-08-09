@@ -17,6 +17,7 @@ from robot_skill_system.api.contracts import (
     SkillCompileRequest,
     SkillEditorCandidateRequest,
     SkillEditorPreviewRequest,
+    SkillEditorRevisionCandidateRequest,
     SkillInduceRequest,
     SkillParameterCandidateRequest,
     SkillRollbackRequest,
@@ -175,6 +176,20 @@ def create_skill_parameter_candidate(
     service: ServiceDependency,
 ) -> dict[str, Any]:
     return service.create_skill_parameter_candidate(
+        skill_id,
+        version,
+        request.model_dump(mode="json"),
+    )
+
+
+@router.post("/{skill_id}/versions/{version}/block-candidates")
+def create_skill_block_revision_candidate(
+    skill_id: str,
+    version: str,
+    request: SkillEditorRevisionCandidateRequest,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.create_skill_editor_revision_candidate(
         skill_id,
         version,
         request.model_dump(mode="json"),
