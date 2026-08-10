@@ -207,6 +207,7 @@ from robot_skill_system.skills.versioning import (
 from robot_skill_system.storage.artifact_store import LocalArtifactStore
 from robot_skill_system.storage.database import Database, StorageRepository
 from robot_skill_system.storage.grip_point_importer import GripPointResultImporter
+from robot_skill_system.voice import WakeWordController
 from robot_skill_system.storage.orm import (
     ActionEndMappingRecord,
     ExecutionRunRecord,
@@ -257,6 +258,7 @@ class MVPApplication:
         jog_controller: JogController | None = None,
         aruco_experiment_controller: ArucoExperimentController | None = None,
         ditto_coordinate_controller: DittoCoordinateController | None = None,
+        wake_word_controller: WakeWordController | None = None,
     ) -> None:
         self.settings = settings
         self.store = LocalArtifactStore(settings.artifact_root)
@@ -483,6 +485,19 @@ class MVPApplication:
                 ),
             )
         )
+        self.wake_word_controller = wake_word_controller or WakeWordController(
+            enabled=settings.enable_ditto_wake_word,
+            microphone_device_index=settings.ditto_wake_word_device_index,
+            wake_phrase=settings.ditto_wake_word_phrase,
+            capture_duration_s=settings.ditto_wake_word_capture_duration_s,
+            live_mode=settings.openai_mode.value == "live",
+            live_transcription_authorized=(
+                settings.enable_ditto_wake_word_live_transcription
+            ),
+            api_key_configured=settings.openai_api_key is not None,
+            transcribe=self.transcribe_monitor_voice,
+        )
+        self.wake_word_controller.start()
 
     def close(self) -> None:
         """Release database resources."""
@@ -495,6 +510,7 @@ class MVPApplication:
         self.jog_controller.close()
         self.calibration_controller.close()
         self.ditto_coordinate_controller.close()
+        self.wake_word_controller.close()
         self.camera_controller.close()
         self.database.close()
 
@@ -692,7 +708,7 @@ class MVPApplication:
         return self.ditto_coordinate_controller.read_live_frame()
 
     def get_monitor_voice_capabilities(self) -> dict[str, Any]:
-        """Return microphone/transcription wiring without constructing a live client."""
+        """Return server Wake Word and transcription status without a live API call."""
 
         ditto_keyword_source = (
             self.settings.repo_root
@@ -704,16 +720,26 @@ class MVPApplication:
         )
         live_mode = self.settings.openai_mode.value == "live"
         api_key_configured = self.settings.openai_api_key is not None
+        wake_word = self.wake_word_controller.status()
+        controller_available = (
+            wake_word["enabled"] and wake_word["dependency_available"]
+        )
         return {
-            "available": not live_mode or api_key_configured,
+            "available": controller_available,
             "openai_mode": self.settings.openai_mode.value,
             "model": self.settings.openai_transcribe_model,
             "api_key_configured": api_key_configured,
             "will_contact_openai": live_mode,
             "explicit_charge_acknowledgement_required": live_mode,
+            "live_transcription_authorized": (
+                self.settings.enable_ditto_wake_word_live_transcription
+            ),
             "openai_maximum_attempts_per_submission": 1 if live_mode else 0,
             "openai_retries_disabled": True,
-            "browser_microphone_capture": True,
+            "browser_microphone_capture": False,
+            "server_microphone_capture": True,
+            "automatic_wake_word_start": True,
+            "wake_word": wake_word,
             "maximum_audio_bytes": 8 * 1024 * 1024,
             "accepted_media_types": [
                 "audio/webm",
@@ -761,7 +787,7 @@ class MVPApplication:
         media_type: str,
         acknowledge_openai_charges: bool,
     ) -> dict[str, Any]:
-        """Transcribe one explicit browser recording; never auto-execute its meaning."""
+        """Transcribe one bounded recording; never auto-execute its meaning."""
 
         base_media_type = media_type.split(";", 1)[0].strip().lower()
         suffixes = {
@@ -789,9 +815,9 @@ class MVPApplication:
             TranscriptionService,
         )
 
-        # A monitor-button submission is deliberately single-attempt.  The general
-        # OpenAI client may retry transient failures, but repeating an audio upload
-        # can create unexpected billable requests for an operator.
+        # A wake-word recording is deliberately single-attempt. The general OpenAI
+        # client may retry transient failures, but repeating an audio upload can
+        # create unexpected billable requests for an operator.
         voice_settings = self.settings.model_copy(
             update={"openai_api_max_retries": 0}
         )

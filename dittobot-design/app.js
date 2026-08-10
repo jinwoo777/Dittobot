@@ -20,9 +20,6 @@
     voice: {
       capabilities: null,
       state: "checking",
-      mediaRecorder: null,
-      mediaStream: null,
-      chunks: [],
       transcript: "",
       tools: [],
       destinations: [],
@@ -155,8 +152,6 @@
     startRecording: element("start-recording"),
     stopRecording: element("stop-recording"),
     cameraStatus: element("camera-status"),
-    voiceStart: element("voice-start"),
-    voiceFinish: element("voice-finish"),
     voiceRecDot: element("voice-rec-dot"),
     voiceStateText: element("voice-state-text"),
     voiceCapabilities: element("voice-capabilities"),
@@ -390,6 +385,7 @@
     if (uiState === "active") return "운영 중";
     if (uiState === "tested") return "테스트 통과";
     if (uiState === "invalid") return "검증 실패";
+    if (uiState === "external") return "외부 · 읽기 전용";
     return "미검증";
   }
 
@@ -416,9 +412,6 @@
 
   function showPage(page) {
     if (page !== "create") stopRecordingPlayback();
-    if (page !== "monitor" && state.voice.state === "recording") {
-      discardVoiceRecording();
-    }
     state.page = page;
     document.querySelectorAll(".page").forEach((section) => {
       section.hidden = section.id !== `page-${page}`;
@@ -525,7 +518,7 @@
   function renderRegistry() {
     dom.skillList.replaceChildren();
     const visibleSkills = state.skills.filter((skill) => {
-      if (state.filter === "draft") return false;
+      if (["draft", "external"].includes(state.filter)) return false;
       if (state.filter === "all") return true;
       if (state.filter === "active") return skill.status === "active";
       return skill.status !== "active";
@@ -533,10 +526,16 @@
     const visibleDrafts = state.filter === "all" || state.filter === "draft"
       ? state.drafts
       : [];
-    dom.skillEmpty.hidden = visibleSkills.length + visibleDrafts.length !== 0;
+    const visibleDittoSkills = state.filter === "all" || state.filter === "external"
+      ? state.dittoSkills
+      : [];
+    dom.skillEmpty.hidden = visibleSkills.length + visibleDrafts.length
+      + visibleDittoSkills.length !== 0;
     dom.skillEmpty.textContent = state.filter === "draft"
       ? "저장된 분석 초안이 없습니다. 스킬 만들기에서 RGB-D 녹화를 분석해 주세요."
-      : "등록된 스킬 또는 분석 초안이 없습니다.";
+      : state.filter === "external"
+        ? "ditto_system/skills에 불러올 수 있는 스킬이 없습니다."
+        : "등록된 스킬 또는 분석 초안이 없습니다.";
 
     visibleDrafts.forEach((draft) => {
       const card = create("article", { className: "skill-card draft-card" });
@@ -559,6 +558,44 @@
         dom.draftInspector.scrollIntoView({ behavior: "smooth", block: "nearest" });
       });
       actions.append(detail);
+      card.append(summary, actions);
+      dom.skillList.append(card);
+    });
+
+    visibleDittoSkills.forEach((skill) => {
+      const card = create("article", { className: "skill-card" });
+      const summary = create("div");
+      summary.append(create("h2", { text: skill.source_id }));
+      const meta = create("div", { className: "meta" });
+      meta.append(document.createTextNode(
+        `ditto_system/skills · ${skill.source_stage} · Blockly ${skill.block_count}개`,
+      ));
+      meta.append(create("span", {
+        className: "tag external",
+        text: tagText("external"),
+      }));
+      summary.append(meta);
+      summary.append(create("p", {
+        text: skill.ready
+          ? "원본을 변경하지 않고 workspace 상대좌표 Blockly 블록으로 불러올 수 있습니다."
+          : `변환 불가: ${(skill.blockers || []).join(" · ")}`,
+      }));
+
+      const actions = create("div", { className: "actions" });
+      const edit = create("button", {
+        className: "button primary",
+        text: "Blockly로 열기",
+      });
+      edit.type = "button";
+      edit.disabled = state.apiStatus !== "connected" || skill.ready !== true;
+      edit.addEventListener("click", async () => {
+        state.editor.createMode = "block";
+        showPage("create");
+        dom.existingSkillSelect.value = `ditto:${skill.source_id}`;
+        renderSkillBlocks();
+        await loadExistingSkillToBlockly();
+      });
+      actions.append(edit);
       card.append(summary, actions);
       dom.skillList.append(card);
     });
@@ -2060,23 +2097,25 @@
   }
 
   const VOICE_STATE_LABELS = {
-    checking: "음성 연결 확인 중",
-    ready: "음성 녹음 준비됨",
-    recording: "녹음 중…",
+    checking: "서버 Wake Word 상태 확인 중",
+    disabled: "Wake Word 자동 감지 비활성",
+    starting: "서버 마이크 시작 중…",
+    listening_for_wakeword: "Wake Word 대기 중",
+    wakeword_detected: "Wake Word 감지됨",
+    recording: "Wake Word 감지 · 5초 음성 수집 중…",
     processing: "OpenAI 음성 인식 처리 중…",
     done: "음성 인식 완료",
-    cancelled: "전송 취소됨 · 과금 없음",
+    stopped: "Wake Word 감지 중지됨",
     error: "음성 인식 오류",
   };
 
   function renderVoiceMonitor() {
     const voice = state.voice;
     const capabilities = voice.capabilities;
+    const wakeWord = capabilities?.wake_word;
     const recording = voice.state === "recording";
     const processing = voice.state === "processing";
     const available = capabilities?.available === true;
-    dom.voiceStart.disabled = !available || recording || processing;
-    dom.voiceFinish.disabled = !recording;
     dom.voiceRecDot.classList.toggle("danger", recording || processing);
     dom.voiceRecDot.classList.toggle(
       "ok", available && !recording && !processing && voice.state !== "error",
@@ -2085,13 +2124,19 @@
       || VOICE_STATE_LABELS[voice.state]
       || voice.state;
     if (!capabilities) {
-      dom.voiceCapabilities.textContent = "음성 API 연결 확인 중…";
-    } else if (!available) {
-      dom.voiceCapabilities.textContent = "OPENAI_MODE=live이지만 API 키가 설정되지 않았습니다.";
+      dom.voiceCapabilities.textContent = "서버 마이크 연결 확인 중…";
+    } else if (!wakeWord?.enabled) {
+      dom.voiceCapabilities.textContent = "ENABLE_DITTO_WAKE_WORD=false · 서버 자동 감지가 비활성화되어 있습니다.";
+    } else if (!wakeWord?.dependency_available) {
+      dom.voiceCapabilities.textContent = "voice_processing 패키지를 찾을 수 없어 Wake Word 감지를 시작하지 못했습니다.";
+    } else if (capabilities.will_contact_openai && !capabilities.api_key_configured) {
+      dom.voiceCapabilities.textContent = `${wakeWord.wake_phrase} 자동 대기 중 · API 키가 없어 감지 후 유료 전사는 건너뜁니다.`;
+    } else if (capabilities.will_contact_openai && !capabilities.live_transcription_authorized) {
+      dom.voiceCapabilities.textContent = `${wakeWord.wake_phrase} 자동 대기 중 · Wake Word 감지는 무료 · 감지 후 유료 전사는 비활성`;
     } else if (capabilities.will_contact_openai) {
-      dom.voiceCapabilities.textContent = `${capabilities.model} LIVE · 녹음 종료 후 확인해야만 OpenAI 전사 1회 요청/과금이 발생합니다. 자동 재시도 없음.`;
+      dom.voiceCapabilities.textContent = `${wakeWord.wake_phrase} 자동 대기 중 · 감지 후 ${wakeWord.capture_duration_s}초 수집 및 OpenAI 전사 1회 · 자동 재시도 없음`;
     } else {
-      dom.voiceCapabilities.textContent = `${capabilities.model} MOCK · OpenAI 네트워크 요청과 과금 없음`;
+      dom.voiceCapabilities.textContent = `${wakeWord.wake_phrase} 자동 대기 중 · MOCK 전사 · OpenAI 요청과 과금 없음`;
     }
     const entityParts = [];
     if (voice.tools.length) entityParts.push(`도구: ${voice.tools.join(", ")}`);
@@ -2108,126 +2153,19 @@
     try {
       const capabilities = await api.voiceCapabilities();
       state.voice.capabilities = capabilities;
-      state.voice.lastError = null;
-      if (!["recording", "processing", "done"].includes(state.voice.state)) {
-        state.voice.state = capabilities.available ? "ready" : "error";
-      }
+      const wakeWord = capabilities.wake_word || {};
+      const result = wakeWord.last_result || {};
+      state.voice.state = wakeWord.state || (capabilities.available ? "starting" : "error");
+      state.voice.lastError = wakeWord.last_error || null;
+      state.voice.transcript = result.transcript || state.voice.transcript;
+      state.voice.tools = Array.isArray(result.tools) ? result.tools : state.voice.tools;
+      state.voice.destinations = Array.isArray(result.destinations)
+        ? result.destinations
+        : state.voice.destinations;
     } catch (error) {
       state.voice.state = "error";
       state.voice.lastError = `음성 API 연결 실패: ${errorText(error)}`;
       if (!quiet) setBanner(state.voice.lastError, "danger");
-    }
-    renderVoiceMonitor();
-  }
-
-  function releaseVoiceMedia() {
-    state.voice.mediaStream?.getTracks().forEach((track) => track.stop());
-    state.voice.mediaStream = null;
-    state.voice.mediaRecorder = null;
-  }
-
-  function discardVoiceRecording() {
-    const recorder = state.voice.mediaRecorder;
-    if (recorder && recorder.state !== "inactive") {
-      recorder.addEventListener("stop", () => {
-        state.voice.chunks = [];
-      }, { once: true });
-      recorder.stop();
-    }
-    releaseVoiceMedia();
-    state.voice.state = "cancelled";
-    state.voice.lastError = null;
-    renderVoiceMonitor();
-  }
-
-  async function startVoiceRecording() {
-    if (!state.voice.capabilities) await refreshVoiceCapabilities();
-    if (state.voice.capabilities?.available !== true) return;
-    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-      state.voice.state = "error";
-      state.voice.lastError = "이 브라우저는 마이크 녹음을 지원하지 않습니다.";
-      renderVoiceMonitor();
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"];
-      const mimeType = candidates.find((value) => window.MediaRecorder.isTypeSupported(value));
-      const recorder = mimeType
-        ? new window.MediaRecorder(stream, { mimeType })
-        : new window.MediaRecorder(stream);
-      state.voice.mediaStream = stream;
-      state.voice.mediaRecorder = recorder;
-      state.voice.chunks = [];
-      state.voice.transcript = "";
-      state.voice.tools = [];
-      state.voice.destinations = [];
-      state.voice.lastError = null;
-      recorder.addEventListener("dataavailable", (event) => {
-        if (event.data?.size) state.voice.chunks.push(event.data);
-      });
-      recorder.addEventListener("error", () => {
-        state.voice.state = "error";
-        state.voice.lastError = "브라우저 마이크 녹음 중 오류가 발생했습니다.";
-        releaseVoiceMedia();
-        renderVoiceMonitor();
-      });
-      recorder.start();
-      state.voice.state = "recording";
-      setBanner("음성 녹음 중 · 아직 OpenAI 요청이나 과금은 발생하지 않았습니다.", "ok");
-    } catch (error) {
-      state.voice.state = "error";
-      state.voice.lastError = `마이크 시작 실패: ${errorText(error)}`;
-      releaseVoiceMedia();
-    }
-    renderVoiceMonitor();
-  }
-
-  async function finishVoiceRecording() {
-    const recorder = state.voice.mediaRecorder;
-    if (!recorder || recorder.state === "inactive") return;
-    const audioBlob = await new Promise((resolve) => {
-      recorder.addEventListener("stop", () => {
-        resolve(new Blob(state.voice.chunks, { type: recorder.mimeType || "audio/webm" }));
-      }, { once: true });
-      recorder.stop();
-    });
-    releaseVoiceMedia();
-    const live = state.voice.capabilities?.will_contact_openai === true;
-    if (live && !window.confirm(
-      "녹음 파일을 OpenAI 음성 인식 API로 전송합니다.\n실제 API 크레딧이 사용됩니다. 계속할까요?",
-    )) {
-      state.voice.state = "cancelled";
-      state.voice.chunks = [];
-      setBanner("음성 전송을 취소했습니다. OpenAI 요청과 과금은 발생하지 않았습니다.", "ok");
-      renderVoiceMonitor();
-      return;
-    }
-    state.voice.state = "processing";
-    state.voice.lastError = null;
-    renderVoiceMonitor();
-    try {
-      const result = await api.transcribeVoiceAudio(audioBlob, {
-        acknowledgeOpenAICharges: live,
-      });
-      state.voice.state = "done";
-      state.voice.transcript = result.transcript || "";
-      state.voice.tools = Array.isArray(result.tools) ? result.tools : [];
-      state.voice.destinations = Array.isArray(result.destinations)
-        ? result.destinations
-        : [];
-      setBanner(
-        result.openai_contacted
-          ? "음성 인식 완료 · OpenAI 전사 1회 요청됨 · 자동 실행 안 함"
-          : "Mock 음성 인식 연결 확인 완료 · OpenAI 요청 없음",
-        "ok",
-      );
-    } catch (error) {
-      state.voice.state = "error";
-      state.voice.lastError = `음성 인식 실패: ${errorText(error)}`;
-      setBanner(state.voice.lastError, "danger");
-    } finally {
-      state.voice.chunks = [];
     }
     renderVoiceMonitor();
   }
@@ -4155,8 +4093,6 @@
   dom.stopCamera.addEventListener("click", stopCameraPreview);
   dom.startRecording.addEventListener("click", startCameraRecording);
   dom.stopRecording.addEventListener("click", stopCameraRecording);
-  dom.voiceStart.addEventListener("click", startVoiceRecording);
-  dom.voiceFinish.addEventListener("click", finishVoiceRecording);
   dom.startHandeyeCalibration.addEventListener("click", startHandeyeCalibration);
   dom.abortHandeyeCalibration.addEventListener("click", abortHandeyeCalibration);
   dom.importLegacyHandeye.addEventListener("click", importLegacyHandeyeNpy);
@@ -4363,6 +4299,7 @@
   resetJogSafetyCheckboxes();
   loadRegistry().then(() => Promise.all([
     refreshCameraStatus(),
+    refreshVoiceCapabilities({ quiet: true }),
     refreshHandeyeCalibrationStatus(),
     refreshJogStatus({ quiet: true }),
     refreshArucoExperimentStatus({ quiet: true }),
@@ -4380,6 +4317,9 @@
     }
     if (state.page === "aruco-experiment" || state.arucoExperiment.status?.enabled) {
       refreshArucoExperimentStatus({ quiet: true });
+    }
+    if (state.page === "monitor") {
+      refreshVoiceCapabilities({ quiet: true });
     }
     if (state.page === "create" && state.editor.createMode === "coords") {
       refreshCoordinateResults();

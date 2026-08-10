@@ -88,6 +88,11 @@ class Settings(BaseModel):
     enable_ditto_coordinate_capture: bool = False
     ditto_coordinate_cell_safety_verified: bool = False
     ditto_workspace_root: Path | None = None
+    enable_ditto_wake_word: bool = False
+    ditto_wake_word_phrase: str = Field(default="헬로 로키", min_length=1, max_length=64)
+    ditto_wake_word_device_index: int = Field(default=10, ge=0, le=255)
+    ditto_wake_word_capture_duration_s: float = Field(default=5.0, ge=1.0, le=10.0)
+    enable_ditto_wake_word_live_transcription: bool = False
     aruco_experiment_expected_tcp: str = Field(
         default="GripperDA_v1", min_length=1, max_length=64
     )
@@ -319,6 +324,19 @@ class Settings(BaseModel):
                 env.get("DITTO_COORDINATE_CELL_SAFETY_VERIFIED"), default=False
             ),
             ditto_workspace_root=ditto_workspace_path.resolve(),
+            enable_ditto_wake_word=_bool_value(
+                env.get("ENABLE_DITTO_WAKE_WORD"), default=False
+            ),
+            ditto_wake_word_phrase=env.get("DITTO_WAKE_WORD_PHRASE", "헬로 로키"),
+            ditto_wake_word_device_index=int(
+                env.get("DITTO_WAKE_WORD_DEVICE_INDEX", "10")
+            ),
+            ditto_wake_word_capture_duration_s=float(
+                env.get("DITTO_WAKE_WORD_CAPTURE_DURATION_S", "5")
+            ),
+            enable_ditto_wake_word_live_transcription=_bool_value(
+                env.get("ENABLE_DITTO_WAKE_WORD_LIVE_TRANSCRIPTION"), default=False
+            ),
             aruco_experiment_expected_tcp=env.get(
                 "ARUCO_EXPERIMENT_EXPECTED_TCP", "GripperDA_v1"
             ),
@@ -408,6 +426,15 @@ class Settings(BaseModel):
                 str(self.ditto_workspace_root)
                 if self.ditto_workspace_root is not None
                 else None
+            ),
+            "enable_ditto_wake_word": self.enable_ditto_wake_word,
+            "ditto_wake_word_phrase": self.ditto_wake_word_phrase,
+            "ditto_wake_word_device_index": self.ditto_wake_word_device_index,
+            "ditto_wake_word_capture_duration_s": (
+                self.ditto_wake_word_capture_duration_s
+            ),
+            "enable_ditto_wake_word_live_transcription": (
+                self.enable_ditto_wake_word_live_transcription
             ),
             "aruco_fixed_reference_npz": str(self.aruco_fixed_reference_npz),
             "aruco_runtime_workspace_npz": str(self.aruco_runtime_workspace_npz),

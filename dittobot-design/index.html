@@ -99,6 +99,7 @@
     .tag.tested { color: var(--ok); background: var(--ok-soft); }
     .tag.active { color: #5736aa; background: var(--accent-soft); }
     .tag.invalid { color: var(--danger); background: var(--danger-soft); }
+    .tag.external { color: #35666f; background: #e5f4f5; }
     .button { border: 1px solid var(--border); border-radius: 10px; padding: 9px 15px; color: var(--text); background: var(--panel); cursor: pointer; }
     .button.primary { color: white; border-color: var(--accent); background: var(--accent); font-weight: 700; }
     .button.danger { color: var(--danger); border-color: var(--danger); background: transparent; }
@@ -579,6 +580,11 @@
       background: var(--danger-soft);
     }
 
+    .tag.external {
+      color: #35666f;
+      background: #e5f4f5;
+    }
+
 
     /* ---------------------------------------------------------
       Buttons
@@ -929,12 +935,13 @@
     <main>
       <section id="page-skills" class="page">
         <div class="toolbar">
-          <header><p class="eyebrow">01 · REGISTRY</p><h1>스킬 관리</h1><p class="subtitle">분석 초안의 승격 준비도를 확인하고, SQLite에 등록된 스킬 버전을 검증·활성화하거나 Mock으로 실행합니다.</p></header>
+          <header><p class="eyebrow">01 · REGISTRY</p><h1>스킬 관리</h1><p class="subtitle">분석 초안과 SQLite 등록 스킬, ditto_system/skills의 읽기 전용 스킬을 한곳에서 확인합니다.</p></header>
           <div class="filters" aria-label="스킬 필터">
             <button type="button" class="chip" data-filter="all" aria-pressed="true">전체</button>
             <button type="button" class="chip" data-filter="draft" aria-pressed="false">분석 초안</button>
             <button type="button" class="chip" data-filter="candidate" aria-pressed="false">후보</button>
             <button type="button" class="chip" data-filter="active" aria-pressed="false">활성</button>
+            <button type="button" class="chip" data-filter="external" aria-pressed="false">외부 스킬</button>
             <button id="refresh-skills" type="button" class="chip">새로고침</button>
           </div>
         </div>
@@ -1197,18 +1204,13 @@
             </div>
             <p id="camera-status" class="recording-status" role="status" aria-live="polite">RealSense 정지됨 · 사용자가 시작할 때만 카메라가 열립니다.</p>
             <div class="voice-card">
-              <h3>음성 인식</h3>
-              <div class="camera-controls">
-                <button id="voice-start" type="button" class="button primary" disabled>음성 녹음 시작</button>
-                <button id="voice-finish" type="button" class="button danger" disabled>녹음 종료 · 인식</button>
-              </div>
+              <h3>Wake Word 음성 인식</h3>
               <div class="voice-status">
                 <span class="dot" id="voice-rec-dot"></span>
-                <span id="voice-state-text">음성 연결 확인 중</span>
+                <span id="voice-state-text">서버 Wake Word 상태 확인 중</span>
               </div>
-              <p id="voice-capabilities" class="recording-status">음성 API 연결 확인 중…</p>
+              <p id="voice-capabilities" class="recording-status">서버 마이크 연결 확인 중…</p>
               <pre id="voice-transcript" class="draft-result voice-transcript" hidden></pre>
-              <p class="notice">LIVE 모드에서는 녹음 종료 후 확인 대화상자에 동의해야만 OpenAI 요청이 전송되고 크레딧이 사용됩니다.</p>
             </div>
             <div class="calibration-card">
               <h3>Eye-in-hand Calibration (선택적 재보정)</h3>
@@ -1342,7 +1344,7 @@
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js?v=ditto-skills-1"></script>
-  <script src="./app.js?v=ditto-skills-1"></script>
+  <script src="./api-client.js?v=ditto-skills-2"></script>
+  <script src="./app.js?v=ditto-wake-3"></script>
 </body>
 </html>

@@ -1,4 +1,4 @@
-"""Explicit, charge-aware browser microphone transcription routes."""
+"""Wake Word status and charge-aware transcription routes."""
 
 from __future__ import annotations
 

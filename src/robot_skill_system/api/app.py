@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -35,14 +38,34 @@ def create_app(service: Any | None = None) -> Any:
     from robot_skill_system.exceptions import HardwareExecutionDenied, NotConfiguredError
     from robot_skill_system.runtime.errors import PreflightError
 
-    if service is None:
+    owns_service = service is None
+    if owns_service:
         from robot_skill_system.application import create_application
+        from robot_skill_system.settings import Settings
 
-        service = create_application()
+        settings = Settings.from_env()
+        # The HTTP server owns the operator-facing microphone monitor. Start its
+        # free, local Wake Word detector automatically unless an operator has
+        # explicitly disabled it. CLI and test-created services remain mock-safe.
+        if "ENABLE_DITTO_WAKE_WORD" not in os.environ:
+            settings = settings.model_copy(update={"enable_ditto_wake_word": True})
+        service = create_application(settings)
+
+    @asynccontextmanager
+    async def lifespan(_app: Any) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            if owns_service:
+                close = getattr(service, "close", None)
+                if callable(close):
+                    close()
+
     app = FastAPI(
         title="Robot Skill System",
         version="0.1.0",
         description="Safety-bounded teaching, skill registry, and runtime API",
+        lifespan=lifespan,
     )
     app.add_middleware(
         CORSMiddleware,
