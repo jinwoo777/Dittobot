@@ -156,6 +156,14 @@
       return this.request("/skills/editor/catalog");
     }
 
+    listDittoSkillSources() {
+      return this.request("/skills/external/ditto");
+    }
+
+    getDittoSkillSource(sourceId) {
+      return this.request(`/skills/external/ditto/${encodeURIComponent(sourceId)}`);
+    }
+
     previewSkillBlocks(payload) {
       return this.request("/skills/editor/preview", {
         method: "POST",

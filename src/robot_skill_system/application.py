@@ -178,6 +178,7 @@ from robot_skill_system.scene.transforms import RigidTransform, rotate_vector
 from robot_skill_system.settings import ExecutionMode as SettingsExecutionMode
 from robot_skill_system.settings import Settings
 from robot_skill_system.skills.compiler import SkillCompiler
+from robot_skill_system.skills.ditto_importer import DittoSkillCatalog
 from robot_skill_system.skills.graph import SkillGraphValidator
 from robot_skill_system.skills.loader import CompiledRun, load_compiled_run
 from robot_skill_system.skills.models import (
@@ -317,6 +318,7 @@ class MVPApplication:
                 gate_summary=ditto_coordinate_gates,
             )
         )
+        self.ditto_skill_catalog = DittoSkillCatalog(settings.repo_root)
         calibration_gates = {
             "ROBOT_EXECUTION_MODE=hardware": (
                 settings.robot_execution_mode is SettingsExecutionMode.HARDWARE
@@ -4594,6 +4596,30 @@ class MVPApplication:
             response["task_flow_catalog"] = hierarchy
         return response
 
+    def list_ditto_skill_sources(self) -> dict[str, Any]:
+        """List read-only ``ditto_system/skills`` sources without persisting them."""
+
+        return self.ditto_skill_catalog.list_sources()
+
+    def get_ditto_skill_editor_source(self, source_id: str) -> dict[str, Any]:
+        """Convert one fixed external artifact set into transient Blockly blocks."""
+
+        result = self.ditto_skill_catalog.editor_source(source_id)
+        registry = get_default_registry()
+        for block in result["blocks"]:
+            try:
+                validated = registry.validate_operation(
+                    block["operation"],
+                    block["arguments"],
+                    skill_type=result["skill_type"],
+                )
+            except RobotSkillError as exc:
+                raise ValueError(str(exc)) from exc
+            normalized = validated.model_dump(mode="json", exclude_none=True)
+            self._validate_editor_profiles(block["operation"], normalized)
+            block["arguments"] = normalized
+        return result
+
     def _skill_registry_summary(
         self, version: SkillVersionRecord, skill: SkillRecord
     ) -> dict[str, Any]:
@@ -5720,6 +5746,33 @@ class MVPApplication:
             )
             for recording_id in source_recording_ids
         ]
+        external_source_request = request.get("external_source")
+        external_source_metadata: dict[str, Any] | None = None
+        if external_source_request is not None:
+            external_source_id = str(external_source_request["source_id"])
+            imported = self.get_ditto_skill_editor_source(external_source_id)
+            supplied_checksum = str(
+                external_source_request["source_checksum_sha256"]
+            )
+            if supplied_checksum != imported["source_checksum_sha256"]:
+                raise ValueError(
+                    "ditto skill source changed; reload it before previewing or saving"
+                )
+            source_demonstrations.append(
+                f"ditto://skills/{external_source_id}?sha256={supplied_checksum}"
+            )
+            external_source_metadata = {
+                "integration": "ditto_system.skills",
+                "source_id": external_source_id,
+                "source_stage": imported["source_stage"],
+                "source_checksum_sha256": supplied_checksum,
+                "source_uris": [
+                    f"repo://{path}" for path in imported["source_files"].values()
+                ],
+                "external_package_read_only": True,
+                "absolute_targets_discarded": True,
+                "numeric_motion_settings_discarded": True,
+            }
         return SkillGraph(
             skill_id=str(request["skill_id"]),
             version=version,
@@ -5740,6 +5793,7 @@ class MVPApplication:
                 "demonstration_required": False,
                 "hardware_compatible": False,
                 "source_recording_ids": source_recording_ids,
+                "external_ditto_import": external_source_metadata,
             },
             validation_status=ValidationStatus.UNVALIDATED,
             lifecycle_status=SkillLifecycleStatus.CANDIDATE,

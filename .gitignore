@@ -34,3 +34,7 @@ data/experiments/*
 *.png
 *.zip
 AGENTS.md
+ditto_ws/build/
+ditto_ws/install/
+ditto_ws/log/
+ditto_ws/src/ditto_system/resource/.env*

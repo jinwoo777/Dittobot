@@ -1020,7 +1020,7 @@
             <p class="notice">속도·가속도·힘은 승인 profile만 사용하며 결과는 Mock-only Candidate로 생성됩니다.</p>
           </div>
           <div class="panel">
-            <p class="eyebrow">현재 SkillGraph 목록</p>
+            <p class="eyebrow">현재 SkillGraph + ditto_system/skills 목록</p>
             <select id="skillgen-list-select" aria-label="생성된 스킬 선택"><option value="">생성된 스킬 없음</option></select>
           </div>
           <div class="panel">
@@ -1103,8 +1103,8 @@
                 <button id="load-skill-to-blockly" type="button" class="button">Blockly로 불러오기</button>
                 <button id="new-block-skill" type="button" class="button">새 스킬로 초기화</button>
               </div>
-              <p id="loaded-skill-status" class="notice" role="status" aria-live="polite">스킬 버전을 선택하면 primitive와 인수를 Blockly 작업공간으로 불러옵니다.</p>
-              <p class="notice">원본 스킬은 변경되지 않으며, 수정 결과는 checksum으로 보호된 새 child Candidate로 생성됩니다.</p>
+              <p id="loaded-skill-status" class="notice" role="status" aria-live="polite">DB 스킬 또는 ditto_system/skills 데이터를 선택하면 Blockly 작업공간으로 불러옵니다.</p>
+              <p class="notice">ditto_system 원본은 읽기 전용입니다. base 절대좌표는 첫 waypoint 기준 workspace 상대좌표로 변환하고, 속도·가속도·힘 숫자는 가져오지 않으며 수정 결과만 Mock-only Candidate로 생성합니다.</p>
             </div>
             <label>스킬 ID
               <input id="block-skill-id" type="text" value="block_skill" pattern="[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}" maxlength="64" required autocomplete="off">
@@ -1198,7 +1198,6 @@
             <p id="camera-status" class="recording-status" role="status" aria-live="polite">RealSense 정지됨 · 사용자가 시작할 때만 카메라가 열립니다.</p>
             <div class="voice-card">
               <h3>음성 인식</h3>
-              <p class="muted">ditto_ws의 음성 상태 UI를 참고해 브라우저 마이크와 현재 OpenAI 전사 API를 연결합니다. 인식 결과는 표시만 하며 로봇이나 스킬을 자동 실행하지 않습니다.</p>
               <div class="camera-controls">
                 <button id="voice-start" type="button" class="button primary" disabled>음성 녹음 시작</button>
                 <button id="voice-finish" type="button" class="button danger" disabled>녹음 종료 · 인식</button>
@@ -1343,7 +1342,7 @@
     </main>
   </div>
   <script src="./vendor/blockly/blockly.min.js"></script>
-  <script src="./api-client.js?v=monitor-voice-1"></script>
-  <script src="./app.js?v=monitor-voice-1"></script>
+  <script src="./api-client.js?v=ditto-skills-1"></script>
+  <script src="./app.js?v=ditto-skills-1"></script>
 </body>
 </html>

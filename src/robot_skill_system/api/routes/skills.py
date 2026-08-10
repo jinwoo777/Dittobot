@@ -40,6 +40,19 @@ def get_skill_editor_catalog(service: ServiceDependency) -> dict[str, Any]:
     return service.get_skill_editor_catalog()
 
 
+@router.get("/external/ditto")
+def list_ditto_skill_sources(service: ServiceDependency) -> dict[str, Any]:
+    return service.list_ditto_skill_sources()
+
+
+@router.get("/external/ditto/{source_id}")
+def get_ditto_skill_editor_source(
+    source_id: str,
+    service: ServiceDependency,
+) -> dict[str, Any]:
+    return service.get_ditto_skill_editor_source(source_id)
+
+
 @router.post("/editor/preview")
 def preview_skill_editor_blocks(
     request: SkillEditorPreviewRequest,

@@ -323,6 +323,14 @@ class SkillEditorBlockRequest(APIModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class DittoExternalSkillSourceRequest(APIModel):
+    """Immutable provenance supplied when Blockly loaded a ditto artifact."""
+
+    integration: Literal["ditto_system.skills"]
+    source_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,180}$")
+    source_checksum_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class SkillEditorPreviewRequest(APIModel):
     """Typed, code-free input shared by block preview and Candidate creation."""
 
@@ -332,6 +340,7 @@ class SkillEditorPreviewRequest(APIModel):
     skill_type: SkillType = SkillType.COMPOSITE
     blocks: list[SkillEditorBlockRequest] = Field(min_length=1, max_length=128)
     bindings: dict[str, BindingSpec] = Field(default_factory=dict)
+    external_source: DittoExternalSkillSourceRequest | None = None
     source_recording_ids: list[
         Annotated[str, Field(pattern=r"^rgbd_[A-Za-z0-9_-]{1,96}$")]
     ] = Field(default_factory=list, max_length=32)

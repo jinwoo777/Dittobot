@@ -6,6 +6,7 @@
     filter: "all",
     apiStatus: "connecting",
     skills: [],
+    dittoSkills: [],
     drafts: [],
     taskFlowCatalog: { objects: [] },
     selectedKey: null,
@@ -92,6 +93,7 @@
       blocklyError: null,
       blocklyCatalogSignature: "",
       loadedParent: null,
+      loadedExternal: null,
       parameterNodeId: null,
       parameterArguments: null,
     },
@@ -1306,10 +1308,34 @@
     });
   }
 
-  function loadPipelineSkillDetail(skillKey) {
-    renderPipelineSegments(
-      state.skills.find((skill) => skill.key === skillKey) || null,
-    );
+  async function loadPipelineSkillDetail(skillKey) {
+    if (skillKey.startsWith("ditto:")) {
+      const sourceId = skillKey.slice("ditto:".length);
+      dom.skillgenSegmentsBody.replaceChildren();
+      const loadingRow = create("tr");
+      const loadingCell = create("td", { text: "ditto_system 스킬 변환 중…" });
+      loadingCell.colSpan = 4;
+      loadingRow.append(loadingCell);
+      dom.skillgenSegmentsBody.append(loadingRow);
+      try {
+        const source = await api.getDittoSkillSource(sourceId);
+        if (dom.skillgenListSelect.value !== skillKey) return;
+        renderPipelineSegments({
+          nodes: source.blocks.map((block, index) => ({
+            nodeId: `ditto_${index + 1}`,
+            operation: block.operation,
+            arguments: block.arguments,
+          })),
+          status: `${source.source_stage} · 읽기 전용`,
+        });
+      } catch (error) {
+        if (dom.skillgenListSelect.value !== skillKey) return;
+        renderPipelineSegments(null);
+        dom.skillgenStatus.textContent = `ditto_system 스킬 조회 실패: ${errorText(error)}`;
+      }
+      return;
+    }
+    renderPipelineSegments(state.skills.find((skill) => skill.key === skillKey) || null);
   }
 
   function refreshPipelineSkills() {
@@ -1337,9 +1363,19 @@
       option.selected = skill.key === selectedKey;
       dom.skillgenListSelect.append(option);
     });
-    dom.skillgenStatus.textContent = state.skills.length
-      ? `현재 SkillGraph ${state.skills.length}개 버전 · Mock/검증 경로 연결됨`
-      : "등록된 SkillGraph가 없습니다.";
+    state.dittoSkills.forEach((skill) => {
+      const option = create("option", {
+        text: `[ditto_system] ${skill.source_id} · ${skill.source_stage} · ${skill.block_count}개 블록`,
+      });
+      option.value = `ditto:${skill.source_id}`;
+      option.disabled = skill.ready !== true;
+      option.selected = option.value === selectedKey;
+      dom.skillgenListSelect.append(option);
+    });
+    const totalSkillCount = state.skills.length + state.dittoSkills.length;
+    dom.skillgenStatus.textContent = totalSkillCount
+      ? `DB SkillGraph ${state.skills.length}개 · ditto_system 읽기 전용 ${state.dittoSkills.length}개 · Blockly 변환 경로 연결됨`
+      : "등록된 SkillGraph와 ditto_system 스킬이 없습니다.";
     loadPipelineSkillDetail(dom.skillgenListSelect.value);
   }
 
@@ -1569,7 +1605,19 @@
       option.selected = skill.key === selectedKey;
       dom.existingSkillSelect.append(option);
     });
-    if (!state.skills.some((skill) => skill.key === selectedKey)) {
+    state.dittoSkills.forEach((skill) => {
+      const option = create("option", {
+        text: `[ditto_system] ${skill.source_id} · ${skill.source_stage} · ${skill.block_count}개 블록`,
+      });
+      option.value = `ditto:${skill.source_id}`;
+      option.disabled = skill.ready !== true;
+      option.selected = option.value === selectedKey;
+      dom.existingSkillSelect.append(option);
+    });
+    const knownExternal = state.dittoSkills.some(
+      (skill) => `ditto:${skill.source_id}` === selectedKey && skill.ready === true,
+    );
+    if (!state.skills.some((skill) => skill.key === selectedKey) && !knownExternal) {
       dom.existingSkillSelect.value = "";
     }
     const parent = state.editor.loadedParent;
@@ -1586,7 +1634,9 @@
       : "Candidate 생성";
     dom.loadedSkillStatus.textContent = parent
       ? `${parent.id}@${parent.version} 불러옴 · checksum ${parent.checksum.slice(0, 12)}… · 원본 메타데이터는 잠겨 있습니다.`
-      : "스킬 버전을 선택하면 primitive와 인수를 Blockly 작업공간으로 불러옵니다.";
+      : state.editor.loadedExternal
+        ? `ditto_system ${state.editor.loadedExternal.sourceId} 불러옴 · ${state.editor.loadedExternal.stage} · checksum ${state.editor.loadedExternal.checksum.slice(0, 12)}… · 원본은 읽기 전용입니다.`
+        : "DB 스킬 또는 ditto_system 스킬을 선택하면 Blockly 작업공간으로 불러옵니다.";
   }
 
   function sequentialNodesForBlockly(graph) {
@@ -1686,6 +1736,49 @@
   }
 
   async function loadExistingSkillToBlockly() {
+    const externalSourceId = dom.existingSkillSelect.value.startsWith("ditto:")
+      ? dom.existingSkillSelect.value.slice("ditto:".length)
+      : null;
+    if (externalSourceId) {
+      if (state.editor.blocks.length
+        && state.editor.loadedExternal?.sourceId !== externalSourceId
+        && !window.confirm("현재 Blockly 작업공간을 ditto_system 스킬로 교체할까요?")) return;
+      state.editor.loading = true;
+      renderSkillBlocks();
+      setBanner(`${externalSourceId} ditto_system 데이터 변환 중…`);
+      try {
+        const result = await api.getDittoSkillSource(externalSourceId);
+        replaceBlocklyWorkspace(result.blocks || []);
+        dom.blockSkillId.value = result.skill_id;
+        dom.blockSkillName.value = result.name;
+        dom.blockSkillDescription.value = result.description;
+        dom.blockSkillType.value = result.skill_type;
+        state.editor.bindings = cloneValue(result.bindings || {});
+        state.editor.loadedParent = null;
+        state.editor.loadedExternal = {
+          sourceId: result.source_id,
+          stage: result.source_stage,
+          checksum: result.source_checksum_sha256,
+        };
+        dom.blockEditorResult.hidden = false;
+        dom.blockEditorResult.textContent = JSON.stringify({
+          source_files: result.source_files,
+          warnings: result.warnings,
+          external_package_read_only: result.external_package_read_only,
+          executable: result.executable,
+        }, null, 2);
+        setBanner(
+          `${result.source_id} · ${result.blocks.length}개 상대좌표 Blockly 블록으로 불러왔습니다.`,
+          "ok",
+        );
+      } catch (error) {
+        setBanner(`ditto_system 스킬 불러오기 실패: ${errorText(error)}`, "danger");
+      } finally {
+        state.editor.loading = false;
+        renderSkillBlocks();
+      }
+      return;
+    }
     const selected = state.skills.find(
       (skill) => skill.key === dom.existingSkillSelect.value,
     );
@@ -1712,6 +1805,7 @@
         version: result.version,
         checksum: result.graph_checksum_sha256,
       };
+      state.editor.loadedExternal = null;
       dom.blockEditorResult.hidden = true;
       setBanner(
         `${result.skill_id}@${result.version}의 primitive ${orderedNodes.length}개를 Blockly로 불러왔습니다.`,
@@ -1729,6 +1823,7 @@
     if (state.editor.blocks.length
       && !window.confirm("현재 Blockly 작업공간을 비우고 새 스킬을 만들까요?")) return;
     state.editor.loadedParent = null;
+    state.editor.loadedExternal = null;
     state.editor.bindings = {};
     state.editor.selectedBlocklyBlockId = null;
     dom.blockSkillForm.reset();
@@ -1800,6 +1895,11 @@
         arguments: cloneValue(block.arguments),
       })),
       bindings,
+      external_source: state.editor.loadedExternal ? {
+        integration: "ditto_system.skills",
+        source_id: state.editor.loadedExternal.sourceId,
+        source_checksum_sha256: state.editor.loadedExternal.checksum,
+      } : null,
     };
   }
 
@@ -3629,13 +3729,17 @@
     renderConnection();
     setBanner("FastAPI 연결 확인 중…");
     try {
-      const [, registry, draftCatalog, editorCatalog] = await Promise.all([
+      const [, registry, draftCatalog, editorCatalog, dittoCatalog] = await Promise.all([
         api.health(),
         api.listSkills(),
         api.listSkillDrafts(),
         api.skillEditorCatalog(),
+        api.listDittoSkillSources(),
       ]);
       state.skills = (registry.skills || []).map(normalizeSkill);
+      state.dittoSkills = Array.isArray(dittoCatalog.skills)
+        ? dittoCatalog.skills
+        : [];
       state.drafts = (draftCatalog.drafts || []).map(normalizeDraft);
       state.taskFlowCatalog = registry.task_flow_catalog || { objects: [] };
       state.editor.catalog = Array.isArray(editorCatalog.primitives)
@@ -3646,12 +3750,13 @@
         : state.skills[0]?.key || null;
       state.apiStatus = "connected";
       setBanner(
-        message || `FastAPI 연결됨 · 등록 버전 ${state.skills.length}개 · 분석 초안 ${state.drafts.length}개`,
+        message || `FastAPI 연결됨 · 등록 버전 ${state.skills.length}개 · ditto_system ${state.dittoSkills.length}개 · 분석 초안 ${state.drafts.length}개`,
         "ok",
       );
     } catch (error) {
       state.apiStatus = "error";
       state.skills = [];
+      state.dittoSkills = [];
       state.drafts = [];
       state.taskFlowCatalog = { objects: [] };
       state.selectedKey = null;
